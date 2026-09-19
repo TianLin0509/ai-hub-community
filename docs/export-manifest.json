@@ -1,0 +1,31 @@
+{
+  "upstream": {
+    "edition": "community",
+    "upstreamVersion": "1.6.194",
+    "upstreamCommit": "dcdadceffc2d040f4967df9287dec0a5f7089602",
+    "personalModules": false
+  },
+  "omittedPersonalModules": [
+    "core/agent-league-accounting.js",
+    "core/agent-league-calendar.js",
+    "core/agent-league-philosophies.js",
+    "core/agent-league-runtime-store.js",
+    "core/agent-league-scheduler-safety.js",
+    "core/agent-league-store.js",
+    "core/agent-league-virtual-debug.js",
+    "core/chuxin-session-registry.js",
+    "core/study-store.js",
+    "core/study-workflow.js",
+    "main/ipc/agent-league-handlers.js",
+    "main/ipc/chuxin-handlers.js",
+    "main/ipc/study-handlers.js",
+    "renderer/agent-league.css",
+    "renderer/agent-league.js",
+    "renderer/chuxin.css",
+    "renderer/chuxin.js",
+    "renderer/study.css",
+    "renderer/study.js"
+  ],
+  "historyCopied": false,
+  "credentialsCopied": false
+}
