@@ -89,7 +89,7 @@ class WorkspaceService {
     this.releaseRegistryLock = opts.releaseRegistryLock || releaseLock;
     // 注册表落盘位置必须和 workspaceRoot 一样可注入。原先只有 workspaceRoot 能注入，
     // getRegistryPath() 却硬走 getHubDataDir() —— 单测把 workspace 建在临时目录、
-    // 却把条目写进用户的生产 ~/.claude-session-hub/workspaces.json，每跑一次脏一批
+    // 却把条目写进用户的生产 ~/.ai-hub-community/workspaces.json，每跑一次脏一批
     // （2026-07-28 实测生产库 74 条里 48 条是测试残留，selectedPath 还指向已删的临时目录）。
     this.registryPath = opts.registryPath || null;
     this.initGit = opts.initGit || (cwd => {

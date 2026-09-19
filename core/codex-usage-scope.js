@@ -113,7 +113,7 @@ function resolveSubscriptionProfile(config, homeDir) {
 
 function resolveCodexUsageScope(config = {}, opts = {}) {
   const homeDir = opts.homeDir || os.homedir();
-  const hubDataDir = opts.hubDataDir || path.join(homeDir, '.claude-session-hub');
+  const hubDataDir = opts.hubDataDir || path.join(homeDir, '.ai-hub-community');
   const backend = config.codexBackend === 'api' && config.codexApiKey ? 'api' : 'subscription';
 
   if (backend === 'api') {

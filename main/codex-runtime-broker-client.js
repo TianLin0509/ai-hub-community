@@ -194,7 +194,7 @@ function launchBroker(dataDir) {
 }
 
 async function connectBroker({ dataDir, timeoutMs = 12_000 } = {}) {
-  dataDir = path.resolve(dataDir || path.join(os.homedir(), '.claude-session-hub'));
+  dataDir = path.resolve(dataDir || path.join(os.homedir(), '.ai-hub-community'));
   fs.mkdirSync(dataDir, { recursive:true });
   const deadline = Date.now() + timeoutMs;
   let launched = null;

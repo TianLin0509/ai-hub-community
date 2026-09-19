@@ -6,7 +6,7 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test tests/unit-community.test.js",
-    "dist": "electron-builder --win",
+    "dist": "electron-builder --win --publish never",
     "doctor": "node scripts/doctor.js",
     "audit": "node scripts/audit-public.js"
   },

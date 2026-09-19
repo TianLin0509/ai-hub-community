@@ -7,13 +7,15 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-community-gui-'));
   const data = path.join(root, 'data'), home = path.join(root, 'home'), project = path.join(root, 'project');
-  const out = path.resolve('artifacts/community-gui');
+  const packaged = process.argv.includes('--packaged');
+  const out = path.resolve(packaged ? 'artifacts/community-packaged-gui' : 'artifacts/community-gui');
   for (const dir of [data,home,project,out,path.join(home,'.codex'),path.join(home,'.claude')]) fs.mkdirSync(dir,{recursive:true});
   const port = await new Promise((resolve,reject) => { const server=net.createServer();server.on('error',reject);server.listen(0,'127.0.0.1',()=>{const port=server.address().port;server.close(()=>resolve(port));}); });
   let hub, cdp;
-  const report = { checks: [], providerNetworkTested: false };
+  const report = { checks: [], packaged, providerNetworkTested: false };
   try {
-    hub = await launchIsolatedHub({ dataDir:data, port, windowMode:'hidden', label:'community', extraEnv: {
+    hub = await launchIsolatedHub({ dataDir:data, port, windowMode:'hidden', label:'community',
+      ...(packaged ? {executablePath:path.resolve('dist/win-unpacked/AI Hub Community.exe')} : {}), extraEnv: {
       CLAUDE_HUB_HOME_DIR:home, USERPROFILE:home, HOME:home, CODEX_HOME:path.join(home,'.codex'), CLAUDE_CONFIG_DIR:path.join(home,'.claude'),
       AI_HUB_WORKSPACE_ROOT:path.join(root,'workspaces'), HUB_CODEX_API_KEY:'', HUB_CLAUDE_API_KEY:'', OPENAI_API_KEY:'', ANTHROPIC_API_KEY:'', ANTHROPIC_AUTH_TOKEN:'',
       CLAUDE_HUB_ACCOUNT_FIXTURE:path.resolve('tests/fixtures/account-center-cli.js'),

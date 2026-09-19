@@ -80,7 +80,7 @@ function resolveDataDir(options = {}) {
   return path.resolve(
     options.dataDir
       || env.CLAUDE_HUB_DATA_DIR
-      || path.join((options.homedir || os.homedir)(), '.claude-session-hub'),
+      || path.join((options.homedir || os.homedir)(), '.ai-hub-community'),
   );
 }
 

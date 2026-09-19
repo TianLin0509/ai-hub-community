@@ -70,3 +70,11 @@ test('fresh project registry is empty but corrupt registry still fails visibly',
     assert.throws(()=>registry.list(), /读取失败/);
   } finally { fs.rmSync(dir, {recursive:true,force:true}); }
 });
+test('secondary stores and diagnostics also default to community data', () => {
+  const lifecycle = require('../core/process-lifecycle-journal').resolveLifecyclePaths({processRef:{pid:123,env:{}}});
+  assert.equal(path.basename(lifecycle.dataDir), '.ai-hub-community');
+  const registry = require('../core/hub-instance-registry').resolveDataDir({env:{}});
+  assert.equal(path.basename(registry), '.ai-hub-community');
+  const usage = require('../core/codex-usage-scope').resolveCodexUsageScope({codexBackend:'api',codexApiKey:'fixture'}, {homeDir:os.tmpdir()});
+  assert.equal(path.basename(path.dirname(usage.home)), '.ai-hub-community');
+});

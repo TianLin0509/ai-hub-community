@@ -379,7 +379,7 @@ function sanitizeSessionHints(hints, repoRoot) {
 }
 
 function createWorkbenchOperationsService(options = {}) {
-  const dataDir = path.resolve(options.dataDir || path.join(os.homedir(), '.claude-session-hub'));
+  const dataDir = path.resolve(options.dataDir || path.join(os.homedir(), '.ai-hub-community'));
   const getConfig = options.getConfig || (() => ({}));
   const execFile = options.execFile || execFileAsync;
   const now = options.now || Date.now;

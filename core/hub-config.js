@@ -3,7 +3,7 @@
  *
  * 优先级（从高到低）：
  * 1. 环境变量（DEEPSEEK_API_KEY, CLAUDE_PROXY）
- * 2. config.json（~/.claude-session-hub/config.json）
+ * 2. config.json（~/.ai-hub-community/config.json）
  * 3. 默认值
  */
 
@@ -27,8 +27,7 @@ const { community } = require('./distribution');
 const DEFAULTS = {
   proxy: community ? '' : 'http://127.0.0.1:7890',
   claude_backend: 'subscription',
-  // 同事提供的 Claude-compatible Fable 网关。只预置连接参数；
-  // backend 仍默认 subscription，未显式切换时绝不会使用该网关。
+  // Official API defaults; subscription login remains the default backend.
   claude_api_base_url: 'https://api.anthropic.com',
   claude_api_model: DEFAULT_MODEL_BY_KIND.claude,
   codex_backend: 'subscription',

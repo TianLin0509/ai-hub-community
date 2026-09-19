@@ -116,7 +116,7 @@ async function readLegacyHubSessions(control){
 }
 async function assertNoOtherHubOwner(options,threadId,readSessions=readOtherHubSessions){
   const checkedPids=[];
-  const data=options.env?.CLAUDE_HUB_DATA_DIR || path.join(os.homedir(),'.claude-session-hub');
+  const data=options.env?.CLAUDE_HUB_DATA_DIR || path.join(os.homedir(),'.ai-hub-community');
   const dir=path.join(data,'control');let files;
   try{files=fs.readdirSync(dir);}catch(e){if(e.code==='ENOENT')return {checkedPids};throw e;}
   for(const name of files.filter(n=>/^\d+\.json$/.test(n))){

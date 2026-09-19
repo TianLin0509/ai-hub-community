@@ -233,7 +233,7 @@ const HIDDEN_E2E_WINDOW_REQUESTED = process.env.CLAUDE_HUB_E2E === '1'
   && process.env.CLAUDE_HUB_E2E_WINDOW_MODE === 'hidden';
 const HIDDEN_E2E_DATA_DIR_SAFE = isIsolatedHub()
   && path.resolve(getHubDataDir()).toLowerCase()
-    !== path.resolve(path.join(os.homedir(), '.claude-session-hub')).toLowerCase();
+    !== path.resolve(path.join(os.homedir(), '.ai-hub-community')).toLowerCase();
 if (HIDDEN_E2E_WINDOW_REQUESTED && !HIDDEN_E2E_DATA_DIR_SAFE) {
   throw new Error('hidden E2E window mode requires a non-production CLAUDE_HUB_DATA_DIR');
 }

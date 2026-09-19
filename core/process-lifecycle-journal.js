@@ -26,7 +26,7 @@ function resolveLifecyclePaths(options = {}) {
   const dataDir = path.resolve(
     options.dataDir
       || processRef.env && processRef.env.CLAUDE_HUB_DATA_DIR
-      || path.join(os.homedir(), '.claude-session-hub'),
+      || path.join(os.homedir(), '.ai-hub-community'),
   );
   const diagnosticsDir = path.join(dataDir, 'diagnostics');
   const pid = Number(processRef.pid) || 0;

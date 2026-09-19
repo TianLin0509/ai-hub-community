@@ -92,7 +92,7 @@ function looksLikePathTitle(title) {
   if (!clean) return false;
   if (/[A-Za-z]:[\\/]/.test(clean)) return true;
   if (/^\\\\/.test(clean)) return true;
-  if (/[\\/]\.claude-session-hub[\\/]/i.test(clean)) return true;
+  if (/[\\/]\.ai-hub-community[\\/]/i.test(clean)) return true;
   const slashCount = (clean.match(/[\\/]/g) || []).length;
   if (slashCount >= 2) return true;
   if (slashCount > 0 && /\.(?:png|jpe?g|gif|webp|bmp|exe|ps1|bat|cmd|md|html?|jsonl?|txt)(?:\s|$)/i.test(clean)) {

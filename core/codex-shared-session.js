@@ -249,7 +249,7 @@ class CodexSharedSession extends EventEmitter {
   async _start() {
     if (this.everAttached) this.viewEpoch++;
     const dataDir = this.options.hubDataDir || this.options.env?.CLAUDE_HUB_DATA_DIR
-      || path.join(os.homedir(), '.claude-session-hub');
+      || path.join(os.homedir(), '.ai-hub-community');
     const client = await this.brokerConnector({ dataDir });
     if (this.closed) { client.close(); return; }
     const serviceId=client.metadata?.serviceId;

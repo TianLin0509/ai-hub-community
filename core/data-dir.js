@@ -4,11 +4,11 @@ const os = require('os');
 // Resolve the Hub's data directory root.
 // Honors CLAUDE_HUB_DATA_DIR env var so parallel test instances can isolate
 // state.json / images without touching the production Hub.
-// Default: ~/.claude-session-hub (unchanged production path).
+// Default: ~/.ai-hub-community (unchanged production path).
 function getHubDataDir() {
   const override = process.env.CLAUDE_HUB_DATA_DIR;
   if (override && override.trim()) return override;
-  return path.join(os.homedir(), require('./distribution').community ? '.ai-hub-community' : '.claude-session-hub');
+  return path.join(os.homedir(), require('./distribution').community ? '.ai-hub-community' : '.ai-hub-community');
 }
 
 // 阶段乙（2026-05-03 道雪）：判定当前 hub 是否运行在隔离模式。

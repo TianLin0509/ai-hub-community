@@ -13,7 +13,7 @@ const THROTTLE_MS = 15 * 1000;
 // production cache. Hub (session-manager.js) forwards this env var when set.
 // Default fallback uses os.homedir() to stay consistent with core/data-dir.js.
 const DATA_DIR = process.env.CLAUDE_HUB_DATA_DIR
-  || path.join(os.homedir(), '.claude-session-hub');
+  || path.join(os.homedir(), '.ai-hub-community');
 const CACHE_FILE = path.join(DATA_DIR, 'statusline-cache.json');
 
 let stdin = '';

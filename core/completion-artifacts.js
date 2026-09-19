@@ -14,7 +14,7 @@ const ALLOWED_EXTENSIONS = new Set([
   '.zip', '.mp4',
 ]);
 const DELIVERY_SIGNAL_RE = /(?:绝对路径|成果|交付|产物|输出路径|已生成|已保存|可打开|下载地址|artifact|deliverable|generated|saved\s+to|output\s+path|report\s+at|preview\s+at)/i;
-const TRUSTED_OUTPUT_RE = /(?:[\\/](?:artifacts?|outputs?)[\\/]|[\\/]Desktop[\\/]claude-artifacts[\\/]|[\\/]VibeData[\\/]Artifacts[\\/]Reports[\\/]|[\\/]\.claude-session-hub[\\/]images[\\/])/i;
+const TRUSTED_OUTPUT_RE = /(?:[\\/](?:artifacts?|outputs?)[\\/]|[\\/]Desktop[\\/]claude-artifacts[\\/]|[\\/]VibeData[\\/]Artifacts[\\/]Reports[\\/]|[\\/]\.ai-hub-community[\\/]images[\\/])/i;
 const SENSITIVE_SEGMENTS = new Set([
   '.git', 'node_modules', '.ssh', '.aws', '.azure', '.lark-cli', '.codex', '.claude',
   'credentials', 'secrets', 'cookies', 'tokens',
@@ -47,7 +47,7 @@ function isSensitiveArtifactPath(filePath) {
   const lower = normalized.toLowerCase();
   const segments = lower.split(/\\+/).filter(Boolean);
   if (segments.some(segment => SENSITIVE_SEGMENTS.has(segment))) return true;
-  if (lower.includes('\\.claude-session-hub\\') && !lower.includes('\\.claude-session-hub\\images\\')) return true;
+  if (lower.includes('\\.ai-hub-community\\') && !lower.includes('\\.ai-hub-community\\images\\')) return true;
   return SENSITIVE_BASENAME_RE.test(path.basename(normalized));
 }
 

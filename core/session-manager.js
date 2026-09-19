@@ -1183,7 +1183,7 @@ class SessionManager extends EventEmitter {
       if (this.hookPort) sessionEnv.CLAUDE_HUB_PORT = String(this.hookPort);
       if (this.hookToken) sessionEnv.CLAUDE_HUB_TOKEN = this.hookToken;
       // Propagate data-dir override so the statusline script writes its cache
-      // into the isolated test dir instead of the production ~/.claude-session-hub.
+      // into the isolated test dir instead of the production ~/.ai-hub-community.
       if (process.env.CLAUDE_HUB_DATA_DIR) {
         sessionEnv.CLAUDE_HUB_DATA_DIR = process.env.CLAUDE_HUB_DATA_DIR;
       }
