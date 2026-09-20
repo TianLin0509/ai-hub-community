@@ -9,7 +9,9 @@ public class HubInstallerProbe {
   public static void Main() {
     string value = Environment.GetEnvironmentVariable("CLAUDE_HUB_DATA_DIR") == null
       && Environment.GetEnvironmentVariable("CLAUDE_HUB_TOKEN") == null
-      && Environment.GetEnvironmentVariable("CODEX_THREAD_ID") == null ? "clean" : "inherited";
+      && Environment.GetEnvironmentVariable("CODEX_THREAD_ID") == null
+      && Environment.GetEnvironmentVariable("ELECTRON_RUN_AS_NODE") == null
+      && Environment.GetEnvironmentVariable("CLAUDE_CODE_GIT_BASH_PATH") == "fixture-bash" ? "clean" : "inherited";
     File.WriteAllText(Environment.GetEnvironmentVariable("HUB_INSTALL_LAUNCH_PROBE"), value);
   }
 }
@@ -40,14 +42,16 @@ Expect ($again.code -eq 0 -and $again.result.reused) 'Repeat installation is not
 $probe=Join-Path $root 'launch-probe.txt'
 $env:HUB_INSTALL_LAUNCH_PROBE=$probe
 $savedData=$env:CLAUDE_HUB_DATA_DIR;$savedToken=$env:CLAUDE_HUB_TOKEN;$savedThread=$env:CODEX_THREAD_ID
+$savedElectron=$env:ELECTRON_RUN_AS_NODE;$savedBash=$env:CLAUDE_CODE_GIT_BASH_PATH
 try {
   $env:CLAUDE_HUB_DATA_DIR='fixture-parent-data';$env:CLAUDE_HUB_TOKEN='fixture-parent-token';$env:CODEX_THREAD_ID='fixture-parent-thread'
+  $env:ELECTRON_RUN_AS_NODE='1';$env:CLAUDE_CODE_GIT_BASH_PATH='fixture-bash'
   $launched=Run-Install -Launch
   Expect ($launched.code -eq 0 -and $launched.result.launchRequested) 'Launch request failed'
   $deadline=[DateTime]::UtcNow.AddSeconds(10)
   while(-not (Test-Path -LiteralPath $probe) -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 100}
   Expect ((Get-Content -LiteralPath $probe) -eq 'clean') 'Parent Hub data or identity leaked into installed application'
-}finally{$env:CLAUDE_HUB_DATA_DIR=$savedData;$env:CLAUDE_HUB_TOKEN=$savedToken;$env:CODEX_THREAD_ID=$savedThread;Remove-Item Env:HUB_INSTALL_LAUNCH_PROBE}
+}finally{$env:CLAUDE_HUB_DATA_DIR=$savedData;$env:CLAUDE_HUB_TOKEN=$savedToken;$env:CODEX_THREAD_ID=$savedThread;$env:ELECTRON_RUN_AS_NODE=$savedElectron;$env:CLAUDE_CODE_GIT_BASH_PATH=$savedBash;Remove-Item Env:HUB_INSTALL_LAUNCH_PROBE}
 $bad=Join-Path $root 'bad.txt'
 [IO.File]::WriteAllText($bad,('0'*64+'  '+[IO.Path]::GetFileName($archive)))
 $failed=Run-Install -dest (Join-Path $root 'bad-install') -checksums $bad

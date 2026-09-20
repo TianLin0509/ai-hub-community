@@ -18,7 +18,7 @@ try {
   $info.FileName=$exe;$info.WorkingDirectory=[IO.Path]::GetDirectoryName($exe);$info.UseShellExecute=$false
   $info.WindowStyle=[Diagnostics.ProcessWindowStyle]::Hidden
   foreach($key in @($info.EnvironmentVariables.Keys)) {
-    if($key -match '^(CLAUDE_HUB_|ARENA_HUB_|CLAUDE_CODE_)' -or $key -in @('CLAUDECODE','CODEX_THREAD_ID','CODEX_SESSION_ID','AI_TEAM_HUB_CALLBACK_URL')) { $info.EnvironmentVariables.Remove($key) }
+    if($key -match '^(CLAUDE_HUB_|ARENA_HUB_)' -or $key -in @('CLAUDECODE','CODEX_THREAD_ID','CODEX_SESSION_ID','AI_TEAM_HUB_CALLBACK_URL','ELECTRON_RUN_AS_NODE')) { $info.EnvironmentVariables.Remove($key) }
   }
   $info.EnvironmentVariables['CLAUDE_HUB_DATA_DIR']=$data
   if($workspace){$info.EnvironmentVariables['AI_HUB_WORKSPACE_ROOT']=$workspace}

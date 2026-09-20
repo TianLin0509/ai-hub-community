@@ -115,7 +115,7 @@ try {
     # An agent may run this installer from another Hub. Never inherit its data
     # root, test fixtures, hook credentials or native session identity.
     foreach($key in @($launch.EnvironmentVariables.Keys)) {
-      if($key -match '^(CLAUDE_HUB_|ARENA_HUB_|CLAUDE_CODE_)' -or $key -in @('CLAUDECODE','CODEX_THREAD_ID','CODEX_SESSION_ID','AI_TEAM_HUB_CALLBACK_URL')) { $launch.EnvironmentVariables.Remove($key) }
+      if($key -match '^(CLAUDE_HUB_|ARENA_HUB_)' -or $key -in @('CLAUDECODE','CODEX_THREAD_ID','CODEX_SESSION_ID','AI_TEAM_HUB_CALLBACK_URL','ELECTRON_RUN_AS_NODE')) { $launch.EnvironmentVariables.Remove($key) }
     }
     [Diagnostics.Process]::Start($launch) | Out-Null
     $launched=$true
