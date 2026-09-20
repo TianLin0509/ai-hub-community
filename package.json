@@ -41,11 +41,12 @@
     "appId": "com.ai-hub.community",
     "productName": "AI Hub Community",
     "win": {
-      "target": "nsis",
+      "target": ["nsis", "zip"],
       "icon": "claude-wx.ico",
-      "artifactName": "AIHubCommunity-Setup-${version}.${ext}"
+      "artifactName": "AIHubCommunity-${version}-win-${arch}.${ext}"
     },
     "nsis": {
+      "artifactName": "AIHubCommunity-Setup-${version}.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "installerIcon": "claude-wx.ico",
@@ -70,6 +71,11 @@
       "core/claude-subscription-standard-settings.json"
     ],
     "extraResources": [
+      {
+        "from": ".",
+        "to": "guides",
+        "filter": ["README.md", "INSTALL.md", "AGENTS.md", "PRIVACY.md", "LICENSE", "docs/**/*.md", "examples/**/*"]
+      },
       {
         "from": "scripts",
         "to": "scripts",

@@ -1,5 +1,11 @@
 # 安装、登录与排障
 
+## 最快路线：便携发布版（免 Node / Git）
+
+普通用户和代装 Agent 优先使用 [AGENT-QUICKSTART.md](docs/AGENT-QUICKSTART.md) 的固定版本命令。`scripts/install-release.ps1` 自动下载 Windows x64 ZIP、SHA256 校验、按版本安装并启动，支持重复执行、JSON 回执及离线包。不要为了运行发布版先装整套开发环境。
+
+安装目录默认 `%LOCALAPPDATA%\Programs\AIHubCommunity\v0.1.0-preview.2`。程序包含 `resources/scripts/install-provider.ps1` 和 `resources/guides`，可离线阅读安装/定制文档。可以手动运行其中的 `AI Hub Community.exe`。卸载便携版仅在关闭对应程序后移除该版本目录；用户数据不自动删除。
+
 ## 路线 A：源码安装（人和 agent 均可执行）
 
 1. 安装 Node.js 22+ LTS；安装后重开终端。Git 可选，ZIP 下载也能用。
@@ -25,7 +31,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-provider.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-provider.ps1 -Provider gemini
 ```
 
-Claude 使用官方原生安装脚本；Windows Claude Code 还需要 Git for Windows 提供的 Git Bash。Codex/Gemini 使用官方 npm 包，版本由执行安装时的官方包决定。安装脚本不会替已有 CLI 自动升级。Kimi 及其他可选提供方按官方说明安装。
+Claude 和 Codex 使用官方原生安装脚本，无需 Node；保留对已有 npm CLI 的兼容。Git for Windows 可选，Claude 当前官方版本在没有 Git Bash 时可以使用 PowerShell。Gemini 使用官方 npm 包，需要 Node/npm。CLI 版本由执行安装时的官方发布决定；安装脚本不会替已有 CLI 自动升级。Kimi 及其他可选提供方按官方说明安装。
 
 登录首选 Hub 首页「登录 / 检查账号」：
 
@@ -70,4 +76,4 @@ doctor 输出 JSON：退出码 `0` = 源码运行环境齐全；`2` = 缺少必�
 
 卸载只移除本安装目录/应用。用户数据和 CLI 登录默认保留；需要清理时先备份、确认具体目录，agent 不得自动删除。
 
-官方来源（2026-09-19 核对）：[Claude setup](https://code.claude.com/docs/en/setup)、[Codex CLI](https://developers.openai.com/codex/cli/)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)。
+官方来源（2026-09-20 核对）：[Claude setup](https://code.claude.com/docs/en/setup)、[Codex CLI](https://learn.chatgpt.com/docs/codex/cli)、[Codex 安装环境变量](https://learn.chatgpt.com/docs/config-file/environment-variables)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)。

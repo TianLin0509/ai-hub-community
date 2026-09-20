@@ -2,6 +2,17 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('fs'), path = require('path'), os = require('os');
 const { requireCommand, resolveClaudeCommand, assertProviderAvailable } = require('../core/community-provider');
+test('packaged readiness uses the bundled runtime without external electron dependency', () => {
+  const result=require('../core/community-setup').inspectSetup({packaged:true,root:os.tmpdir(),env:{PATH:'',USERPROFILE:os.tmpdir()},platform:'win32',version:'22.0.0'});
+  assert.equal(result.ready,true);assert.equal(result.runtime,'bundled');
+});
+test('native Codex default installation is found before reopening the Windows shell', t => {
+  const {root,env}=environment(t);env.LOCALAPPDATA=path.join(root,'local');
+  const executable=path.join(env.LOCALAPPDATA,'Programs/OpenAI/Codex/bin/codex.exe');
+  fs.mkdirSync(path.dirname(executable),{recursive:true});fs.writeFileSync(executable,'fixture');
+  assert.equal(requireCommand('codex',env),executable);
+  assert.equal(require('../main/codex-windows-command').resolveWindowsCodex(env).command,executable);
+});
 function environment(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'community onboarding '));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
