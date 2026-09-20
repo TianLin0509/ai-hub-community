@@ -1,5 +1,16 @@
 # 验证记录
 
+## 上手审查（2026-09-20，修复分支）
+
+- `npm test`：15 项通过，新增缺失 CLI、Claude 原生安装路径/npm 启动器、登录错误和旧版快捷方式保护回归。
+- `node tests/e2e-community-onboarding.js`：真实隔离 Electron，清空 AI CLI 的 PATH、临时 HOME/APPDATA、无真实凭据；以 CDP 鼠标/键盘操作创建表单和输入框。验证缺失 CLI 不创建失败会话、登录错误可见、群聊缺少成员依赖时不启动任何成员、安装后刷新、首次发送与回复、重启恢复同一原生身份与历史、默认通用群聊的两位成员回复。
+- Claude 使用临时目录内 npm 风格的合成 CLI，经真实路径解析与子进程启动；Codex 使用 App Server 协议夹具。安装路径含空格。以上不代表在线模型质量、真实 OAuth、账号额度或模型权限已验证。
+- `node tests/e2e-community-cdp.js`：原有 GUI/账号夹具/真实 PowerShell ConPTY 回归通过。
+- `powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -CheckOnly`、`node scripts/audit-public.js`、改动 JS 的 `node --check` 通过。
+- CI 增加源码和 `--packaged` 的上手流程；具体构建结果以当前 PR 的 GitHub Actions 终态为准。没有在本机执行 NSIS 安装器点击流程，也没有覆盖已发布版本。
+
+修复：缺失 CLI 的创建前检查；检测/Claude 登录/Claude 会话共用安装路径解析；创建群聊前检查全部成员；公开版不接管旧版失效桌面快捷方式。首页缺失项提供官方安装入口；通用群聊默认使用工作目录，开发群聊仍要求选择项目。
+
 基线：AI Hub 1.6.194，公开版 0.1.0-preview.1。日期：2026-09-19。
 
 ## 已执行

@@ -23,6 +23,14 @@
           const item = document.createElement('span');
           item.className = 'community-provider';
           item.textContent = provider.name + (provider.installed ? ' · 已安装' : ' · 待安装');
+          if (!provider.installed) {
+            const install = document.createElement('button');
+            install.type = 'button';
+            install.textContent = '安装';
+            install.setAttribute('aria-label', '安装 ' + provider.name);
+            install.onclick = () => shell.openExternal(provider.docs);
+            item.append(' ', install);
+          }
           target.append(item);
         }
       } catch (error) { target.textContent = '检测失败：' + error.message; }

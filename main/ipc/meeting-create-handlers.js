@@ -276,6 +276,10 @@ function registerMeetingCreateIpc(ipcMain, deps) {
     const safe = { ...(opts || {}) };
     safe.groupChat = true;
     const devSlots = Array.isArray(safe.slots) ? safe.slots : safe.slotSpecs;
+    // Check every requested member before creating a room or starting any AI.
+    for (const slot of (Array.isArray(devSlots) ? devSlots : [])) {
+      require('../../core/community-provider').assertProviderAvailable(slot.kind);
+    }
     if (safe.serialWorkflow?.soloDevelopment || safe.serialWorkflow?.templateId === 'dev-task-solo'
       || (safe.mode === 'dev' && (!Array.isArray(devSlots) || devSlots.length < 2))) {
       throw new Error('开发群聊至少需要两位成员；单人开发请使用普通会话的“一键开工”。');
