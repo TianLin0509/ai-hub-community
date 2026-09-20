@@ -2,7 +2,8 @@
 
 ## v0.1.0-preview.2 发布验收
 
-- 本机 `npm test`：17 项通过；`tests/test-release-installer.ps1` 验证带空格路径、重复安装、摘要不匹配、未知目录保护、已安装程序被改动、ZIP 路径越界拒绝。
+- 本机 `npm test`：18 项通过，含无 Git 的源码 ZIP 审计；`tests/test-release-installer.ps1` 验证带空格路径、重复安装、摘要不匹配、未知目录保护、已安装程序被改动、ZIP 路径越界拒绝、父 Hub 环境隔离。
+- 合并前最终提交 `1f58742e79c7b62e622cd94076c708f7863d6659` 已通过 [完整 Windows CI](https://github.com/TianLin0509/ai-hub-community/actions/runs/35519896979)，包含官方 Codex 0.155.1 无 Node/Git PATH 握手、源码/打包程序及实际 ZIP 安装后的用户路径；PR #1 已合并。发布 tag 会对版本提交再跑同样验证。
 - `node tests/e2e-community-onboarding.js`：8 条真实窗口用户路径通过，新增原生停止确认、提供方失败可见、用户主动再次发送恢复。首次使用、群聊、历史恢复仍全部保留。
 - `node tests/smoke-official-codex.js`：本机真实 Codex CLI 0.153.4 的 App Server 初始化、空账号查询通过。使用新的临时 CODEX_HOME，没有调用模型。临时目录下 Codex 提示不创建 PATH 辅助别名；握手仍成功。
 - CI 必须独立安装依赖，安装当前官方 Codex 原生 CLI，验证真实握手；随后构建 NSIS 和 ZIP，验证打包版，再用便携安装脚本安装实际 ZIP 并对安装后的 exe 重跑 8 条用户路径。
