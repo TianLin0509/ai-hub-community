@@ -2,7 +2,18 @@ $ErrorActionPreference='Stop'
 $root=Join-Path ([IO.Path]::GetTempPath()) ('hub installer tests '+[guid]::NewGuid())
 $source=Join-Path $root 'source'
 New-Item -ItemType Directory -Path (Join-Path $source 'resources') -Force | Out-Null
-[IO.File]::WriteAllText((Join-Path $source 'AI Hub Community.exe'),'synthetic installer fixture - never executed')
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+public class HubInstallerProbe {
+  public static void Main() {
+    string value = Environment.GetEnvironmentVariable("CLAUDE_HUB_DATA_DIR") == null
+      && Environment.GetEnvironmentVariable("CLAUDE_HUB_TOKEN") == null
+      && Environment.GetEnvironmentVariable("CODEX_THREAD_ID") == null ? "clean" : "inherited";
+    File.WriteAllText(Environment.GetEnvironmentVariable("HUB_INSTALL_LAUNCH_PROBE"), value);
+  }
+}
+'@ -OutputAssembly (Join-Path $source 'AI Hub Community.exe') -OutputType ConsoleApplication
 [IO.File]::WriteAllText((Join-Path $source 'resources\app.asar'),'synthetic app archive')
 $version='v0.0.0-test'
 $archive=Join-Path $root 'AIHubCommunity-0.0.0-test-win-x64.zip'
@@ -13,8 +24,10 @@ $hash=(Get-FileHash -LiteralPath $archive).Hash
 $installer=Join-Path $PSScriptRoot '..\scripts\install-release.ps1'
 $receipt=Join-Path $root 'result.json'
 $destination=Join-Path $root 'installed app'
-function Run-Install([string]$dest=$destination,[string]$checksums=$manifest) {
-  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -Version $version -Destination $dest -PackagePath $archive -ChecksumPath $checksums -NoLaunch -NoShortcut -ResultPath $receipt | Out-Null
+function Run-Install([string]$dest=$destination,[string]$checksums=$manifest,[switch]$Launch) {
+  $options=@('-NoProfile','-ExecutionPolicy','Bypass','-File',$installer,'-Version',$version,'-Destination',$dest,'-PackagePath',$archive,'-ChecksumPath',$checksums,'-NoShortcut','-ResultPath',$receipt)
+  if(-not $Launch){$options+='-NoLaunch'}
+  & powershell.exe @options | Out-Null
   $code=$LASTEXITCODE
   return @{code=$code;result=(Get-Content -LiteralPath $receipt -Raw -Encoding UTF8 | ConvertFrom-Json)}
 }
@@ -24,6 +37,17 @@ Expect ($first.code -eq 0 -and $first.result.ok -and -not $first.result.reused) 
 Expect (-not $first.result.launchRequested -and $first.result.auth -eq 'not_checked') 'Installer must not claim authenticated readiness'
 $again=Run-Install
 Expect ($again.code -eq 0 -and $again.result.reused) 'Repeat installation is not idempotent'
+$probe=Join-Path $root 'launch-probe.txt'
+$env:HUB_INSTALL_LAUNCH_PROBE=$probe
+$savedData=$env:CLAUDE_HUB_DATA_DIR;$savedToken=$env:CLAUDE_HUB_TOKEN;$savedThread=$env:CODEX_THREAD_ID
+try {
+  $env:CLAUDE_HUB_DATA_DIR='fixture-parent-data';$env:CLAUDE_HUB_TOKEN='fixture-parent-token';$env:CODEX_THREAD_ID='fixture-parent-thread'
+  $launched=Run-Install -Launch
+  Expect ($launched.code -eq 0 -and $launched.result.launchRequested) 'Launch request failed'
+  $deadline=[DateTime]::UtcNow.AddSeconds(10)
+  while(-not (Test-Path -LiteralPath $probe) -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 100}
+  Expect ((Get-Content -LiteralPath $probe) -eq 'clean') 'Parent Hub data or identity leaked into installed application'
+}finally{$env:CLAUDE_HUB_DATA_DIR=$savedData;$env:CLAUDE_HUB_TOKEN=$savedToken;$env:CODEX_THREAD_ID=$savedThread;Remove-Item Env:HUB_INSTALL_LAUNCH_PROBE}
 $bad=Join-Path $root 'bad.txt'
 [IO.File]::WriteAllText($bad,('0'*64+'  '+[IO.Path]::GetFileName($archive)))
 $failed=Run-Install -dest (Join-Path $root 'bad-install') -checksums $bad
@@ -49,4 +73,5 @@ $failed=Run-Install -dest (Join-Path $root 'traversal')
 Expect ($failed.code -ne 0 -and $failed.result.error -match 'Unsafe archive entry') 'Archive traversal not rejected'
 Write-Host 'PASS: fresh spaced-path install, repeat install, checksum rejection, existing-directory preservation, changed-app rejection.'
 Write-Host 'PASS: archive path traversal rejected before extraction.'
-Write-Host "Synthetic files retained at $root; no executable, shortcut or provider was launched."
+Write-Host 'PASS: launched stub receives no parent Hub data, token or native identity.'
+Write-Host "Synthetic files retained at $root; only the local probe executable was launched; no Hub, shortcut or provider was launched."

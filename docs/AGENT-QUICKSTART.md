@@ -22,7 +22,7 @@ Agent 无人值守安装文件时添加 `-NoLaunch -NoShortcut -ResultPath <绝�
 
 完整参数：`-Version` 固定版本；`-Destination` 安装根；`-Provider existing|codex|claude|gemini`；`-NoLaunch`；`-NoShortcut`；`-PackagePath` + `-ChecksumPath` 离线输入；`-ResultPath` 机器可读回执。
 
-重复执行会验证现有版本再复用。不同版本安装在不同子目录，旧版本不删除；同版本已改动或未知目录拒绝覆盖。默认数据在 `%USERPROFILE%\.ai-hub-community`，版本升级不搬动它。自定义 `CLAUDE_HUB_DATA_DIR` 时使用该目录。回退程序前先备份数据，新旧版本数据格式不承诺永久兼容。
+重复执行会验证现有版本再复用。不同版本安装在不同子目录，旧版本不删除；同版本已改动或未知目录拒绝覆盖。默认数据在 `%USERPROFILE%\.ai-hub-community`，版本升级不搬动它。安装器首次启动会清除父 Hub 的数据目录、测试夹具和会话控制环境，避免从另一个 Hub 内代装时串用数据；自定义目录请使用公司启动示例显式指定。回退程序前先备份数据，新旧版本数据格式不承诺永久兼容。
 
 ## 路线 B：公司网络受限的离线交付
 

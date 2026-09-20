@@ -108,7 +108,18 @@ try {
     $shortcut.TargetPath=$exe; $shortcut.WorkingDirectory=$target; $shortcut.Save()
   }
   $launched = $false
-  if (-not $NoLaunch) { Start-Process -FilePath $exe -WorkingDirectory $target -WindowStyle Hidden; $launched=$true }
+  if (-not $NoLaunch) {
+    $launch=New-Object Diagnostics.ProcessStartInfo
+    $launch.FileName=$exe; $launch.WorkingDirectory=$target; $launch.UseShellExecute=$false
+    $launch.WindowStyle=[Diagnostics.ProcessWindowStyle]::Hidden
+    # An agent may run this installer from another Hub. Never inherit its data
+    # root, test fixtures, hook credentials or native session identity.
+    foreach($key in @($launch.EnvironmentVariables.Keys)) {
+      if($key -match '^(CLAUDE_HUB_|ARENA_HUB_|CLAUDE_CODE_)' -or $key -in @('CLAUDECODE','CODEX_THREAD_ID','CODEX_SESSION_ID','AI_TEAM_HUB_CALLBACK_URL')) { $launch.EnvironmentVariables.Remove($key) }
+    }
+    [Diagnostics.Process]::Start($launch) | Out-Null
+    $launched=$true
+  }
   Write-Receipt @{ schemaVersion=1; ok=$true; version=$tag; directory=$target; executable=$exe; archiveSha256=$actual; reused=$reused; launchRequested=$launched; auth='not_checked'; model='not_checked'; next='In Hub, refresh CLI detection, open Accounts, complete official login, and send one test message.' }
   $success = $true
   exit 0
