@@ -8,11 +8,25 @@
 
 把这段话发给你的 AI 编码助手：
 
-> 请安装 https://github.com/TianLin0509/ai-hub-community 。先读仓库 AGENTS.md 和 INSTALL.md，在独立目录安装，运行 doctor 并依据结果补齐依赖。复用我本机已有的 AI CLI；缺哪个再装哪个。打开官方登录入口让我授权，不读取或索取我的密钥。启动 Hub 并核实窗口与 hook server，再报告实际验证结果。
+> 请安装 https://github.com/TianLin0509/ai-hub-community 的 v0.1.0-preview.2。先读 AGENTS.md 和 docs/AGENT-QUICKSTART.md，走免 Node/Git 的便携安装路线，校验下载并保留现有 Hub。复用本机已有 CLI，缺少时按我的账号补装。打开官方登录让我授权，不读取或索取密钥。确认首次消息、群聊和重启恢复，报告实际验证结果。若要制作公司专用 HUB，继续阅读 docs/CUSTOMIZE.md，在独立分支或新库实现。
 
-公司 agent 需要借鉴实现时，先读 [架构与复用地图](docs/ARCHITECTURE.md) 和 [发行边界](docs/DISTRIBUTION.md)。
+完整 [Agent 安装手册](docs/AGENT-QUICKSTART.md) · [公司定制指南](docs/CUSTOMIZE.md) · [架构与复用地图](docs/ARCHITECTURE.md)。安装包 `resources/guides` 内也包含这些说明，离线可读。
 
-## 自己安装
+## 一段命令安装（推荐）
+
+Windows 10/11 x64，在 PowerShell 粘贴执行。Hub 自带运行时，不要求 Node、Git 或管理员权限：
+
+```powershell
+$setup = Join-Path $env:TEMP ('ai-hub-install-' + [guid]::NewGuid() + '.ps1')
+Invoke-WebRequest -UseBasicParsing 'https://github.com/TianLin0509/ai-hub-community/releases/download/v0.1.0-preview.2/install-release.ps1' -OutFile $setup
+powershell -NoProfile -ExecutionPolicy Bypass -File $setup -Version v0.1.0-preview.2
+```
+
+脚本下载并校验便携 ZIP，按版本安装、创建桌面入口并启动；重复执行可复用已验证版本，旧版本和用户数据保留。缺少 CLI 时最后一行添加 `-Provider codex` 或 `-Provider claude`，会调用官方原生安装器；已有 CLI 不重复安装。**本人登录授权和模型使用权仍由使用者提供。**
+
+也可直接下载 [Windows 安装器 / 便携包 / 源码包](https://github.com/TianLin0509/ai-hub-community/releases/tag/v0.1.0-preview.2)。公司断网环境见 [离线安装](docs/AGENT-QUICKSTART.md#路线-b公司网络受限的离线交付)。
+
+## 从源码安装 / 开发
 
 **Windows 10/11 x64 + Node.js 22 或更新的 LTS**。源码包不要求管理员权限。
 

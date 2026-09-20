@@ -1,7 +1,7 @@
 const { app, BrowserWindow, ipcMain, clipboard, dialog, nativeImage, screen, shell, Menu } = require('electron');
 const path = require('path');
 const { community, personalModules } = require('./core/distribution');
-if (community) ipcMain.handle('community:setup', () => require('./core/community-setup').inspectSetup());
+if (community) ipcMain.handle('community:setup', () => require('./core/community-setup').inspectSetup({packaged:app.isPackaged}));
 const { fileURLToPath } = require('url');
 const fs = require('fs');
 const crypto = require('crypto');

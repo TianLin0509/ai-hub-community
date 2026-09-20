@@ -287,7 +287,7 @@ function ensureWindowsShellIntegration({
   // Older development launches created an English-named Desktop shortcut.
   // Keep a working user-customized link untouched; repair only this exact
   // Hub-owned filename when its executable, cwd, or icon no longer exists.
-  if (fsModule.existsSync(desktopLegacyPath)) {
+  if (!require('./distribution').community && fsModule.existsSync(desktopLegacyPath)) {
     try {
       let desktopShortcut = null;
       try { desktopShortcut = shell.readShortcutLink(desktopLegacyPath); } catch {}

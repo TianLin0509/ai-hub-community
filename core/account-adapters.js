@@ -41,7 +41,8 @@ function createAccountAdapters({dataDir,homeDir=os.homedir(),env=process.env,run
   if(row.provider==='bridge'){const v=await tool('bridge','check');return {state:v.logged_in?'signed_in':v.login_required?'login_required':'unknown',message:v.logged_in?'中转官方页面已确认登录；未读取或推进拉取游标':'请在原中转窗口完成验证',source:'中转浏览器'};}
   if(row.provider==='chatgpt-web'){external();const v=await require('./chatgpt-web-integration').webStatus();return {state:v.connected?'configured':'offline',message:v.connected?'原工具服务在线；网页登录须在原工具确认':v.message,source:'Codex Web GPT 服务健康，不是登录证明'};}
   if(row.provider==='claude'){
-   const r=await runImpl('claude.exe',['auth','status','--json'],cliEnv(row));let v;try{v=JSON.parse(r.stdout);}catch{throw Error('Claude 状态无效');}
+   const cmd=require('./community-provider').resolveClaudeCommand(cliEnv(row));
+   const r=await runImpl(cmd.command,[...cmd.args,'auth','status','--json'],cmd.env);let v;try{v=JSON.parse(r.stdout);}catch{throw Error('Claude 状态无效');}
    if(typeof v.loggedIn!=='boolean'||(r.code!==0&&v.loggedIn))throw Error('Claude 状态缺少登录证据');
    return {state:v.loggedIn?'signed_in':'login_required',identity:v.email,message:v.loggedIn?'Claude 官方 CLI 已确认本机登录；会话仍保留启动身份':'Claude 官方 CLI 报告尚未登录',source:'claude auth status'};
   }
@@ -79,10 +80,11 @@ function createAccountAdapters({dataDir,homeDir=os.homedir(),env=process.env,run
   if(row.provider==='images'){await tool('images','open',row.accountId);return {message:'已交给生图共享队列打开原账号浏览器；当前图片任务不会重发'};}
   if(row.provider==='chatgpt-web'){external();return require('./chatgpt-web-integration').openWebSettings();}
   let e=cliEnv(row),command,args;
+  if(['claude','codex','gemini','kimi'].includes(row.provider)) require('./community-provider').requireCommand(row.provider,e);
   if(row.provider==='codex'){const cmd=require('../main/codex-windows-command').resolveWindowsCodex(e);command=cmd.command;args=[...cmd.args,'login'];e=cmd.env;}
-  else if(row.provider==='claude'){command='claude.exe';args=['auth','login'];}
-  else if(row.provider==='kimi'){command='kimi.exe';args=['login'];}
-  else if(row.provider==='gemini'){command='gemini';args=[];}
+  else if(row.provider==='claude'){const cmd=require('./community-provider').resolveClaudeCommand(e);command=cmd.command;args=[...cmd.args,'auth','login'];e=cmd.env;}
+  else if(row.provider==='kimi'){command=require('./community-provider').requireCommand('kimi',e);args=['login'];}
+  else if(row.provider==='gemini'){command=require('./community-provider').requireCommand('gemini',e);args=[];}
   else if(row.provider==='token-plan'){command='bl';args=['auth','login','--console'];}
   else if(row.provider==='feishu'){external();command=getConfig().notifications?.feishuCliPath||require('./completion-notifier').resolveDefaultFeishuCliPath(e);args=['auth','login'];}
   else throw Error('此连接没有登录入口');

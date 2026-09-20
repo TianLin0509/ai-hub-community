@@ -36,7 +36,7 @@ let _escListener = null;
 let _meetingWorkspace = null;
 // 群聊与单会话同一个默认档：工作根（2026-08-31 平铺决策）。
 // 群聊尤其需要——180 场会议 100% 共用 cwd，本来就是「多个 AI 同一个目录」的场景。
-let _meetingWorkspaceMode = 'existing';
+let _meetingWorkspaceMode = DEFAULT_SCENE === 'general' ? 'default' : 'existing';
 // 项目库：已被 project-prep 整理过的项目（中文名 → 路径，按活跃时间排序）。
 // 建群那一刻从主进程取快照；「选择已有路径」的下拉和开发场景的 prompt 都用它。
 let _projectLibrary = [];
@@ -713,7 +713,7 @@ function openMeetingCreateModal(mode = 'general', options = {}) {
   };
   _clearError();
   _applyScene(DEFAULT_SCENE, { clearTitle: true, resetSlots: true });
-  _meetingWorkspaceMode = 'existing';
+  _meetingWorkspaceMode = DEFAULT_SCENE === 'general' ? 'default' : 'existing';
   _meetingWorkspace = null;
   _projectLibraryOpen = false;
   _paintWorkspace();

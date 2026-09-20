@@ -1104,6 +1104,7 @@ class SessionManager extends EventEmitter {
     } else this.reserveSessionOpen(id);
     const lease = this.openLeases?.get(id);
     try {
+      require('./community-provider').assertProviderAvailable(kind);
       if (lease) require('./session-store').resumeSessionWrites(id);
       return this._createSession(kind, {...opts, id});
     }

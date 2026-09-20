@@ -8,6 +8,7 @@
 #community-setup p { font-size:13px; line-height:1.65; margin:8px 0; }
 #community-providers,.community-setup-actions { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
 .community-provider { padding:5px 9px; border-radius:6px; background:var(--bg-primary,#fff); font-size:12px; }
+.community-provider button { border:0; background:transparent; color:var(--accent-color,#8ba8ff); text-decoration:underline; cursor:pointer; font:inherit; }
 .community-setup-actions button { padding:8px 12px; border:1px solid #c9d2df; border-radius:8px; background:var(--bg-primary,#fff); color:inherit; cursor:pointer; }
 #community-accounts { background:#2563eb; color:#fff; border-color:#2563eb; }
 .community-setup-note { opacity:.72; }
