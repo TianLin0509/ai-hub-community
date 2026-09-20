@@ -1,7 +1,18 @@
 'use strict';
 const fs=require('fs'),path=require('path'),{execFileSync}=require('child_process');
 const root=path.resolve(__dirname,'..');
-const files=execFileSync('git',['ls-files','--cached','--others','--exclude-standard','-z'],{cwd:root,encoding:'utf8'}).split('\0').filter(Boolean);
+const inventoryMode=fs.existsSync(path.join(root,'.git'))?'git':'source-archive';
+function archiveFiles(dir=root,prefix='') {
+  return fs.readdirSync(dir,{withFileTypes:true}).flatMap(entry=>{
+    // Generated dependencies/build/evidence are not part of a source release.
+    if(!prefix && ['node_modules','dist','artifacts','output'].includes(entry.name))return [];
+    const name=prefix+entry.name;
+    return entry.isDirectory()?archiveFiles(path.join(dir,entry.name),name+'/'):[name];
+  });
+}
+const files=inventoryMode==='git'
+  ? execFileSync('git',['ls-files','--cached','--others','--exclude-standard','-z'],{cwd:root,encoding:'utf8'}).split('\0').filter(Boolean)
+  : archiveFiles();
 const failures=[];
 const forbidden=/(^|\/)(?:auth\.json|config\.json|state\.json|\.env(?:\..*)?|Cookies|Login Data|\.claude|\.codex|\.qwen|\.gemini|\.kimi-code|transcripts|electron-userdata|node_modules|artifacts|output)(?:\/|$)/i;
 const checks=[
@@ -22,5 +33,5 @@ for(const file of files){
   if(file==='scripts/audit-public.js')continue;
   for(const [rule,pattern] of checks)if(pattern.test(text))failures.push({file,rule});
 }
-console.log(JSON.stringify({ok:failures.length===0,files:files.length,failures},null,2));
+console.log(JSON.stringify({ok:failures.length===0,inventoryMode,files:files.length,failures},null,2));
 process.exitCode=failures.length?1:0;

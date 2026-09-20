@@ -6,6 +6,18 @@ test('packaged readiness uses the bundled runtime without external electron depe
   const result=require('../core/community-setup').inspectSetup({packaged:true,root:os.tmpdir(),env:{PATH:'',USERPROFILE:os.tmpdir()},platform:'win32',version:'22.0.0'});
   assert.equal(result.ready,true);assert.equal(result.runtime,'bundled');
 });
+test('source ZIP audit works without Git and still rejects runtime files', t => {
+  const {root}=environment(t);
+  fs.mkdirSync(path.join(root,'scripts'));
+  const script=path.join(root,'scripts/audit-public.js');
+  fs.copyFileSync(path.resolve(__dirname,'../scripts/audit-public.js'),script);
+  const run=()=>require('child_process').spawnSync(process.execPath,[script],{encoding:'utf8',env:{...process.env,PATH:''}});
+  const clean=run();assert.equal(clean.status,0,clean.stderr);
+  assert.equal(JSON.parse(clean.stdout).inventoryMode,'source-archive');
+  fs.writeFileSync(path.join(root,'auth.json'),'{}');
+  const dirty=run();assert.equal(dirty.status,1);
+  assert.ok(JSON.parse(dirty.stdout).failures.some(f=>f.file==='auth.json'));
+});
 test('native Codex default installation is found before reopening the Windows shell', t => {
   const {root,env}=environment(t);env.LOCALAPPDATA=path.join(root,'local');
   const executable=path.join(env.LOCALAPPDATA,'Programs/OpenAI/Codex/bin/codex.exe');
