@@ -131,7 +131,22 @@ async function parseProviderTranscript(args = {}, deps) {
     const session = hubSessionId ? sessionManager.getSession(hubSessionId) : null;
     const nativeCodex = hubSessionId && (sessionManager.getNativeSession?.(hubSessionId) || sessionManager.getNativeCodex?.(hubSessionId));
     if (nativeCodex) {
-      if (!require('../../core/codex-native-runtime').isUnstartedRuntime(nativeCodex.runtime)) await nativeCodex.start();
+      try {
+        if (!require('../../core/codex-native-runtime').isUnstartedRuntime(nativeCodex.runtime)) await nativeCodex.start();
+      } catch (error) {
+        // A failed connection must not hide saved Codex history. Only read the
+        // bound, identity-checked file; this is not a reconnect or turn replay.
+        const sid=session?.codexSid || nativeCodex.runtime?.threadId;
+        const saved=session?.transcriptPath || nativeCodex.options?.resumePath;
+        if (session?.runtimeBackend !== 'codex-app-server' || !sid || !saved
+            || !validateCodexRolloutPath(saved,sid)) throw error;
+        transcriptPath=saved;
+        const parseOpts={limit:50,fromTail:true,...opts};
+        const parsed=await runTranscriptParser(deps,'codex',saved,parseOpts,parseCodexRolloutToTurns);
+        return {turns:await withInheritedBranchTurns(args,deps,session,parsed.turns,parseOpts,saved),
+          transcriptPath:saved,source:'codex-rollout',error:null,connectionError:error.message,
+          parseMs:parsed.meta.parseMs,parseCacheHit:!!parsed.meta.cacheHit};
+      }
       const refreshIds=session?.runtimeBackend==='codex-app-server' && Array.isArray(opts?.refreshTurnIds)
         ? [...new Set(opts.refreshTurnIds.filter(id=>typeof id==='string' && id.length<=256))].slice(0,128) : [];
       const displayIds=new Set(Array.isArray(opts?.refreshDisplayIds)?opts.refreshDisplayIds.filter(id=>typeof id==='string' && id.length<=512).slice(0,4096):[]);
@@ -144,7 +159,7 @@ async function parseProviderTranscript(args = {}, deps) {
         });
       return {turns:nativeCodex.readTranscript({...opts,toolPreviews:true}),
         refreshedTurns,transcriptPath:session?.transcriptPath || null,
-        error:null,source:nativeCodex.options?.kind && require('../../core/acp-profiles').isAcpKind(nativeCodex.options.kind) ? 'acp' : 'codex-app-server'};
+        error:null,source:nativeCodex.isCliProvider ? 'provider-cli' : nativeCodex.options?.kind && require('../../core/acp-profiles').isAcpKind(nativeCodex.options.kind) ? 'acp' : 'codex-app-server'};
     }
     const native = hubSessionId && sessionManager.getNativeClaude?.(hubSessionId);
     if (native) {
@@ -173,6 +188,16 @@ async function parseProviderTranscript(args = {}, deps) {
       && !(session && session.codexSid);
     const runtimeKind = (session && session.transcriptKind)
       || (isLegacyDeepSeek ? 'deepseek-legacy' : kind);
+
+    if(/^gemini(?:-resume)?$/.test(String(runtimeKind||''))){
+      const bound=session||(hubSessionId?lookupSessionRecord(hubSessionId,deps)?.record:null);
+      transcriptPath=bound?.transcriptPath||inPath||null;
+      if(!transcriptPath)return {turns:[],transcriptPath:null,error:'Gemini 原生记录尚未绑定，请等待 CLI 启动'};
+      const parseOpts={limit:50,fromTail:true,...opts,expectedSessionId:bound?.geminiChatId};
+      const parsed=await runTranscriptParser(deps,'gemini',transcriptPath,parseOpts,
+        require('../../core/gemini-transcript-parser').parseGeminiTranscriptToTurns);
+      return {turns:parsed.turns,transcriptPath,error:null,source:'gemini-cli'};
+    }
 
     if (isCodexCliKind(runtimeKind)) {
       const liveRolloutPath = hubSessionId ? transcriptTap.getCodexRolloutPath(hubSessionId) : null;
@@ -261,7 +286,13 @@ async function parseProviderTranscript(args = {}, deps) {
     }
     const parseOpts = { limit: 50, fromTail: true, ...(opts && typeof opts === 'object' ? opts : {}) };
     const parseStartedAt = Date.now();
-    const parsed = await runTranscriptParser(deps, 'claude', transcriptPath, parseOpts, parseClaudeTranscriptToTurns);
+    // Claude 卡片与原生会话走同一套投影（claude-disk-transcript）：过程/结果分段、
+    // 工具状态与耗时都对齐。旧 DeepSeek-Claude 兼容会话保持原解析器。
+    const nativeProjection = typeof deps.parseClaudeTranscriptToNativeTurns === 'function'
+      && !/^deepseek-legacy/.test(String(runtimeKind || ''));
+    const parsed = nativeProjection
+      ? await runTranscriptParser(deps, 'claude-native', transcriptPath, parseOpts, deps.parseClaudeTranscriptToNativeTurns)
+      : await runTranscriptParser(deps, 'claude', transcriptPath, parseOpts, parseClaudeTranscriptToTurns);
     return {
       turns: await withInheritedBranchTurns(args, deps, session, parsed.turns, parseOpts, transcriptPath),
       transcriptPath,

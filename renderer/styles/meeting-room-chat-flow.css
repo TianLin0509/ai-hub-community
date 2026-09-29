@@ -90,7 +90,7 @@
   overflow: auto;
   padding: 8px 18px 20px;
 }
-/* 2026-06-28 道雪：收紧群聊消息密度（消息间距/气泡内边距/行距），一屏看更多内容。 */
+/* 2026-06-28 maintainer：收紧群聊消息密度（消息间距/气泡内边距/行距），一屏看更多内容。 */
 .mr-gc-msg {
   display: flex;
   gap: 9px;
@@ -189,7 +189,7 @@
   background: rgba(var(--rgb-success), 0.18);
   color: var(--mark-green);
 }
-/* 2026-06-28 道雪：AI 气泡 hover「重新提取」(↻) —— 提取错时手动重新同步本轮回答。
+/* 2026-06-28 maintainer：AI 气泡 hover「重新提取」(↻) —— 提取错时手动重新同步本轮回答。
    位于气泡操作区（复制/prompt 旁），默认隐藏、hover 浮现，与复制按钮同节奏。
    复用 data-gc-sync-answer → _handleGcManualSync（点击委托已覆盖）。 */
 .mr-gc-resync-btn {
@@ -322,7 +322,7 @@
   line-height: 1.74;
   word-break: break-word;
 }
-/* 2026-06-28 道雪 [改进1]：长回答折叠——超阈值默认折叠 + 渐变遮罩 + 展开按钮 */
+/* 2026-06-28 maintainer [改进1]：长回答折叠——超阈值默认折叠 + 渐变遮罩 + 展开按钮 */
 .mr-gc-bubble.mr-gc-collapsible {
   max-height: 360px;
   overflow: hidden;
@@ -349,7 +349,7 @@
   cursor: pointer;
 }
 .mr-gc-expand-btn:hover { background: rgba(var(--rgb-info), 0.12); border-color: rgba(var(--rgb-info), 0.5); }
-/* 2026-06-28 道雪 [改进2]：回到最新悬浮按钮 */
+/* 2026-06-28 maintainer [改进2]：回到最新悬浮按钮 */
 .mr-gc-thread { position: relative; }
 .mr-gc-scroll-bottom {
   position: absolute;
@@ -369,9 +369,9 @@
 }
 .mr-gc-scroll-bottom.visible { opacity: 0.95; pointer-events: auto; }
 .mr-gc-scroll-bottom:hover { opacity: 1; }
-/* 2026-06-28 道雪 [改进3]：回答字数标签 */
+/* 2026-06-28 maintainer [改进3]：回答字数标签 */
 .mr-gc-wordcount { color: var(--mr-gc-muted, var(--fg-muted)); font-size: 10.5px; opacity: 0.85; }
-/* 2026-06-28 道雪 [改进5]：AI 名字品牌色（快速辨认发言者） */
+/* 2026-06-28 maintainer [改进5]：AI 名字品牌色（快速辨认发言者） */
 .mr-gc-name { font-weight: 600; }
 .ai-name-claude   { color: var(--mark-red); }
 .ai-name-deepseek { color: var(--mark-indigo); }
@@ -381,7 +381,7 @@
 .ai-name-kimi     { color: var(--mark-amber); }
 .ai-name-qwen     { color: var(--brand); }
 .ai-name-glm      { color: #3859ff; }
-/* 2026-06-28 道雪 [改进R2-1]：代码块一键复制按钮 */
+/* 2026-06-28 maintainer [改进R2-1]：代码块一键复制按钮 */
 .mr-gc-md pre { position: relative; }
 .mr-gc-code-copy {
   position: absolute; top: 6px; right: 6px;
@@ -394,10 +394,10 @@
 }
 .mr-gc-md pre:hover .mr-gc-code-copy { opacity: 0.9; }
 .mr-gc-code-copy:hover { opacity: 1; background: rgba(var(--rgb-info), 0.22); color: var(--fg-strong); }
-/* 2026-06-28 道雪 [改进R2-4]：消息 hover 聚焦高亮（悬停整条微高亮，聚焦阅读） */
+/* 2026-06-28 maintainer [改进R2-4]：消息 hover 聚焦高亮（悬停整条微高亮，聚焦阅读） */
 .mr-gc-msg { border-radius: var(--radius-md); transition: background .15s; }
 .mr-gc-msg:hover { background: rgba(var(--rgb-neutral), 0.06); }
-/* 2026-06-28 道雪 [改进R2-3]：折叠/展开全部悬浮按钮（在"回到最新"上方） */
+/* 2026-06-28 maintainer [改进R2-3]：折叠/展开全部悬浮按钮（在"回到最新"上方） */
 .mr-gc-collapse-all {
   position: absolute; right: 16px; bottom: 52px;
   z-index: 5; padding: 5px 12px; font-size: 12px;
@@ -409,7 +409,7 @@
 }
 .mr-gc-collapse-all.visible { opacity: 0.92; pointer-events: auto; }
 .mr-gc-collapse-all:hover { opacity: 1; }
-/* 2026-06-28 道雪 [改进R2-2]：轮次分隔线 */
+/* 2026-06-28 maintainer [改进R2-2]：轮次分隔线 */
 .mr-gc-turn-sep {
   display: flex; align-items: center; gap: 10px;
   margin: 16px 6px 8px;
@@ -420,7 +420,7 @@
   content: ""; flex: 1; height: 1px;
   background: var(--mr-gc-border, rgba(var(--rgb-neutral), 0.25));
 }
-/* 2026-06-28 道雪 [改进R2-5]：群聊内搜索框 + 过滤淡化 */
+/* 2026-06-28 maintainer [改进R2-5]：群聊内搜索框 + 过滤淡化 */
 .mr-gc-search-row { display: flex; align-items: center; gap: 8px; padding: 4px 14px 2px; }
 .mr-gc-search {
   flex: 1; max-width: 320px; height: 26px; padding: 0 10px; font-size: 12px;
@@ -584,7 +584,7 @@
 .mr-gc-waiting {
   color: var(--mr-gc-muted);
 }
-/* 2026-07-12 道雪：空内容的 errored/superseded/absent 消息占位文案——
+/* 2026-07-12 maintainer：空内容的 errored/superseded/absent 消息占位文案——
    替代旧"空气泡+裸图标排"，弱化显示但保持可读。 */
 .mr-gc-empty-placeholder {
   color: var(--mr-gc-muted);
@@ -944,7 +944,7 @@
   line-height: 1.6;
 }
 
-/* 2026-06-21 道雪：原断点 1100px 太宽——Hub 右侧开预览分屏挤压主区时极易跌破，导致右侧
+/* 2026-06-21 maintainer：原断点 1100px 太宽——Hub 右侧开预览分屏挤压主区时极易跌破，导致右侧
    成员/职责/账本栏整块消失且无提示。降到 860px：860-1100 区间保留侧栏（用户可用顶部
    "收起"按钮手动折叠），真正窄(<860)时才自动隐藏，避免常态误隐。 */
 @media (max-width: 860px) {
@@ -958,7 +958,7 @@
 /* Arch refactor 2026-05-02: .mr-terminals + .mr-terminals.focus-mode 已删除
    (AI 群聊界面不再 mount xterm，shell 沉到子 session 主区 view)。 */
 
-/* 2026-07-20 道雪 [修#9]：悬空用户消息的"已被重启打断"标记 */
+/* 2026-07-20 maintainer [修#9]：悬空用户消息的"已被重启打断"标记 */
 .mr-gc-interrupted-note { color: var(--mr-gc-muted, var(--fg-muted)); font-size: 10px; }
 
 /* 2026-09-06：派发卡片（发给工作位 / 发给合并位）+ 循环自愈的系统提示行。

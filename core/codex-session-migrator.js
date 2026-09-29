@@ -6,7 +6,7 @@
 //
 //     Choose working directory to resume this session
 //     Current = your current working directory
-//     › 1. Use session directory (\\?\C:\Vibe\_scratch\inbox-...)
+//     › 1. Use session directory (\\?\C:\Workspace\_scratch\inbox-...)
 //       Press enter to continue
 //
 // 根因是 workspace-handlers.js 里一句写进注释的错误推论：

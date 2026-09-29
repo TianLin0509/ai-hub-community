@@ -14,10 +14,11 @@
 //   - cmd:       `C:\Users\xxx>`
 //   - bash:      `user@host:~$`、`$`
 //   都要求出现在行首、tail 末尾结束（^/(?:\n|^) 锚 + $\s*$ 锚）
-const HOST_SHELL_PROMPT_RE = /(?:^|\n)\s*(?:PS [A-Za-z]:\\[^\n]*?>\s*$|[\w-]+@[^\s]+:[^\s]*?\$\s*$|\$\s*$|[A-Za-z]:\\[^\n]*?>\s*$)/;
+const HOST_SHELL_PROMPT_RE = /(?:^|\n)\s*(?:PS [A-Za-z]:\\[^\n]*?>\s*(?:\n\s*>>\s*)*$|[\w-]+@[^\s]+:[^\s]*?\$\s*$|\$\s*$|[A-Za-z]:\\[^\n]*?>\s*$)/;
 
 function stripAnsi(buf) {
   return String(buf || '')
+    .replace(/\x1b\[(\d*)C/g, (_match, count) => ' '.repeat(Math.min(Number(count) || 1, 200)))
     .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
     .replace(/\x1b\][^\x07]*\x07/g, '')
     .replace(/\x1b[()][0-9A-Za-z]/g, '')
@@ -32,8 +33,31 @@ function detectHostShellTakeover(rawBuffer) {
   return HOST_SHELL_PROMPT_RE.test(tail);
 }
 
+// Codex 0.153 的 /new 在同一个 TUI 里结束当前线程时，先打印
+// "To continue this session, run codex resume, then select … (<旧线程 id>)"，再以
+// source=startup 报新线程的 SessionStart（2026-09-26 真机实测，不是 clear）。只认带着
+// 「当前绑定线程 id」的这句提示：模型在工具里嵌套跑的 codex 不会把父线程 id 画到这个终端上。
+// ConPTY 用光标移动代替空格、长 id 会折行，所以去掉控制序列与全部空白后再比对。
+// 只看最后一次这样的提示，它必须指向当前绑定的线程。
+function detectCodexThreadEnded(rawBuffer, boundSid) {
+  const sid = String(boundSid || '').replace(/\s+/g, '');
+  if (!rawBuffer || !sid) return false;
+  const compact = stripAnsi(rawBuffer).replace(/\s+/g, '');
+  const at = compact.lastIndexOf('Tocontinuethissession');
+  if (at < 0) return false;
+  const hint = compact.slice(at);
+  // 0.157.1 prints the executable resume command directly, without the old
+  // title + parenthesized id. Match the UUID in that command, not arbitrary
+  // occurrences of the bound id elsewhere in a newer thread's output.
+  const direct = /^Tocontinuethissession,runcodexresume([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f-])/i.exec(hint);
+  if (direct) return direct[1] === sid;
+  const parenthesized = /^Tocontinuethissession,runcodexresume\(([^)]+)\)/.exec(hint);
+  if (parenthesized) return parenthesized[1] === sid;
+  return hint.startsWith('Tocontinuethissession,runcodexresume,thenselect') && hint.includes(`(${sid})`);
+}
+
 // ---------------------------------------------------------------------------
-// createAuthBannerMonitor — CLI 登录失效横幅检测（2026-07-12 道雪）。
+// createAuthBannerMonitor — CLI 登录失效横幅检测（2026-07-12 maintainer）。
 //   血泪：旧实现在 dispatcher 心跳里对整个 8KB ring buffer 裸测 AUTH_FAILURE_RE，
 //   AI 回答/工具输出里提到 "not logged in"（如 gh CLI 报 "not logged into any
 //   GitHub hosts"）就被当场 markErrored('auth_required') —— PTY 明明在正常回答，
@@ -73,5 +97,6 @@ module.exports = {
   AUTH_FAILURE_RE,
   stripAnsi,
   detectHostShellTakeover,
+  detectCodexThreadEnded,
   createAuthBannerMonitor,
 };

@@ -239,13 +239,13 @@ function createTerminalActivityMonitor({
       return;
     }
 
-    // 2026-07-21 道雪 [修进行中误判]：记录最近输出时间，供周期性兜底回收
+    // 2026-07-21 maintainer [修进行中误判]：记录最近输出时间，供周期性兜底回收
     //   判断"语义 running 但 45min 无任何输出 = 卡死"。
     session._lastOutputTs = now;
 
     dataCounters.set(sessionId, (dataCounters.get(sessionId) || 0) + dataLen);
 
-    // 2026-07-20 道雪：byte burst 只在"无语义工作信号"的 kind 上标记 running
+    // 2026-07-20 maintainer：byte burst 只在"无语义工作信号"的 kind 上标记 running
     //   （powershell / gemini / deepseek 等）。claude(hook prompt/stop) 与
     //   codex/kimi(transcript/cardWorking) 的 running 由语义事件驱动——否则
     //   用户在 TUI 输入框打字时的整屏重绘 >200B 会被误判为"agent 运行中"。

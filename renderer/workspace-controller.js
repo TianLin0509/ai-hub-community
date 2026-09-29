@@ -8,6 +8,10 @@
     DEFAULT_MODEL_BY_KIND,
     setRuntimeModelOptions,
   } = require('../core/model-options.js');
+  const {
+    isDefaultModel,
+    resolveDefaultModel,
+  } = require('../core/default-model-preference.js');
   const { defaultCodexContextWindow } = require('../core/codex-context-window.js');
 
   const KIND_LABELS = {
@@ -68,16 +72,23 @@
   let chatgptCatalog = null;
   let codexTuningCatalog = null;
   let claudeModelCatalog = null;
-  let codexCatalogInFlight = null;
+  const codexCatalogInFlight = new Map();
+  let codexAccounts = [];
+  let codexAccountId = '';
+  let codexBackend = 'subscription';
+  let accountSaving = false;
+  let pendingAccountId = '';
+  let accountReadError = '';
+  let accountNotice = '';
+  let configReadRevision = 0;
   let claudeCatalogInFlight = null;
   // 2026-08-29 起三家统一默认 none：一个 MCP 都不加载，要用哪个当场选。
-  // 起因是 superran 这个 MCP 每个进程恒定提交 2.66 GB（实占只有 20–30 MB），
+  // 起因是 wireless-sim 这个 MCP 每个进程恒定提交 2.66 GB（实占只有 20–30 MB），
   // Claude 原来默认 full，13 个会话就吃掉 34.6 GB 提交内存。
   const MCP_OPTIONS = {
     claude: [
       ['none', 'None · 默认，不加载任何 MCP'],
       ['browser', 'Browser · 只留 Playwright / Chrome'],
-      ['wireless', 'Wireless · 只留 superran'],
       ['lean', 'Lean · 仅保留 workspace / 群聊 MCP'],
       ['full', 'Full · 继承全部全局 MCP（最占内存）'],
     ],
@@ -85,7 +96,6 @@
       ['none', 'None · 默认，不加载任何 MCP'],
       ['lean', 'Lean · 仅保留 workspace / 群聊 MCP'],
       ['browser', 'Browser · 只留 Playwright'],
-      ['wireless', 'Wireless · 只留 superran'],
       ['full', 'Full · 全部全局 MCP'],
     ],
   };
@@ -154,15 +164,49 @@
     return options;
   }
 
+  // 用户在新建会话面板点过「设为默认」的 per-CLI 模型。由 main 从 config.json
+  // 读来，空表示沿用 model-options.js 的出厂默认值。
+  //
+  // 模块加载时就拉一次，不能只在打开新建会话面板时拉：群聊/圆桌成员走的是
+  // resolveSessionTuning，它不经过那个面板，晚加载的话成员会一律回落出厂默认。
+  let hubDefaultModels = {};
+  // 本轮面板里用户有没有亲手动过模型下拉。异步回读配置后靠它决定能不能覆盖
+  // 当前选择，避免把用户刚选的值改掉。
+  let modelTouchedByUser = false;
+
+  function defaultModelConfig() {
+    return { defaultModels: hubDefaultModels };
+  }
+
+  // 读一次用户设过的默认模型。读不到就保持空表、回落出厂默认值 —— 这条路径
+  // 决定的只是"预选哪个"，失败不该挡住新建会话。
+  async function loadHubDefaultModels() {
+    const revision=++configReadRevision;
+    try {
+      const config = await ipcRenderer.invoke('get-hub-config');
+      hubDefaultModels = (config && config.defaultModels) || {};
+      if (!accountSaving && revision===configReadRevision) {
+        codexAccounts=(config.codexSubscriptionProfiles || []).map(p=>({...p,email:config.codexProfileIdentities?.[p.id] || ''}));
+        codexAccountId=config.codexSubscriptionProfile || '';
+        codexBackend=config.codexBackend;
+        accountReadError='';
+      }
+    } catch (error) {
+      hubDefaultModels = {};
+      accountReadError='账号配置读取失败：'+error.message;
+    }
+    return hubDefaultModels;
+  }
+
   // 新建 Session 与群聊成员共用这一份纯计算结果。群聊不能复制一套静态枚举：
   // Codex 的 effort / fast 支持会随模型目录变化，复制后迟早与单会话弹窗漂移。
   function resolveSessionTuning(kind, modelId, selection = {}) {
     const modelOptions = modelOptionsFor(kind);
+    // 用户设过默认就用它，否则才回落出厂值；两者都不在当前可选清单里时取第一项。
+    // 群聊成员走的也是这里，所以「设为默认」对群聊同样生效。
     const model = modelOptions.some(option => option.id === modelId)
       ? modelId
-      : ((DEFAULT_MODEL_BY_KIND[kind] && modelOptions.some(option => option.id === DEFAULT_MODEL_BY_KIND[kind]))
-        ? DEFAULT_MODEL_BY_KIND[kind]
-        : (modelOptions[0] ? modelOptions[0].id : ''));
+      : resolveDefaultModel(kind, defaultModelConfig(), modelOptions.map(option => option.id));
     const effortOptions = EFFORT_KINDS.has(kind) ? effortOptionsFor(kind, model) : [];
     const kindDefaultEffort = defaultEffortFor(kind);
     const fallbackEffort = effortOptions.some(([value]) => value === kindDefaultEffort)
@@ -830,7 +874,44 @@
     });
   }
 
+  // 「设为默认」按钮的三种状态：已是默认（禁用，用来回答"当前默认是不是它"）、
+  // 可设为默认、以及 chatgpt 这种没有稳定模型 id 的 kind（整个隐藏）。
+  function paintDefaultModelButton() {
+    const button = document.getElementById('new-session-model-default');
+    if (!button) return;
+    const supported = !!selectedModel && selectedKind !== 'chatgpt';
+    button.hidden = !supported;
+    if (!supported) return;
+    const already = isDefaultModel(selectedKind, selectedModel, defaultModelConfig());
+    button.disabled = already;
+    button.textContent = already ? '默认 ✓' : '设为默认';
+    button.title = already
+      ? `新建 ${selectedKind} 会话时默认就用这个模型`
+      : `把 ${selectedModel} 设为新建 ${selectedKind} 会话的默认模型`;
+  }
+
   function paintTuning() {
+    const accountField=document.getElementById('new-session-account-field');
+    const accountSelect=document.getElementById('new-session-account');
+    const accountNote=document.getElementById('new-session-account-note');
+    const showAccount=selectedKind === 'codex' && codexBackend !== 'api';
+    if (accountField) accountField.hidden=!showAccount;
+    if (accountNote) {
+      accountNote.hidden=!showAccount;
+      accountNote.textContent=accountReadError || (accountSaving ? '正在切换全局账号…' : accountNotice)
+        || '选择后立即设为全局账号。新建、恢复和重启都跟随；正在回答的会话在本轮结束后切换。';
+    }
+    if (accountSelect) {
+      const signature=JSON.stringify(codexAccounts);
+      if (accountSelect.dataset.accounts !== signature) {
+        // The hand-typed label has been wrong before; lead with the account the profile is
+        // actually logged into and keep the label as the secondary hint.
+        accountSelect.innerHTML=codexAccounts.map(p=>`<option value="${escapeHtml(p.id)}">${escapeHtml(p.email ? `${p.email}（${p.label || p.id}）` : `${p.label || p.id} · 账号未确认`)}</option>`).join('');
+        accountSelect.dataset.accounts=signature;
+      }
+      accountSelect.value=pendingAccountId || codexAccountId;
+      accountSelect.disabled=accountSaving || submitting || !codexAccounts.length || !!accountReadError;
+    }
     const label = document.getElementById('new-session-tuning-label');
     const grid = document.getElementById('new-session-tuning');
     const modelSelect = document.getElementById('new-session-model');
@@ -864,7 +945,8 @@
 
     if (!options.some(option => option.id === selectedModel)) {
       selectedModel = selectedKind === 'chatgpt' && selectedModel.startsWith('chatgpt-web/')
-        ? selectedModel : DEFAULT_MODEL_BY_KIND[selectedKind] || options[0].id;
+        ? selectedModel
+        : resolveDefaultModel(selectedKind, defaultModelConfig(), options.map(option => option.id));
     }
     const wanted = options.map(option => `${option.id}\u0000${option.label}`).join('|');
     if (modelSelect.dataset.builtFor !== wanted) {
@@ -883,6 +965,7 @@
       modelSelect.appendChild(unavailable);
     }
     modelSelect.value = selectedModel;
+    paintDefaultModelButton();
 
     const effortLabel = document.getElementById('new-session-effort-label');
     const fastField = document.getElementById('new-session-fast-field');
@@ -1036,7 +1119,7 @@
       summary.title = summaryTitle();
     }
     const submit = document.getElementById('new-session-submit');
-    if (submit) submit.disabled = submitting || (workspaceMode === 'existing' && !existingWorkspace);
+    if (submit) submit.disabled = submitting || accountSaving || (selectedKind === 'codex' && !!accountReadError) || (workspaceMode === 'existing' && !existingWorkspace);
   }
 
   // The footer states where the session will actually land, so a mis-set
@@ -1061,6 +1144,7 @@
 
   function summaryText() {
     const parts = [KIND_LABELS[selectedKind] || selectedKind];
+    if (selectedKind === 'codex' && codexBackend !== 'api') {const p=codexAccounts.find(x=>x.id===codexAccountId);parts.push(p?(p.email||p.label||p.id):'读取账号中');}
     const tuning = tuningTag();
     if (tuning) {
       if (selectedKind === 'chatgpt') parts[0] = tuning;
@@ -1112,8 +1196,28 @@
     existingWorkspace = requestedWorkspace;
     void loadPreparedProjects();
     submitting = false;
-    selectedModel = selectedKind === 'chatgpt' ? 'chatgpt-web/high' : DEFAULT_MODEL_BY_KIND[selectedKind] || '';
+    selectedModel = selectedKind === 'chatgpt'
+      ? 'chatgpt-web/high'
+      : resolveDefaultModel(selectedKind, defaultModelConfig());
+    modelTouchedByUser = false;
     applyTuningMemory(selectedKind);
+    // 配置可能在别处被改过（设置面板、手改 config.json）。重读一次再决定预选值。
+    //
+    // 判据只能是「用户这轮有没有亲手动过模型下拉」，不能拿「当前值是否等于出厂
+    // 默认」来推断：同步那次 paint 可能已经把值换成了 options[0]（出厂默认不在
+    // 当前清单里时就会这样），判据直接落空、用户设的默认值被丢掉；反过来，用户
+    // 手选的模型若恰好等于出厂默认，又会被这次回读悄悄改掉。
+    void loadHubDefaultModels().then(async () => {
+      if (selectedKind === 'codex') await loadCodexTuningCatalog();
+      if (!modelTouchedByUser && selectedKind !== 'chatgpt') {
+        selectedModel = resolveDefaultModel(
+          selectedKind,
+          defaultModelConfig(),
+          modelOptionsFor(selectedKind).map(option => option.id),
+        );
+      }
+      paint();
+    }).catch(() => {});
     setError('');
     renderRecommendations();
     renderRecent();
@@ -1161,13 +1265,15 @@
   // Main 优先调用 codex app-server model/list；失败再读 models_cache.json。
   // renderer 不做永久缓存，main 的短 TTL 既避免频繁拉进程，又能在 CLI 更新目录后自动刷新。
   async function loadCodexTuningCatalog(options = {}) {
-    if (codexCatalogInFlight) return codexCatalogInFlight;
-    codexCatalogInFlight = (async () => {
+    const profileId=options.codexProfile || codexAccountId;
+    if (codexCatalogInFlight.has(profileId)) return codexCatalogInFlight.get(profileId);
+    const task = (async () => {
       try {
         const result = await ipcRenderer.invoke('codex:tuning-catalog', {
           force: options.force === true,
-          codexProfile: options.codexProfile || undefined,
+          codexProfile: profileId || undefined,
         });
+        if (profileId !== codexAccountId) return result;
         if (result && result.ok) {
           codexTuningCatalog = result;
           if (Array.isArray(result.models) && result.models.length) {
@@ -1175,6 +1281,7 @@
           }
         }
       } catch (error) {
+        if (profileId !== codexAccountId) throw error;
         codexTuningCatalog = {
           ok: false,
           refreshError: error && error.message ? error.message : String(error),
@@ -1182,8 +1289,9 @@
         };
       }
       return codexTuningCatalog;
-    })().finally(() => { codexCatalogInFlight = null; });
-    return codexCatalogInFlight;
+    })().finally(() => { codexCatalogInFlight.delete(profileId); });
+    codexCatalogInFlight.set(profileId,task);
+    return task;
   }
 
   async function loadClaudeModelCatalog() {
@@ -1253,7 +1361,7 @@
   }
 
   async function submitNewSession() {
-    if (submitting) return null;
+    if (submitting || accountSaving || (selectedKind === 'codex' && accountReadError)) return null;
     setError('');
     let workspace = existingWorkspace;
     if (workspaceMode === 'existing' && !workspace) {
@@ -1289,6 +1397,28 @@
     menuEl = document.getElementById('new-session-menu');
     if (!menuEl) return;
 
+    document.getElementById('new-session-account')?.addEventListener('change', async event => {
+      if (accountSaving) return;
+      const profileId=event.target.value;
+      accountSaving=true;pendingAccountId=profileId;configReadRevision++;accountNotice='';setError('');paint();
+      try {
+        const result=await ipcRenderer.invoke('codex:set-global-account',{profileId});
+        if (!result?.ok) throw new Error(result?.error || '账号切换失败');
+        codexAccountId=result.profileId;
+        const failed=(result.sessions || []).filter(s=>s?.error).length;
+        const pending=(result.sessions || []).filter(s=>s?.pending).length;
+        accountNotice=failed ? `全局账号已保存；${failed} 个会话切换失败，请查看会话提示并重试恢复。`
+          : pending ? `全局账号已切换；${pending} 个进行中的会话将在本轮结束后切换。` : '全局账号已切换，新建、恢复和重启会话均跟随。';
+        codexTuningCatalog=null;
+        await loadCodexTuningCatalog({force:true});
+      } catch(error) { setError(error.message); }
+      finally { accountSaving=false;pendingAccountId='';paint(); }
+    });
+    ipcRenderer.on('codex-global-account-changed',()=>{
+      if (accountSaving) return;
+      void loadHubDefaultModels().then(()=>loadCodexTuningCatalog()).then(paint).catch(error=>setError(error.message));
+    });
+
     document.getElementById('chatgpt-web-settings')?.addEventListener('click', async () => {
       try { await ipcRenderer.invoke('chatgpt-web:settings'); } catch (error) { setError(error.message); }
     });
@@ -1296,7 +1426,7 @@
     menuEl.querySelectorAll('.new-session-option').forEach(button => {
       button.addEventListener('click', () => {
         rememberTuning(selectedKind);
-        selectedKind = button.dataset.kind === 'deepseek' ? (document.getElementById('new-session-deepseek-route')?.value || 'deepseek-acp') : button.dataset.kind || 'claude';
+        selectedKind = button.dataset.kind === 'deepseek' ? (document.getElementById('new-session-deepseek-route')?.value || 'deepseek') : button.dataset.kind || 'claude';
         applyTuningMemory(selectedKind);
         setError('');
         paint();
@@ -1329,6 +1459,34 @@
     if (modelSelect) {
       modelSelect.addEventListener('change', () => {
         selectedModel = modelSelect.value;
+        modelTouchedByUser = true;
+        paint();
+      });
+    }
+    const defaultModelButton = document.getElementById('new-session-model-default');
+    if (defaultModelButton) {
+      defaultModelButton.addEventListener('click', async event => {
+        // 按钮嵌在 <label for="new-session-model"> 里，不拦住就会连带聚焦并展开下拉。
+        event.preventDefault();
+        event.stopPropagation();
+        if (defaultModelButton.disabled) return;
+        const kind = selectedKind;
+        const model = selectedModel;
+        defaultModelButton.disabled = true;
+        try {
+          const result = await ipcRenderer.invoke('session:set-default-model', {
+            kind,
+            model,
+            // 把下拉里真正能选的清单一并带上：ACP 那几个 kind 会有用户自配的
+            // 模型，main 侧的静态清单认不出来。
+            available: modelOptionsFor(kind).map(option => option.id),
+          });
+          if (!result || !result.ok) throw new Error((result && result.error) || '保存失败');
+          hubDefaultModels = result.defaultModels || {};
+          setError('');
+        } catch (error) {
+          setError(`设为默认失败：${error && error.message ? error.message : error}`);
+        }
         paint();
       });
     }
@@ -1369,6 +1527,9 @@
       if (button) button.addEventListener('click', closeNewSessionModal);
     }
     paint();
+    // 默认模型要在这里就拉起来：群聊成员走 resolveSessionTuning，不经过新建
+    // 会话面板，等到面板打开才加载的话成员会一律回落出厂默认。
+    void loadHubDefaultModels().then(paint).catch(() => {});
     // 预热工作区信息：workspaceTierLabel() 要靠 flatWorkRoot 才能把工作根显示成
     // 「工作根」而不是「组织根·不可用」，而侧边栏 / 会话 header 的 chip 可能在
     // 启动中心第一次打开之前就调用它。不预热就会先闪一次错误标签。

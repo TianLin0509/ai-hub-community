@@ -2,6 +2,7 @@
 
 const { HubRestart, restartToken, ARG } = require('../../core/hub-restart');
 const F = require('../../core/dev-file-workflow');
+const D = require('../../core/delivery-workflow');
 const { nativeSessionIdentity } = require('../../core/session-capabilities');
 const clone = value => JSON.parse(JSON.stringify(value));
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -33,12 +34,13 @@ function registerHubRestartIpc(ipcMain, deps) {
     const groups=[];
     for (const m of mm.getAllMeetings()) {
       const members=rows.filter(s => s.meetingId === m.id);
-      if (!m.groupChat || !members.length || (!members.some(s => s.before === 'working') && !global.__loopEngine?.isRunning(m.id) && !global.__devFileEngine?.status(m.id)?.running)) continue;
+      if (!m.groupChat || !members.length || (!members.some(s => s.before === 'working') && !global.__loopEngine?.isRunning(m.id) && !global.__devFileEngine?.status(m.id)?.running && !global.__deliveryEngine?.isBusy(m.id))) continue;
       const workflow = clone(m.serialWorkflow || {});
       groups.push({ id:m.id, title:m.title, sessionIds:members.map(s => s.id), workingIds:members.filter(s => s.before === 'working').map(s => s.id),
         memberIds:members.filter(s => s.before === 'working').map(s => {
           const index=m.subSessions.indexOf(s.id); return m.slotSpecs?.[index]?.memberId || 'm'+(index+1);
-        }), workflow, kind:F.enabled(m) ? 'file' : global.__loopEngine?.isRunning(m.id)
+        }), workflow, deliveryPaused:D.enabled(m) && global.__deliveryEngine?.status(m.id)?.paused,
+        kind:D.enabled(m) ? 'delivery' : F.enabled(m) ? 'file' : global.__loopEngine?.isRunning(m.id)
           ? global.__loopEngine.getStatus(m.id).mode : 'group', status:'pending' });
     }
     return groups;
@@ -47,7 +49,12 @@ function registerHubRestartIpc(ipcMain, deps) {
     const n=native(row.id);
     if (!n) {
       const session=sm.getSession(row.id);
-      if (!['kimi','gemini','deepseek'].includes(session?.kind?.replace(/-resume$/,''))) throw new Error('此提供方缺少执行状态，请核对后继续');
+      const base=session?.kind?.replace(/-resume$/,'');
+      // 2026-09-26：PTY 成为默认后，Claude / Codex 也走这里。只放行老式 CLI 会让每个正在干活的
+      // PTY 会话重启后都报「缺少执行状态」而不续作（真机：Codex 计划 before=working → error）。
+      // 续作提示自己要求先核对上一步的实际结果，已完成就只报告，不会重复执行。
+      const ptyAgent=session?.agentRuntime === 'pty' && ['claude','codex'].includes(base);
+      if (!ptyAgent && !['kimi','gemini','deepseek'].includes(base)) throw new Error('此提供方缺少执行状态，请核对后继续');
       return {completed:false};
     }
     await n.start?.();
@@ -56,7 +63,7 @@ function registerHubRestartIpc(ipcMain, deps) {
       if (outcome?.status === 'completed') return {completed:true};
     }
     await n.prepareForNewPrompt?.();
-    if (row.submissionId && n.records?.get(row.submissionId)?.status === 'completed') return {completed:true};
+    if (row.submissionId && n.records?.get?.(row.submissionId)?.status === 'completed') return {completed:true};
     const r=n.runtime;
     if (r?.state === 'waiting' || ['unknown','submitting','queued'].includes(r?.submission?.status || r?.submission?.sendStatus)) throw new Error('原生会话仍待核对或审批，未自动发送');
     if (r?.state === 'running') throw new Error('原生会话仍报告执行中，未叠加发送续作');
@@ -65,6 +72,14 @@ function registerHubRestartIpc(ipcMain, deps) {
   async function resumeGroup(group, prompt, token) {
     const m=mm.getMeeting(group.id);
     if (!m) throw new Error('原群聊不存在');
+    if(group.kind==='delivery') {
+      // Reconcile persisted deliveries only. Restart never replays a send
+      // intent whose native acceptance may already have happened.
+      if(group.deliveryPaused)throw new Error('文件交付工作流保持用户暂停，请进入群聊核对后继续');
+      const result=await global.__deliveryEngine.resume(group.id);
+      if(result.done)return {completed:true};
+      throw new Error(result.error || '交付记录已恢复；未重复派工，请在群聊查看进度或继续未交付成员');
+    }
     const receipt = id => {
       if(!native(id))return sm.restartContinuationReceipts?.get(id) || {};
       const r=native(id)?.runtime, s=r?.submission;
@@ -151,6 +166,7 @@ function registerHubRestartIpc(ipcMain, deps) {
         native(s.id)?.client?.proc,sm.sessions.get(s.id)?.pty?._agent?._conoutSocketWorker?._worker,
       ]).filter(Boolean)])];
       global.__devFileEngine?.dispose();
+      global.__deliveryEngine?.freeze();
       for (const g of plan.groups) {
         if (g.kind==='file') global.__devFileEngine.stop(g.id);
         else if (['loop','serial','kickoff'].includes(g.kind)) global.__loopEngine.stopLoop(g.id,{reason:'hub_restart',interrupt:false});

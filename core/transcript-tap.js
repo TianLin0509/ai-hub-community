@@ -77,7 +77,7 @@ const { KimiTap } = require('./kimi-transcript-tap.js');
 //   根治：JsonlTail.onLine 看到新 assistant 行时启动 5s idle timer，连续 5s 无新行视为本轮答完，
 //         **主动 emit 'turn-complete'**（兜底信号）。Stop hook 仍是快路径：来了立即 emit + 取消 timer。
 const _CLAUDE_STREAM_BUF_MAX_BYTES = 50000;
-// 2026-05-03 道雪 R3：用 Claude 自带的 message.stop_reason 语义信号判定本轮真结束。
+// 2026-05-03 maintainer R3：用 Claude 自带的 message.stop_reason 语义信号判定本轮真结束。
 //   原 5s idle 启发式在 tool_use 边界后误触发 — Claude 等 tool_result + 思考可达 27-67s
 //   静默（无新 assistant 行），被 hub 当成"本轮答完"主动 emit，导致后续真答案 M2（4647 字）
 //   到达 transcript 时 watcher 已 settle 无人监听，卡片永远定格在 M1 首句。
@@ -85,7 +85,7 @@ const _CLAUDE_STREAM_BUF_MAX_BYTES = 50000;
 //             "tool_use" / null 不 emit，等下一条 message。
 //   90s idle 仅留作"transcript 完全卡死/写入异常"的最终兜底，不再是主路径。
 const _CLAUDE_STOP_REASON_DEBOUNCE_MS = 200;
-// 2026-05-05 道雪：从 90s 缩回 15s。R3 之前 5s idle 误触发的根因不是时长，是 readLast
+// 2026-05-05 maintainer：从 90s 缩回 15s。R3 之前 5s idle 误触发的根因不是时长，是 readLast
 //   会把 tool_use 行的"我先读取..."中间 text 当成本轮答案 emit。现在 _scheduleIdleEmit
 //   改用 readLastTerminalAssistantTextFromClaudeTranscript 终态过滤（只接受 stop_reason
 //   ∈ {end_turn, max_tokens, refusal}），中间态行被跳过 → 时长可以安全缩短。
@@ -173,10 +173,10 @@ class ClaudeTap extends EventEmitter {
   //   sincePromptTs 做时间窗下界过滤（见下方 2026-07-20 修复说明）。
   //   返回 { text, source } 与 GeminiTap 同形；transcriptPath 未知（hook/scan 都未拿到）→ null。
   //
-  // 2026-05-14 道雪：切到合并版 readLastAssistantTurnMergedTextFromClaudeTranscript，
+  // 2026-05-14 maintainer：切到合并版 readLastAssistantTurnMergedTextFromClaudeTranscript，
   //   修群聊只拿到 [3] recap 段的 bug（plan 段在首条 entry，旧函数只读末条）。
   //
-  // 2026-07-20 道雪 [修#1]：补上 sincePromptTs 时间窗下界。旧版忽略该参数 —— AI 卡住
+  // 2026-07-20 maintainer [修#1]：补上 sincePromptTs 时间窗下界。旧版忽略该参数 —— AI 卡住
   //   /思考中时 transcript 最后一个完整 turn 是「上一轮」的答案，一键提取会把它抓进
   //   本轮（张冠李戴）。现在末轮完成时间早于本轮 prompt 5s 以上 → 视为旧答案拒绝提取。
   async extractLatestTurn(hubSessionId, sincePromptTs = 0) {
@@ -266,6 +266,26 @@ class ClaudeTap extends EventEmitter {
     // 首次拿到路径 → 启动 JsonlTail，让后续轮也能流式
     if (!entry._tail) {
       const onLine = (obj) => {
+        // Esc 中断时 Claude 不发 Stop hook，只在 transcript 里写一条
+        // "[Request interrupted by user…]" 的 user 记录。这是中断唯一的语义证据，
+        // 漏掉它会让 Hub 一直显示「正在工作」。
+        if (obj?.type === 'user' && !obj.isSidechain) {
+          const content = obj.message?.content;
+          const text = typeof content === 'string' ? content
+            : Array.isArray(content) ? content.filter(block => block && block.type === 'text').map(block => block.text || '').join('\n') : '';
+          if (String(text).trimStart().startsWith('[Request interrupted by user')) {
+            this._cancelIdleEmit(hubSessionId);
+            this._cancelStopReasonEmit(hubSessionId);
+            this.emit('turn-aborted', {
+              hubSessionId,
+              transcriptPath: entry.transcriptPath,
+              abortedAt: timestampToMs(obj.timestamp) || Date.now(),
+              turnId: entry.currentTurnId || null,
+              signalSource: 'claude-interrupt-marker',
+            });
+          }
+          return;
+        }
         if (obj?.type !== 'assistant' || !obj.message?.content) return;
         const content = obj.message.content;
         if (!Array.isArray(content)) return;
@@ -317,7 +337,7 @@ class ClaudeTap extends EventEmitter {
           }
         }
 
-        // 2026-05-03 道雪 R3：用 Claude 自带的 message.stop_reason 语义信号判定本轮真结束。
+        // 2026-05-03 maintainer R3：用 Claude 自带的 message.stop_reason 语义信号判定本轮真结束。
         //   终态值 {end_turn, max_tokens, refusal} 是 Claude 主动标的"本轮真完结"，立即（200ms 防抖）emit。
         //   "tool_use" 表明还要等 tool_result + 后续 assistant message，不 emit。
         //   null 表示流式中间态（未 finalize），不 emit。
@@ -351,7 +371,7 @@ class ClaudeTap extends EventEmitter {
     if (options.watchOnly) return;
 
     // Stop hook 触发 → 取消 idle timer + stop_reason timer，走快路径直接读 transcript 末尾立即 emit
-    // 2026-05-14 道雪：用合并版读，避免群聊丢失 [1] plan 段（多 entry 合并 bug 修复）
+    // 2026-05-14 maintainer：用合并版读，避免群聊丢失 [1] plan 段（多 entry 合并 bug 修复）
     this._cancelIdleEmit(hubSessionId);
     this._cancelStopReasonEmit(hubSessionId);
     const text = await readLastAssistantTurnMergedTextFromClaudeTranscript(transcriptPath);
@@ -394,7 +414,7 @@ class ClaudeTap extends EventEmitter {
   // 内部：每条新 assistant 行调用一次，重置 idle timer。
   //   timer 触发时（连续 N 秒无新行）从 transcript 末尾读 last assistant 主动 emit。
   //   防重复：emit 前比对 lastText，相同则不再重复 emit。
-  // 2026-05-05 道雪：兜底 emit 增加 stop_reason 终态过滤 — 历史 R3 修了"5s idle 拿到
+  // 2026-05-05 maintainer：兜底 emit 增加 stop_reason 终态过滤 — 历史 R3 修了"5s idle 拿到
   //   tool_use 行的中间 text 误 emit settle"的 bug，但代价是把 idle 时间拉到 90s，
   //   transcript 写入异常 / stop_reason 字段缺失场景下卡片要等 90s 才更新。
   //   现在让兜底也用 stop_reason 过滤：只在 transcript 末尾真有 terminal 行（end_turn/
@@ -438,7 +458,7 @@ class ClaudeTap extends EventEmitter {
     }
   }
 
-  // R3（2026-05-03 道雪）：stop_reason 终态信号触发的延迟 emit。
+  // R3（2026-05-03 maintainer）：stop_reason 终态信号触发的延迟 emit。
   //   onLine 看到 stop_reason ∈ {end_turn, max_tokens, refusal} 时调，200ms 防抖窗口
   //   兼容罕见的"end_turn 后还有续 chunk 落盘"场景。emit 时取消 idle timer 不再兜底。
   _scheduleStopReasonEmit(hubSessionId) {
@@ -451,7 +471,7 @@ class ClaudeTap extends EventEmitter {
       entry._stopReasonTimer = null;
       if (!entry.transcriptPath) return;
       try {
-        // 2026-05-14 道雪：用合并版（多 entry 合并 bug 修复）
+        // 2026-05-14 maintainer：用合并版（多 entry 合并 bug 修复）
         // 2026-09-06：改用带终态过滤的读取 —— 与 idle 兜底同一套判据。防抖这 200ms 里
         //   Claude 可能又写了一条 stop_reason='tool_use'，此时本轮并没有结束，
         //   不带过滤的读取会把中间正文当成最终答复送出去。
@@ -546,7 +566,7 @@ function codexPromptMatchesExpected(userMessage, expectedPrompt) {
   return canonicalizeLongPromptForTuiCompare(msg) === expectedCanonical;
 }
 
-// 2026-05-14 道雪：多 entry 合并版 — 修群聊只拿到 [3] recap 段的 bug。
+// 2026-05-14 maintainer：多 entry 合并版 — 修群聊只拿到 [3] recap 段的 bug。
 //   Claude CLI 把"1 个 user prompt + N 次工具调用"拆成 N+1 条 assistant entry，
 //   中间 stop_reason='tool_use'、末条 stop_reason='end_turn'。旧版
 //   readLastAssistantMessageFromClaudeTranscript 只读末条，导致首条 entry 的 text
@@ -569,14 +589,14 @@ async function readLastAssistantTurnMergedTextFromClaudeTranscript(transcriptPat
   }
 }
 
-// 2026-05-05 道雪：终态 stop_reason 过滤版本 — 用于 idle 兜底 emit。
+// 2026-05-05 maintainer：终态 stop_reason 过滤版本 — 用于 idle 兜底 emit。
 // 从尾部向前扫，找第一个 stop_reason ∈ {end_turn, max_tokens, refusal} 且 content
 // 含 text 块的 assistant message。
 // 与 readLastAssistantMessageFromClaudeTranscript 的区别：本函数会跳过 stop_reason='tool_use'
 // 等中间态行（这些行的 text 块是工具调用前的"我先读取..."类中间输出，不是本轮真答案）。
 // 返回 { text, stopReason } 或 null（找不到 terminal 行）。
 //
-// 2026-05-14 道雪 升级：上述老版本只读末条 entry → 群聊丢 [1] plan。改为复用合并版
+// 2026-05-14 maintainer 升级：上述老版本只读末条 entry → 群聊丢 [1] plan。改为复用合并版
 // readLastAssistantTurnMergedTextFromClaudeTranscript 取整段 turn，stopReason 从
 // 合并后的 turn 取（_mergeConsecutiveAssistantTurns 已保证末条决定 stopReason）。
 // 终态过滤语义保留：未 flush 的 turn（stop_reason 一直 'tool_use'）合并器返回为空，
@@ -666,6 +686,9 @@ const TRY_BIND_TIMEOUT_MS = 15_000;
 const SCAN_STUCK_RESET_MS = 45_000;
 // 看门狗巡检间隔。只比时间戳，开销可忽略；比扫描间隔慢一个量级即可。
 const WATCHDOG_INTERVAL_MS = 15_000;
+// hook 报来 rollout 路径但文件还没落盘时，单独盯这一个文件的间隔与上限。
+const EXPECTED_ROLLOUT_POLL_MS = 250;
+const EXPECTED_ROLLOUT_POLL_MAX_MS = 10 * 60_000;
 
 function withTimeout(promise, ms) {
   let timer = null;
@@ -760,6 +783,77 @@ class CodexTap extends EventEmitter {
 
   hasSession(hubSessionId) {
     return this._pending.has(hubSessionId) || this._bound.has(hubSessionId);
+  }
+
+  // Codex hook 上报的 session_id + transcript_path 是这条会话的权威身份，
+  // 比 cwd + 时间窗推断可靠，可覆盖扫描器的猜测（rebind 仅用于 SessionStart：
+  // 同一个终端里 /new、重新启动 Codex 会换成新线程）。
+  // Codex 在首个 turn 才落盘 rollout：文件还不存在时先把期望路径钉在 pending 上，
+  // 扫描器看到它就直接绑定，并且不再为这条会话猜别的文件。
+  async bindFromHook(hubSessionId, { codexSid = null, transcriptPath = null, sessionsRoot = null, rebind = false } = {}) {
+    if (!hubSessionId || !transcriptPath) return false;
+    const wanted = normalizePathForCompare(transcriptPath);
+    const current = this._bound.get(hubSessionId);
+    if (current && normalizePathForCompare(current.rolloutPath) === wanted) return true;
+    if (current && !rebind) return false;
+    if (sessionsRoot) this._sessionsRoots.add(sessionsRoot);
+    let exists = false;
+    try { exists = fs.statSync(transcriptPath).isFile(); } catch {}
+    if (current) this._dropBinding(hubSessionId);
+    if (!exists) {
+      const pending = this._pending.get(hubSessionId) || {
+        cwd: null, spawnTime: Date.now(), allowMtimeFallback: false, requirePromptMatch: false,
+        expectedPrompt: null, expectedPromptAt: null,
+      };
+      pending.expectedRolloutPath = wanted;
+      pending.expectedCodexSid = codexSid || null;
+      this._pending.set(hubSessionId, pending);
+      this._ensureWatcherAlive();
+      this._ensureWatchdog();
+      this._pollExpectedRollout(hubSessionId, { codexSid, transcriptPath, sessionsRoot });
+      return false;
+    }
+    const pending = this._pending.get(hubSessionId);
+    if (pending) { pending.expectedRolloutPath = wanted; pending.expectedCodexSid = codexSid || null; }
+    const ok = await this._bindRolloutToHubSession(hubSessionId, transcriptPath, codexSid || null);
+    if (ok) {
+      this._pending.delete(hubSessionId);
+      this._markSeen(transcriptPath, 'bound_by_hook');
+    }
+    return ok;
+  }
+
+  // hook 报来的 rollout 路径是确定的，只是 Codex 首轮开始后才落盘。只盯这一个文件，
+  // 不再依赖全目录扫描器：终轮矩阵里扫描器在高负载下反复「heartbeat stale」，群聊的
+  // Codex 成员答完了却迟迟没绑上，完成事件就一直等不到。绑定后 tail 会回放已写内容，
+  // 晚绑也不漏这一轮的完成。
+  _pollExpectedRollout(hubSessionId, options) {
+    this._expectedPolls ||= new Map();
+    const previous = this._expectedPolls.get(hubSessionId);
+    if (previous) clearInterval(previous);
+    const wanted = normalizePathForCompare(options.transcriptPath);
+    const startedAt = Date.now();
+    const stop = () => { clearInterval(timer); if (this._expectedPolls.get(hubSessionId) === timer) this._expectedPolls.delete(hubSessionId); };
+    const timer = setInterval(() => {
+      const pending = this._pending.get(hubSessionId);
+      if (this._bound.has(hubSessionId) || !pending || pending.expectedRolloutPath !== wanted
+          || Date.now() - startedAt > EXPECTED_ROLLOUT_POLL_MAX_MS) { stop(); return; }
+      let exists = false;
+      try { exists = fs.statSync(options.transcriptPath).isFile(); } catch {}
+      if (!exists) return;
+      stop();
+      this.bindFromHook(hubSessionId, options).catch(error => console.warn('[codex-tap] expected rollout bind failed:', error.message));
+    }, EXPECTED_ROLLOUT_POLL_MS);
+    timer.unref?.();
+    this._expectedPolls.set(hubSessionId, timer);
+  }
+
+  _dropBinding(hubSessionId) {
+    const bound = this._bound.get(hubSessionId);
+    if (!bound) return;
+    try { bound.tail?.close(); } catch {}
+    if (bound._pendingEmitTimer) { try { clearTimeout(bound._pendingEmitTimer); } catch {} }
+    this._bound.delete(hubSessionId);
   }
 
   notePrompt(hubSessionId, prompt) {
@@ -880,7 +974,7 @@ class CodexTap extends EventEmitter {
   //   - no_rollout_bound      ← _bound.get(hubSessionId).rolloutPath 不存在
   //   返回值始终是对象（不再返回 null），text='' 时由调用方按 extractMode 区分原因。
   //   `source` 字段（manual_codex_rollout / manual_codex_rollout_streaming）保留用于日志追溯。
-  // 2026-07-12 道雪：新增 opts.untilTs —— 轮次窗口上界（开区间）。
+  // 2026-07-12 maintainer：新增 opts.untilTs —— 轮次窗口上界（开区间）。
   //   「重新提取」旧轮时，调用方传该轮用户消息时间做 sincePromptTs、下一轮用户消息
   //   时间做 untilTs，把提取严格框在该轮内；否则"从尾向前扫最新 task_complete"
   //   永远拿到最新轮的答案，patch 回旧轮 = 内容张冠李戴。untilTs 缺省 null = 原行为。
@@ -1152,6 +1246,17 @@ class CodexTap extends EventEmitter {
       return;
     }
 
+    // hook 已经告诉了我们确切的文件：命中就直接绑定，其余会话不参与猜测。
+    const wantedPath = normalizePathForCompare(rolloutPath);
+    for (const [hubSessionId, entry] of this._pending) {
+      if (entry.expectedRolloutPath !== wantedPath) continue;
+      if (await this._bindRolloutToHubSession(hubSessionId, rolloutPath, entry.expectedCodexSid || null)) {
+        this._pending.delete(hubSessionId);
+        this._markSeen(rolloutPath, 'bound_by_hook_path');
+      }
+      return;
+    }
+
     const metaCwd = normalizePathForCompare(meta.cwd || '');
     const metaTs = Date.parse(meta.timestamp || '');
     if (!metaCwd) { console.warn(`[codex-tap] rollout has no cwd: ${rolloutPath}`); return; }
@@ -1168,6 +1273,7 @@ class CodexTap extends EventEmitter {
     let sawMatchingPendingCwd = false;
     const rejects = [];
     for (const [hubSessionId, entry] of this._pending) {
+      if (entry.expectedRolloutPath) continue;
       if (entry.cwd !== metaCwd) {
         rejects.push({ sid: hubSessionId.slice(0, 8), why: 'cwd_mismatch', want: metaCwd, got: entry.cwd });
         continue;
@@ -1291,7 +1397,7 @@ class CodexTap extends EventEmitter {
     //         取消 pending 并丢弃旧 text，等下一次 task_complete；
     //         静默后才真 emit 'turn-complete'。
     //
-    // 2026-06-07 道雪：原 3000ms 拖累卡片同步体验。每个简单 prompt（如"你好"、"1+1"）codex 只产生
+    // 2026-06-07 maintainer：原 3000ms 拖累卡片同步体验。每个简单 prompt（如"你好"、"1+1"）codex 只产生
     //   1 个 task_complete，3s debounce 是纯 dead time。多 task 场景下 codex 写下一条
     //   task_started 间隔通常 50-200ms（核心 event loop 同步），400ms 足够防误判。
     //   对比 ClaudeTap stop_reason 终态 emit 只用 200ms debounce。
@@ -1307,6 +1413,16 @@ class CodexTap extends EventEmitter {
         }
         return;
       }
+      // Resume hydrates an old suffix. Fence the entire lifecycle, not only
+      // completions: replaying an old start while suppressing its end leaves
+      // renderer/group scheduling working until their expiry turns it unknown.
+      // Context/usage above/below remain useful metadata; cards read history
+      // independently. New events retain the existing short bind grace.
+      const liveEntry = this._bound.get(hubSessionId);
+      const recordAt = timestampToMs(obj?.timestamp);
+      if (liveEntry && recordAt && recordAt + 5000 < liveEntry._liveBoundaryAt
+          && (obj?.type === 'turn_aborted'
+            || (obj?.type === 'event_msg' && obj.payload?.type !== 'token_count'))) return;
       // Codex 0.147 writes aborts as event_msg(payload.type=turn_aborted).
       // Older/fixture rollouts may use a top-level turn_aborted record, so keep
       // both shapes. Missing the event_msg form leaves the Hub stuck running
@@ -1429,6 +1545,7 @@ class CodexTap extends EventEmitter {
       // 新 task 开始 → 取消 pending emit（视为"还在进行"，丢弃上一次的 pendingText）
       if (eventType === 'task_started') {
         if (eventTurnId) entry._currentTurnId = eventTurnId;
+        entry._lastCompletedTurnId = null;
         if (entry._pendingEmitTimer) clearTimeout(entry._pendingEmitTimer);
         entry._pendingEmitTimer = null;
         entry._pendingText = null;
@@ -1457,7 +1574,15 @@ class CodexTap extends EventEmitter {
         }
       }
 
-      const completedAgent = codexAgentMessageEventFromRecord(obj);
+      let completedAgent = codexAgentMessageEventFromRecord(obj);
+      // /compact 等没有回答的任务：task_complete 的 last_agent_message 为空，解析器返回 null。
+      // 仍然要收尾这一轮，否则状态永远停在运行中（2026-09-25 真机 Codex /compact）。
+      if (!completedAgent && eventType === 'task_complete') {
+        const payloadDuration = Number(obj.payload && obj.payload.duration_ms);
+        completedAgent = { text: '', phase: 'final_answer', completed: true, signalSource: 'task_complete',
+          completedAt: timestampToMs(obj.timestamp) || Date.now(), turnId: eventTurnId || null,
+          durationMs: Number.isFinite(payloadDuration) ? payloadDuration : null };
+      }
       if (completedAgent && completedAgent.completedAt >= entry._liveBoundaryAt) {
         const liveTags = devLiveTags(completedAgent.text);
         if (liveTags.length) { const liveTurnId = completedAgent.turnId || eventTurnId || entry._currentTurnId || null;
@@ -1473,7 +1598,10 @@ class CodexTap extends EventEmitter {
           || timestampToMs(obj.timestamp)
           || 0;
         if (completionAt && completionAt + 5000 < entry._liveBoundaryAt) return;
-        const text = completedAgent.text;
+        const completedTurnId = completedAgent.turnId || eventTurnId || entry._currentTurnId || null;
+        // 同一轮先到的 final_answer 正文不能被随后 last_agent_message 为空的 task_complete 冲掉。
+        const text = completedAgent.text
+          || (entry._pendingTurnId && entry._pendingTurnId === completedTurnId ? entry._pendingText : null);
         // Legacy task_complete and 0.147 final_answer share one debounce path.
         // If several terminal records arrive, the last authoritative text wins.
         if (entry._pendingEmitTimer) clearTimeout(entry._pendingEmitTimer);
@@ -1494,7 +1622,22 @@ class CodexTap extends EventEmitter {
           entry._pendingCompletedAt = null;
           entry._pendingTurnId = null;
           entry._pendingSignalSource = null;
-          if (!finalText) return;
+          if (!finalText) {
+            // /compact 这类没有回答的任务也会写 task_complete（last_agent_message 为空）。
+            // 它不是新回答（不出卡、不加未读），但这一轮确实结束了：不发信号，Hub 会一直显示运行中。
+            this.emit('turn-aborted', {
+              hubSessionId,
+              transcriptPath: entry.rolloutPath,
+              abortedAt: finalCompletedAt || Date.now(),
+              turnId: finalTurnId,
+              signalSource: 'task_complete_without_answer',
+            });
+            return;
+          }
+          // final_answer 与随后约一秒的 task_complete 属于同一轮：只报一次完成。
+          // 新的 task_started 会重置 _lastCompletedTurnId。
+          if (finalTurnId && entry._lastCompletedTurnId === finalTurnId && entry.lastText === finalText) return;
+          entry._lastCompletedTurnId = finalTurnId || null;
           entry.lastText = finalText;
           this.emit('turn-complete', {
             hubSessionId,
@@ -2167,6 +2310,14 @@ class TranscriptTap extends EventEmitter {
 
   getCodexRolloutPath(hubSessionId) {
     return this._codex.getRolloutPath(hubSessionId);
+  }
+
+  async bindCodexFromHook(hubSessionId, options = {}) {
+    try { return await this._codex.bindFromHook(hubSessionId, options); }
+    catch (e) {
+      console.warn('[transcript-tap] bindCodexFromHook failed:', e.message);
+      return false;
+    }
   }
 
   async hasCodexUserMessageSince(hubSessionId, sincePromptTs = 0) {

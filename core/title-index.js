@@ -1,5 +1,7 @@
 'use strict';
 
+const { matchesSearchProvider } = require('./session-search-providers');
+
 /**
  * 标题即时检索层。
  *
@@ -94,14 +96,12 @@ function searchTitles(index, query, options = {}) {
   const normalizedQuery = normalizeTitleText(query);
   const terms = titleQueryTerms(query);
   if (!terms.length) return [];
-  const providerFilter = Array.isArray(options.providers) && options.providers.length
-    ? new Set(options.providers.map(String))
-    : null;
+  const providers = Array.isArray(options.providers) ? options.providers.map(String) : [];
   const since = Number.isFinite(options.since) && options.since > 0 ? options.since : null;
 
   const hits = [];
   for (const entry of Array.isArray(index) ? index : []) {
-    if (providerFilter && !providerFilter.has(String(entry.provider))) continue;
+    if (!matchesSearchProvider(entry.provider, providers)) continue;
     const updatedAt = Number(entry.updatedAt) || 0;
     if (since !== null && updatedAt < since) continue;
     const score = scoreTitle(entry.normalizedTitle, terms, normalizedQuery);
@@ -110,7 +110,13 @@ function searchTitles(index, query, options = {}) {
   }
   hits.sort((left, right) => right.score - left.score || right.updatedAt - left.updatedAt);
 
-  return hits.map(({ entry, updatedAt }) => ({
+  const sort = normalizeSort(options.sort, query);
+  const direction = options.direction || (options.sort === 'title' ? 'asc' : 'desc');
+  return hits.map(({ entry, updatedAt }) => {
+    // Ranking also normalizes and scans the title. The explanatory label uses
+    // that same rank; computing it again doubles this work on every keypress.
+    const rank = documentRank({ scope: 'title', text: entry.title }, normalizedQuery, terms);
+    return {
     key: entry.key,
     sessionKey: entry.key,
     hubSessionId: entry.hubSessionId || null,
@@ -123,8 +129,8 @@ function searchTitles(index, query, options = {}) {
     updatedAt,
     lastConversationAt: Number(entry.lastConversationAt || entry.lastMessageTime || entry.lastCompletedAt) || null,
     newestMatchedEventAt: null,
-    rank: documentRank({ scope: 'title', text: entry.title }, normalizedQuery, terms),
-    matchReasons: rankReason(documentRank({ scope: 'title', text: entry.title }, normalizedQuery, terms), true),
+    rank,
+    matchReasons: rankReason(rank, true),
     matchCount: 1,
     titleOnly: true,
     bestMatch: {
@@ -136,7 +142,8 @@ function searchTitles(index, query, options = {}) {
       ordinal: 0,
       text: entry.title,
     },
-  })).sort((a,b) => compareResults(a,b,normalizeSort(options.sort,query),options.direction || (options.sort === 'title' ? 'asc' : 'desc'))).slice(0,limit);
+    };
+  }).sort((a,b) => compareResults(a,b,sort,direction)).slice(0,limit);
 }
 
 /** 两条结果指的是不是同一个会话。全文层与标题层合并时去重用。 */

@@ -21,10 +21,16 @@ const RUNNING_ANIMATION_CONFIRM_MAX_MS = 3000;
 // session incorrectly. The active row is rendered with a provider marker and
 // a small, known family of work verbs.
 const CODEX_RUNNING_RE = /^\s*[\u2022\u23fa\u25cf\u25c9\u25d0-\u25d5]\s*(?:Working|Thinking|Running|Searching|Reading|Writing|Editing|Exploring|Generating|Pursuing\s+goal)\b.*\besc to interrupt\b/i;
+// 0.157 fullscreen renders the status without a leading bullet. Require its
+// elapsed timer and interrupt hint together, so ordinary prose is not work.
+const CODEX_FULLSCREEN_RUNNING_RE = /^\s*(?:Working|Thinking|Running|Searching|Reading|Writing|Editing|Exploring|Generating|Pursuing\s+goal)\s+\((?:\d+[hms]\s*)+[•·]\s*esc to interrupt\)(?:\s+·.*)?\s*$/i;
 const CODEX_PROMPT_RE = /^\s*[\u203a>]\s*(?:$|\S)/;
 const CODEX_CONTEXT_RE = /\bContext\s+(?:\d+(?:\.\d+)?%\s*(?:left)?|window|left)/i;
 
-const CLAUDE_FOOTER_RE = /shift\+tab to cycle|\? for shortcuts|bypass permissions on/i;
+// Claude 2.1.28x 的底栏随权限模式变化：默认模式是「⏸ manual mode on · ← for agents」，
+// 不再带 shift+tab 提示。漏认它，就绪画面就一直是 ambiguous，Stop 时留下的旧运行帧
+// 永远收不了尾（2026-09-25 审查现场：Stop 后 182 秒仍显示运行中）。
+const CLAUDE_FOOTER_RE = /shift\+tab to cycle|\? for shortcuts|bypass permissions on|\b(?:manual|plan|auto) mode on\b|accept edits on|← for agents/i;
 // Claude 2.1.251 may render either an empty prompt, a “Try …” placeholder, or
 // the literal `<no suggestion>` after a completed turn.  All three are input
 // ready when paired with the persistent footer; running markers still win
@@ -34,7 +40,8 @@ const CLAUDE_ACTIVE_STATUS_RE = /^\s*[\u2722\u2731-\u273d\u00b7*]\s+[A-Za-z][A-Z
 const CLAUDE_ACTIVE_TOOL_RE = /^\s*[\u25cf\u23fa]\s+(?:Reading|Running|Searching|Writing|Editing|Fetching|Calling|Thinking|Exploring|Generating)\b.*(?:\u2026|\.\.\.)/i;
 
 const WAITING_PATTERNS = [
-  /Enter to confirm\s*[\u00b7|]\s*Esc to cancel/i,
+  // \u7ed3\u5c3e\u4e0d\u4e00\u5b9a\u662f "cancel"\uff1aClaude \u7684 Chrome \u6269\u5c55\u63d0\u793a\u662f "Esc to keep browser tools off"\u3002
+  /Enter to confirm\s*[\u00b7|]\s*Esc to\b/i,
   /\[(?:y\/N|Y\/n)\]/,
   /Press Enter to confirm/i,
 ];
@@ -82,7 +89,8 @@ function classifyCodex(lines) {
   const waiting = waitingObservation(lines);
   if (waiting) return waiting;
 
-  const runningLine = firstMatchingLine(lines.slice(-12), CODEX_RUNNING_RE);
+  const runningLine = firstMatchingLine(lines.slice(-12), CODEX_RUNNING_RE)
+    || firstMatchingLine(lines.slice(-12), CODEX_FULLSCREEN_RUNNING_RE);
   if (runningLine) return observation(RUNTIME_RUNNING, 'codex-interrupt-footer', runningLine);
 
   const promptLine = firstMatchingLine(lines, CODEX_PROMPT_RE);

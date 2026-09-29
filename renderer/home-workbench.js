@@ -213,7 +213,7 @@ function deriveRecentArtifacts(sessionMap, options = {}) {
   const candidates = [];
   const sessions = Array.from(sessionMap.values())
     // Keep recent outputs visible after automatic session suspension.
-    .filter(session => session && session.purpose !== 'chuxin-research')
+    .filter(session => session && session.purpose !== 'xresearch-research')
     .sort((a, b) => itemTime(b) - itemTime(a))
     .slice(0, 30);
 
@@ -440,8 +440,10 @@ function buildHomeSnapshot(options = {}) {
     .filter(session => session
       && !session.meetingId
       && !session.hiddenFromSidebar
-      && session.kind !== 'chuxin-run'
-      && session.purpose !== 'chuxin-research')
+      && session.kind !== 'xresearch-run'
+      // 投研任务席位（xresearch-research）是在投研 Tab 自己的终端里驱动的，不进侧边栏。
+      // 作手林铛的每日决策会话不一样：它就是一次完整的对话，用户要在侧边栏点开接着追问。
+      && session.purpose !== 'xresearch-research')
     .map(session => makeSessionItem(session, now));
   const meetingItems = Object.values(meetings)
     .filter(Boolean)

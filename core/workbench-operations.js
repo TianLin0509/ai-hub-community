@@ -39,7 +39,7 @@ function isBroadWorkspaceRoot(value) {
   const key = normalizePathKey(resolved).replace(/[\\/]+$/, '');
   const drive = normalizePathKey(path.parse(resolved).root).replace(/[\\/]+$/, '');
   const home = normalizePathKey(os.homedir()).replace(/[\\/]+$/, '');
-  const vibe = normalizePathKey('C:\\Vibe').replace(/[\\/]+$/, '');
+  const vibe = normalizePathKey('C:\\Workspace').replace(/[\\/]+$/, '');
   return key === drive || key === home || key === vibe;
 }
 
@@ -869,7 +869,9 @@ function createWorkbenchOperationsService(options = {}) {
     const repoRoot = await requireRepo(manifest.repoRoot);
     await runGit(repoRoot, ['cat-file', '-e', `${manifest.commit}^{commit}`]);
     const config = normalizeOperationsConfig(getConfig().operations || {});
-    const defaultRoot = path.join(os.homedir(), 'AIHubWorktrees');
+    const defaultRoot = process.platform === 'win32' && fs.existsSync('C:\\Workspace\\Worktrees')
+      ? 'C:\\Workspace\\Worktrees'
+      : path.join(os.homedir(), 'AIHubWorktrees');
     const restoreRoot = path.resolve(config.restoreRoot || process.env.CLAUDE_HUB_RESTORE_ROOT || defaultRoot);
     const destination = path.join(restoreRoot, String(manifest.repoName || path.basename(repoRoot)).replace(/[^a-z0-9._-]/gi, '-'), id);
     if (isPathInside(repoRoot, destination) || isPathInside(destination, repoRoot)) throw new Error('unsafe_restore_destination');

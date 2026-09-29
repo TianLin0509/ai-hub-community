@@ -1,5 +1,5 @@
 // core/hub-control.js
-// 2026-05-16 道雪：per-PID 控制文件 + CDP 端口探测 + stale 清理
+// 2026-05-16 maintainer：per-PID 控制文件 + CDP 端口探测 + stale 清理
 //   控制文件：<dataDir>/control/<pid>.json，含 hookPort/cdpPort/token/dataDir/pid/startedAt
 //   救援脚本（tools/hub-escape.ps1）通过这个文件发现目标 Hub 的端口和 token
 //

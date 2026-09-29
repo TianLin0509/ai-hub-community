@@ -274,7 +274,7 @@ class KimiTap extends EventEmitter {
       } else {
         turn = extractLatestKimiTurnFromText(fs.readFileSync(bound.wirePath, 'utf8'));
       }
-      // 2026-07-20 道雪 [修#1]：时间窗下界——turn 完成时间早于本轮 prompt 5s 以上，
+      // 2026-07-20 maintainer [修#1]：时间窗下界——turn 完成时间早于本轮 prompt 5s 以上，
       //   判定为上一轮旧答案拒绝提取（与 ClaudeTap 同口径，防张冠李戴）。
       if (turn && sincePromptTs && turn.completedAt && turn.completedAt < sincePromptTs - 5000) return null;
       return turn;

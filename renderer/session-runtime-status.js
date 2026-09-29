@@ -67,7 +67,9 @@ function deriveSessionRuntimeStatus(session, options = {}) {
   const now = Number(options.now) || Date.now();
   const provider = providerLabel(session);
   let truth = getSessionRuntimeTruth(session, { now });
-  if (!native && options.isRunning === true && [RUNTIME_IDLE, RUNTIME_COMPLETED, RUNTIME_UNKNOWN].includes(truth.state)) {
+  const closedPtyTurn = session?.agentRuntime === 'pty' && truth.confidence === 'authoritative'
+    && [RUNTIME_IDLE, RUNTIME_COMPLETED, RUNTIME_FAILED, 'interrupted'].includes(truth.state);
+  if (!native && !closedPtyTurn && options.isRunning === true && [RUNTIME_IDLE, RUNTIME_COMPLETED, RUNTIME_UNKNOWN].includes(truth.state)) {
     truth = {
       ...truth,
       state: RUNTIME_RUNNING,
@@ -112,8 +114,13 @@ function deriveSessionRuntimeStatus(session, options = {}) {
   }
 
   const visibleText = meta ? `${label} · ${meta}` : label;
+  const contentAge = require('../core/native-feedback').nativeContentAge(session, now);
+  if (contentAge) detail = [detail, contentAge].filter(Boolean).join(' · ');
+  const compactDetail = detail.replace(/\s+/g, ' ');
   const visibleDetail = [RUNTIME_STARTING, RUNTIME_RUNNING, RUNTIME_WAITING, RUNTIME_FAILED, RUNTIME_UNKNOWN].includes(state)
-    ? detail.replace(/\s+/g, ' ').slice(0, 180)
+    ? contentAge && compactDetail.length > 180
+      ? `${compactDetail.slice(0, 177 - contentAge.length)}… · ${contentAge}`
+      : compactDetail.slice(0, 180)
     : '';
   const ariaLabel = `${provider} ${label}`;
   const titleParts = [ariaLabel];

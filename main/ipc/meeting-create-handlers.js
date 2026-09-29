@@ -1,7 +1,6 @@
 'use strict';
 
 const devProjectLocator = require('../../core/dev-project-locator.js');
-const { ensureClaudeMemoryFile } = require('../../core/claude-memory-loader.js');
 const { normalizeCodexContextWindow } = require('../../core/codex-context-window.js');
 
 const CLAUDE_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
@@ -77,7 +76,6 @@ function createMeetingSubAdder(deps) {
     getSlotPromptName,
     groupchat,
     hookToken,
-    ensureDeepSeekInstructionFile = ensureClaudeMemoryFile,
     isClaudeFamily,
     isCodexBaseKind,
     isIsolatedHub,
@@ -159,19 +157,9 @@ function createMeetingSubAdder(deps) {
       }
     }
 
-    // DeepSeek 已迁移到 Codex runtime；原来通过 Claude
-    // --append-system-prompt-file 注入的主 MEMORY.md 改走 Codex instruction file。
-    if (meeting && meeting.groupChat && kind === 'deepseek' && !sessionOpts.codexInstructionFile) {
-      try {
-        const hubDataDir = getHubDataDir();
-        const injectPath = ensureDeepSeekInstructionFile(hubDataDir);
-        if (injectPath) {
-          sessionOpts.codexInstructionFile = injectPath;
-        }
-      } catch (err) {
-        logger.warn(`[meeting-sub] claude-memory injection failed for ${meetingId}: ${err.message}`);
-      }
-    }
+    // 2026-09-26：不再只给 DeepSeek 群成员额外注入 Claude 的 MEMORY.md 索引。
+    // 全局规则 ~/.agents/USER_CONTEXT.md 已对所有 CLI 写明共享记忆库目录与分类索引，
+    // 单独给一家多塞一份既冗余，又让群里各成员拿到的上下文不对等。
 
     const hookPort = getHookPort();
     const codexMcpEnabled = sessionOpts.mcpProfile !== 'none';
@@ -179,34 +167,6 @@ function createMeetingSubAdder(deps) {
       addCodexMcpEntry(sessionOpts, scenes.buildAiTeamMcpEntryForCodex(meetingId, kind));
     }
 
-    const needsResearchMcp = meeting && meeting.groupChat && meeting.scene === 'research';
-    if (needsResearchMcp && hookPort) {
-      const hubDataDir = getHubDataDir();
-      if (isClaudeFamily(kind)) {
-        sessionOpts.mcpConfigFile = scenes.writeResearchMcpConfig(
-          hubDataDir, meetingId, hookPort, hookToken, kind, { enableChuxin: true },
-        );
-      } else if (kind === 'gemini') {
-        sessionOpts.extraEnv = {
-          ...(sessionOpts.extraEnv || {}),
-          ELECTRON_RUN_AS_NODE: '1',
-          ARENA_MEETING_ID: meetingId,
-          ARENA_HUB_PORT: String(hookPort),
-          ARENA_HOOK_TOKEN: hookToken,
-          ARENA_AI_KIND: 'gemini',
-          ARENA_HUB_DATA_DIR: hubDataDir,
-          ARENA_CHUXIN_ENABLED: '1',
-          SPIRIT_REGISTRY_ROOT: process.env.SPIRIT_REGISTRY_ROOT || path.join(require('os').homedir(), 'spirit-lens-registry'),
-        };
-      } else if (isCodexBaseKind(kind) && codexMcpEnabled) {
-        sessionOpts.codexBypassApprovals = true;
-        addCodexMcpEntry(sessionOpts, scenes.buildResearchMcpEntryForCodex(
-          meetingId, hookPort, hookToken, hubDataDir, { enableChuxin: true },
-        ));
-      }
-    } else if (needsResearchMcp && !hookPort) {
-      logger.warn('[群聊] ' + meeting.scene + ' scene in meeting ' + meetingId + ' but hookPort unavailable — stock MCP tools unavailable');
-    }
 
     // Dev seats hold identity without an engine until they are given work. Both
     // native backends support it, so a Claude seat does not spawn a process the
@@ -272,13 +232,11 @@ function registerMeetingCreateIpc(ipcMain, deps) {
   const addMeetingSubInternal = createMeetingSubAdder(deps);
 
   ipcMain.handle('create-meeting', async (_e, opts) => {
-    if (require('../../core/distribution').community && (opts?.mode === 'research' || opts?.scene === 'research')) throw new Error('Community edition supports general and development rooms.');
     const safe = { ...(opts || {}) };
     safe.groupChat = true;
     const devSlots = Array.isArray(safe.slots) ? safe.slots : safe.slotSpecs;
-    // Check every requested member before creating a room or starting any AI.
     for (const slot of (Array.isArray(devSlots) ? devSlots : [])) {
-      require('../../core/community-provider').assertProviderAvailable(slot.kind);
+      require('../../core/community-provider').assertProviderAvailable(slot && slot.kind);
     }
     if (safe.serialWorkflow?.soloDevelopment || safe.serialWorkflow?.templateId === 'dev-task-solo'
       || (safe.mode === 'dev' && (!Array.isArray(devSlots) || devSlots.length < 2))) {

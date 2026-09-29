@@ -52,8 +52,6 @@ function resolveDefaultFeishuCliPath(env = process.env, platform = process.platf
   const configured = String(env.HUB_NOTIFY_FEISHU_CLI_PATH || '').trim();
   if (configured) return configured;
   if (platform === 'win32') {
-    const stable = 'C:\\DevTools\\LarkCLI\\node_modules\\@larksuite\\cli\\bin\\lark-cli.exe';
-    if (fs.existsSync(stable)) return stable;
     return 'lark-cli.exe';
   }
   return 'lark-cli';

@@ -190,7 +190,7 @@
   box-shadow: -10px 0 30px rgba(var(--rgb-shadow), .55);
   display: flex; flex-direction: column;
   animation: mr-gc-tl-slide .18s ease-out;
-  /* 2026-05-05 道雪：抽屉打开时字体放大，Ctrl+滚轮可调（JS 动态写）。
+  /* 2026-05-05 maintainer：抽屉打开时字体放大，Ctrl+滚轮可调（JS 动态写）。
      默认 1.2 = 抽屉正文从 13px 提升到 ~16px；clamp [0.8, 2.0]。
      仅缩放 .mr-gc-tl-content 内的正文（body/decision/user/empty），
      header/tab/close 按钮保持原字号，避免 tab bar 撑变形。 */
@@ -247,7 +247,7 @@
 }
 .mr-gc-tl-content {
   padding: 16px 18px 24px; overflow-y: auto; flex: 1;
-  /* 2026-05-05 道雪：在 content 容器统一基准字号 = 13px × scale；子元素用 em 继承缩放。
+  /* 2026-05-05 maintainer：在 content 容器统一基准字号 = 13px × scale；子元素用 em 继承缩放。
      仅作用于抽屉正文，header/tab 不受影响（它们在 content 之外）。 */
   font-size: calc(13px * var(--drawer-font-scale, 1));
   line-height: 1.6;

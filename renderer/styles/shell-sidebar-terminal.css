@@ -496,7 +496,7 @@
   align-items: center;
 }
 
-/* 2026-06-28 道雪：session 标题统一 10px（普通 + 群聊一致），同 150px 宽容纳约 1.5× 文字、省空间。 */
+/* 2026-06-28 maintainer：session 标题统一 10px（普通 + 群聊一致），同 150px 宽容纳约 1.5× 文字、省空间。 */
 .session-title {
   font-size: 10px;
   color: var(--text-primary);
@@ -579,7 +579,7 @@
   color: var(--text-secondary);
   margin-top: 5px;
   white-space: pre-line;
-  /* 2026-06-21 道雪：原 max-height:4.2em + overflow:hidden 把预览硬切 3 行、无任何
+  /* 2026-06-21 maintainer：原 max-height:4.2em + overflow:hidden 把预览硬切 3 行、无任何
      省略号，看着像缺字。改用 line-clamp，超 3 行结尾显示 … 提示"还有更多"。 */
   display: -webkit-box;
   -webkit-box-orient: vertical;
@@ -1531,7 +1531,7 @@
 
 
 /* =========================================================================
-   2026-07-19 道雪 · 方案C：顶部配额 ticker + 侧栏密排行/分区 + 底部聚合条
+   2026-07-19 maintainer · 方案C：顶部配额 ticker + 侧栏密排行/分区 + 底部聚合条
    ========================================================================= */
 .app-container { flex-direction: column; }
 .app-body { display: flex; flex: 1; min-height: 0; width: 100%; position: relative; }
@@ -1834,7 +1834,7 @@
 .header-overflow-menu .ho-key { margin-left: auto; color: var(--text-muted); font-size: 10px; font-family: ui-monospace, Consolas, monospace; }
 
 /* =========================================================================
-   2026-07-19 道雪 · 方案4(ctx 圆环)：sl-dot 退役，15px 圆环一图双关
+   2026-07-19 maintainer · 方案4(ctx 圆环)：sl-dot 退役，15px 圆环一图双关
    环=ctx 占用（ok/warn/danger 配色同 pctClass），圆心点=会话状态。
    同时清除旧版视觉：群聊紫竖线、休眠灰竖线+卡片底、selected 蓝竖线。
    ========================================================================= */
@@ -1901,7 +1901,7 @@
 .sl-line1 { grid-template-columns: auto 15px minmax(0,1fr) auto auto; }
 
 /* =========================================================================
-   2026-07-20 道雪：running 语义化 + 群聊运行中/去展开箭头 配套样式
+   2026-07-20 maintainer：running 语义化 + 群聊运行中/去展开箭头 配套样式
    ========================================================================= */
 /* 群聊行1 状态词：运行中（任一成员运行） */
 .sl-state.run { color: var(--accent-green); }

@@ -1,6 +1,6 @@
 'use strict';
 /*
- * 循环工作流 · main 进程驱动引擎（Phase 2b 进阶，2026-06-29 道雪）
+ * 循环工作流 · main 进程驱动引擎（Phase 2b 进阶，2026-06-29 maintainer）
  * ──────────────────────────────────────────────────────────────
  * 把「开发→评审→gate→推进→打磨→终止」循环驱动放在 main 进程，复用现有 dispatcher。
  * renderer 崩溃不中断循环（turn 级容错）；每轮持久化 loopState，Hub 重启自动续跑。
@@ -347,7 +347,7 @@ function createLoopEngine(deps) {
     const sid = sidOf(meeting, memberId);
     if (!sid || !sessionManager) throw new Error(`workflow member ${memberId} is missing`);
     let session = sessionManager.getSession(sid);
-    if (!session && require('../../core/dev-file-workflow').enabled(meeting) && typeof deps.loadSessionMeta === 'function') {
+    if (!session && (require('../../core/dev-file-workflow').enabled(meeting) || require('../../core/delivery-workflow').enabled(meeting)) && typeof deps.loadSessionMeta === 'function') {
       const meta = deps.loadSessionMeta(sid);
       if (meta && meta.hubId === sid && meta.meetingId === meeting.id) {
         if (typeof resumeSession !== 'function' || !await resumeSession(meta)) throw new Error(`workflow member ${memberId} could not restore its saved session`);
@@ -1051,7 +1051,7 @@ function createLoopEngine(deps) {
           state.lastError = state.lastError || { stage: 'builder', reason: builderChecked.reason, at: Date.now() };
           logger.log('[loop-engine] builder not completed: ' + state.lastError.reason); break;
         }
-        // 运行中被用户接管（2026-07-29 道雪）：用户点「停止本轮」(interrupted) 或直接
+        // 运行中被用户接管（2026-07-29 maintainer）：用户点「停止本轮」(interrupted) 或直接
         //   追问下一题把本步抢占掉 (superseded) —— 语义明确定为「中断整个循环」，不是
         //   「排到下一步」：后续步骤的 prompt 依赖本步产出，本步已经作废，再往下跑只会
         //   拿空结果编排出垃圾。用户接管后由用户自己决定要不要重启循环。

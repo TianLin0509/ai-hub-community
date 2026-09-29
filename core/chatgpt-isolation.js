@@ -2,7 +2,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const DEFAULT_ROOT = path.join(require('./data-dir').getHubDataDir(), 'chatgpt-isolated');
+const DEFAULT_ROOT = path.join(os.homedir(), '.ai-hub-community', 'chatgpt-web');
 
 function isolatedPaths(env = process.env) {
   const root = path.resolve(env.AI_HUB_CHATGPT_ROOT || DEFAULT_ROOT);

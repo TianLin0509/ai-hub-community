@@ -10,7 +10,7 @@ const pool = new Map();
 const threadOwners = new Map();
 function ownershipKey(options, threadId) {
   const path=require('path');
-  const home=path.resolve(options.env?.CODEX_HOME || path.join(require('os').homedir(),'.codex'));
+  const home=path.resolve(options.ownershipHome || options.env?.CODEX_HOME || path.join(require('os').homedir(),'.codex'));
   return (process.platform==='win32'?home.toLowerCase():home)+'\0'+threadId;
 }
 const INPUT_REQUESTS = new Set(['item/commandExecution/requestApproval','item/fileChange/requestApproval',
@@ -23,6 +23,8 @@ function scopeKey(options) {
   })).digest('hex');
 }
 function acquire(options) {
+  if (options.sqliteHome) options = {...options,
+    processArgs:[...(options.processArgs || []),'-c','sqlite_home='+JSON.stringify(options.sqliteHome)]};
   // A managed session must be able to retire its writer without affecting a
   // neighbour. Codex unsubscribe acknowledges detachment, but can retain the
   // loaded thread (and writer lock) for 30 minutes while its server stays alive.
@@ -138,6 +140,18 @@ class CodexNativeSession extends EventEmitter {
   }
   async _start() {
     if (this.closed) throw new Error('Codex 会话已关闭，不能启动');
+    if (this.options.resolveAccount) {
+      try {
+        const sqliteHome=await require('./codex-global-account').resolveHistorySqliteHome(this.options,this.runtime.sqliteHome);
+        if (this.closed) return;
+        this.options.sqliteHome=sqliteHome;
+        this.options.env={...this.options.env,CODEX_SQLITE_HOME:sqliteHome};
+        this.apply({type:'history-storage',sqliteHome});
+      } catch(error) {
+        if (!this.closed) this.apply({type:'disconnect',reason:error.message});
+        throw error;
+      }
+    }
     if (isUnstartedRuntime(this.runtime)) this.apply({type:'connect',epoch:this.runtime.epoch});
     this.entry = acquire(this.options);
     const client = this.entry.client;
@@ -283,6 +297,10 @@ class CodexNativeSession extends EventEmitter {
     return result;
   }
   async openThread(method, id) {
+    if (['thread/resume','thread/fork'].includes(method) && this.options.resumePath
+        && !require('./codex-transcript-parser').isUsableCodexRolloutPath(this.options.resumePath,id)) {
+      throw new Error('Codex 原始历史文件缺失或身份不匹配，未恢复或创建替代会话');
+    }
     const entry = this.entry;
     const ownerKey=ownershipKey(this.options,id);
     if (method === 'thread/resume' && threadOwners.has(ownerKey) && threadOwners.get(ownerKey) !== this) {
@@ -304,6 +322,7 @@ class CodexNativeSession extends EventEmitter {
     try {
       result = await this.requestNative(entry.client,method,{
         ...this.options.threadParams, ...(id ? {threadId:id} : {}),
+        ...(['thread/resume','thread/fork'].includes(method) && this.options.resumePath ? {path:this.options.resumePath} : {}),
       });
     } catch (error) {
       if (entry.owners.get(id) === this) entry.owners.delete(id);
@@ -341,6 +360,7 @@ class CodexNativeSession extends EventEmitter {
     threadOwners.set(ownershipKey(this.options,result.thread.id),this);
     this.unsubscribed = false;
     this.threadId = result.thread.id;
+    if (result.thread.path) this.options.resumePath = result.thread.path;
     this.backstage.bind();
     for (const turn of result.thread.turns || []) this.history.set(turn.id,turn);
     const lastTurn = (result.thread.turns || []).at(-1);
@@ -451,6 +471,14 @@ class CodexNativeSession extends EventEmitter {
       this.emit('items',this.blocks());
     } else if (type === 'item/commandExecution/outputDelta') {
       this.terminalPresentation.toolDelta(p.itemId, p.delta);
+      const item = this.items.get(p.itemId);
+      if (item && item.type === 'commandExecution' && typeof p.delta === 'string') {
+        // Keep the received output at the writer. compactCodexTools sends only
+        // a bounded tail to cards; the existing detail reader retains the text.
+        this.items.set(p.itemId, {...item, aggregatedOutput: (item.aggregatedOutput || '') + p.delta});
+        this.contentRevision++;
+        this.emit('items', this.blocks());
+      }
     } else if (type === 'thread/tokenUsage/updated') {
       this.tokenUsage = p.tokenUsage;
       this.emit('usage',p.tokenUsage);
@@ -587,6 +615,13 @@ class CodexNativeSession extends EventEmitter {
   }
   checkSendable(intent) {
     this.checkSendIntent(intent);
+    if (this.options.resolveAccount && !['running','waiting'].includes(this.runtime.state)) {
+      const target=this.options.resolveAccount();
+      if (target.id !== this.options.accountId || require('path').toNamespacedPath(target.home).toLowerCase()
+          !== require('path').toNamespacedPath(this.options.env.CODEX_HOME).toLowerCase()) {
+        throw new Error('全局 Codex 账号已变化，当前消息未发送，请等待切换后重试');
+      }
+    }
     if (this.runtime.cancellation) throw new Error('正在停止，请等待原生会话确认后发送');
     if (!this.threadId) throw new Error('请先选择要恢复的历史会话');
     if (this.runtime.connection !== 'connected' || !this.entry || this.entry.client.closed) throw new Error('Codex 连接已断开，请先核对');
@@ -596,6 +631,7 @@ class CodexNativeSession extends EventEmitter {
     if (this.runtime.state === 'waiting' && this.runtime.requests.length) throw new Error('请先回答当前审批或问题');
   }
   async _send(text, options, intent) {
+    await this.followGlobalAccount(intent);
     await this.start();
     this.checkSendIntent(intent);
     if (!this.threadId) throw new Error('请先选择要恢复的历史会话');
@@ -948,6 +984,7 @@ class CodexNativeSession extends EventEmitter {
   }
   async reconnect() {
     if (this.closed) throw new Error('Codex 会话正在关闭，不能重新连接');
+    if (await this.followGlobalAccount()) return this.runtime;
     if (isUnstartedRuntime(this.runtime)) return this.runtime;
     if (this.runtime.connection === 'connected') return this.reconcile();
     if (!this.entry || this.entry.client.closed || !this.threadId) {
@@ -973,6 +1010,70 @@ class CodexNativeSession extends EventEmitter {
       return this.start();
     }
     return this.reconcile();
+  }
+  async followGlobalAccount(intent) {
+    if (!this.options.resolveAccount) return false;
+    if (this.accountSwitch) { await this.accountSwitch; return false; }
+    const target = this.options.resolveAccount();
+    const same = target.id === this.options.accountId && require('path').toNamespacedPath(target.home).toLowerCase()
+      === require('path').toNamespacedPath(this.options.env.CODEX_HOME).toLowerCase();
+    if (same) return false;
+    if (this.closed) throw new Error('会话正在关闭，不能切换账号');
+    if (this.ready) {
+      try { await this.ready; }
+      catch(error) { this.emit('diagnostic','原连接启动失败，将按原始历史核对账号切换：'+error.message); }
+    }
+    // reconnect is also callable outside the send queue. A competing switch
+    // may have acquired the writer while we awaited the shared startup above.
+    if (this.accountSwitch) { await this.accountSwitch; return false; }
+    if (this.runtime.submission?.status === 'unknown' || this.runtime.submission?.status === 'submitting'
+        || this.runtime.requests?.length || ['running','waiting'].includes(this.runtime.state)) return false;
+    if (this.runtime.state === 'unknown' && this.entry && !this.entry.client.closed) {
+      throw new Error('Codex 状态待核对，暂未切换账号；请先核对旧会话');
+    }
+    this.accountSwitch = (async () => {
+      const old = this.entry?.client;
+      let id = this.threadId || this.options.resumeId;
+      const empty = id && !this.options.resumePath && this.runtime.connection==='connected'
+        && this.hasNoTurnEvidence() && !this.receipts.size && !this.options.resumeId && !this.options.forkId;
+      if (id && !this.options.resumePath && !empty) throw new Error('Codex 原始历史路径未知，未切换账号或新建替代会话');
+      if (this.entry && this.entry.refs !== 1) throw new Error('共享原生进程不能切换账号，请先关闭旧会话');
+      const nextEnv={...this.options.env,CODEX_HOME:target.home};
+      const nextOptions=this.options.accountOptions ? this.options.accountOptions(target,nextEnv) : {};
+      if (intent) this.checkSendIntent(intent);
+      if (old) { old.close(); await old.waitForExit(); }
+      if (this.closed) throw new Error('会话已关闭，取消账号切换');
+      this.detach();
+      const options = this.options;
+      if (empty) { this.resetEmptyIdentity(id);id=null;options.ownershipHome=target.home; }
+      if (!id) {
+        options.ownershipHome=target.home;
+        options.historyStorageHome=target.home;
+        options.sqliteHome=null;
+        delete nextEnv.CODEX_SQLITE_HOME;
+        this.apply({type:'history-storage',sqliteHome:null});
+      }
+      options.env = nextEnv;
+      options.accountId = target.id;
+      options.resumeId = id;
+      if (id) { options.forkId=null; options.picker=false; options.resumeLatest=false; }
+      Object.assign(options,nextOptions);
+      this.apply({type:'connect',epoch:this.runtime.epoch+1});
+      this.ready=null;
+      if (intent) { intent.epoch=this.runtime.epoch;intent.client=null;intent.threadId=id; }
+      this.emit('account-changed',target);
+      if (old || id) {
+        try { await this.start(); }
+        catch(error) {
+          const failed=this.entry?.client;
+          if (failed) { failed.close();await failed.waitForExit(); }
+          throw error;
+        }
+      }
+      return true;
+    })();
+    try { return await this.accountSwitch; }
+    finally { this.accountSwitch=null; }
   }
   detach() {
     if (!this.entry) return;

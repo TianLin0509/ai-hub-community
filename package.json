@@ -1,11 +1,11 @@
 {
   "name": "ai-hub-community",
-  "version": "0.1.0-preview.2",
+  "version": "0.2.0",
   "description": "Local multi-agent desktop workspace using your own AI accounts",
   "main": "main-bootstrap.js",
   "scripts": {
     "start": "electron .",
-    "test": "node --test tests/unit-community.test.js tests/unit-community-onboarding.test.js",
+    "test": "node --test tests/unit-community.test.js tests/unit-community-onboarding.test.js tests/unit-community-hooks.test.js",
     "dist": "electron-builder --win --publish never",
     "doctor": "node scripts/doctor.js",
     "audit": "node scripts/audit-public.js"
@@ -41,17 +41,20 @@
     "appId": "com.ai-hub.community",
     "productName": "AI Hub Community",
     "win": {
-      "target": ["nsis", "zip"],
+      "target": [
+        "nsis",
+        "zip"
+      ],
       "icon": "claude-wx.ico",
       "artifactName": "AIHubCommunity-${version}-win-${arch}.${ext}"
     },
     "nsis": {
-      "artifactName": "AIHubCommunity-Setup-${version}.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "installerIcon": "claude-wx.ico",
       "uninstallerIcon": "claude-wx.ico",
-      "createDesktopShortcut": true
+      "createDesktopShortcut": true,
+      "artifactName": "AIHubCommunity-Setup-${version}.${ext}"
     },
     "files": [
       "main-bootstrap.js",
@@ -63,7 +66,12 @@
       "!scripts/firewall-whitelist-electron.ps1",
       "claude-wx.ico",
       "package.json",
-      "community-edition.json"
+      "community-edition.json",
+      "!node_modules/node-pty/deps/**",
+      "!node_modules/node-pty/src/**",
+      "!node_modules/node-pty/scripts/**",
+      "!node_modules/node-pty/typings/**",
+      "!node_modules/node-pty/binding.gyp"
     ],
     "asarUnpack": [
       "core/claude-fast-settings.json",
@@ -71,11 +79,6 @@
       "core/claude-subscription-standard-settings.json"
     ],
     "extraResources": [
-      {
-        "from": ".",
-        "to": "guides",
-        "filter": ["README.md", "INSTALL.md", "AGENTS.md", "PRIVACY.md", "LICENSE", "docs/**/*.md", "examples/**/*"]
-      },
       {
         "from": "scripts",
         "to": "scripts",

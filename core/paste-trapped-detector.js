@@ -1,6 +1,6 @@
 'use strict';
 // core/paste-trapped-detector.js
-// 主动检测"prompt 卡在 CLI 输入框的 paste 模式没提交"现象（2A，2026-05-05 道雪）。
+// 主动检测"prompt 卡在 CLI 输入框的 paste 模式没提交"现象（2A，2026-05-05 maintainer）。
 //
 // 用户痛点：dispatch 主路径写 prompt + \r 后，CLI（特别是 codex）有时不识别 \r，
 //   prompt 留在输入框 paste 缓冲区。屏幕显示一个折叠标记如：

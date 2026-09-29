@@ -81,6 +81,25 @@
 .mr-composer-head .mr-file-error { display: inline; margin-left: 6px; }
 .mr-composer-head .mr-file-actions { flex: none; flex-wrap: nowrap; gap: 6px; }
 .mr-composer-head .mr-file-actions button { white-space: nowrap; padding: 4px 9px; }
+.mr-composer-head:has(.mr-delivery-flow) { flex-wrap: wrap; overflow-x: hidden; }
+.mr-composer-head:has(.mr-delivery-flow) .mr-input-preflight { flex-basis: 100%; }
+.mr-composer-head .mr-delivery-flow { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 6px; }
+.mr-composer-head .mr-delivery-flow .mr-file-detail { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.mr-composer-head .mr-delivery-flow .mr-file-detail small,
+.mr-composer-head .mr-delivery-flow .mr-file-detail span { display: block; margin: 3px 0 0; }
+.mr-composer-head .mr-delivery-flow .mr-file-actions { flex-wrap: wrap; }
+.mr-composer-head .mr-delivery-flow > .mr-file-detail { flex: 1 1 160px; }
+.mr-composer-head .mr-delivery-flow > .mr-file-error,
+.mr-delivery-recipients, .mr-delivery-details { flex-basis: 100%; min-width: 0; }
+.mr-delivery-recipients { color: var(--fg-muted); font-size: 11px; }
+.mr-delivery-details[hidden] { display: none; }
+.mr-delivery-details { padding-top: 8px; border-top: 1px solid var(--border-subtle); }
+.mr-delivery-details p { margin: 6px 0; color: var(--fg-muted); font-size: 12px; }
+.mr-delivery-stages { display: flex; flex-wrap: wrap; gap: 6px 22px; margin: 0; padding-left: 20px; color: var(--fg-muted); font-size: 12px; }
+.mr-delivery-stages [aria-current="step"] { color: var(--accent, var(--mark-indigo)); font-weight: 600; }
+.mr-delivery-flow button:focus-visible, .mr-gc-dispatch-details summary:focus-visible { outline: 2px solid var(--accent, var(--mark-indigo)); outline-offset: 2px; }
+.mr-gc-dispatch-details { margin-top: 8px; border-top: 1px solid var(--border-subtle); padding-top: 6px; }
+.mr-gc-dispatch-details summary { cursor: pointer; color: var(--fg-muted); font-size: 12px; }
 .mr-composer-head .mr-input-battle-detail { max-width: 180px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .mr-composer-head .mr-input-battle-chips { flex-wrap: nowrap; }
 .mr-composer-head .mr-next-actions { flex-wrap: nowrap; white-space: nowrap; }
@@ -97,12 +116,6 @@
 .mr-input-member-tuning .composer-model { max-width: 230px; }
 .mr-input-member-tuning .composer-chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mr-input-member-tuning .composer-thinking:disabled { opacity: .65; cursor: default; }
-/* The bridge status is text-only; in a group it must not cover the send key. */
-body:has(#meeting-room-panel[style*="display: flex"] .mr-group-composer) #chatgpt-bridge-status {
-  top: 64px;
-  bottom: auto !important;
-  pointer-events: none;
-}
 
 .mr-input-preflight {
   display: flex;
@@ -354,7 +367,7 @@ body:has(#meeting-room-panel[style*="display: flex"] .mr-group-composer) #chatgp
   flex-wrap: wrap;
 }
 
-/* 2026-06-28 道雪：把聊天区的 nextActions（综合共识/互相挑错/生成交接/引用焦点卡）融入作战面板这一行——
+/* 2026-06-28 maintainer：把聊天区的 nextActions（综合共识/互相挑错/生成交接/引用焦点卡）融入作战面板这一行——
    去掉独立卡片的边框/外边距/背景，靠右排，与目标/引用/字数 chips 同行。 */
 .mr-input-preflight .mr-next-actions {
   margin: 0 0 0 auto;
@@ -425,8 +438,9 @@ body:has(#meeting-room-panel[style*="display: flex"] .mr-group-composer) #chatgp
 .mr-free-avatar-chk.disabled {
   cursor: not-allowed; opacity: 0.5;
 }
+.mr-free-avatar-chk:focus-visible { outline: 2px solid var(--accent, var(--mark-indigo)); outline-offset: 2px; }
 
-/* 2026-07-20 道雪 [修#10]：模式 dropdown 死样式已删（功能早移除，原 125 行） */
+/* 2026-07-20 maintainer [修#10]：模式 dropdown 死样式已删（功能早移除，原 125 行） */
 
 /* Phase 4 v2: 欢迎 head 动态状态 — 启动中黄色 / 全员就绪绿色 */
 .mr-gc-ob-head {
@@ -477,7 +491,7 @@ body:has(#meeting-room-panel[style*="display: flex"] .mr-group-composer) #chatgp
   outline: none;
   overflow-y: auto;
   word-break: break-word;
-  /* 2026-07-20 道雪 [修#7a]：JS 写入（草稿恢复/模板注入）后换行不再被折叠成空格 */
+  /* 2026-07-20 maintainer [修#7a]：JS 写入（草稿恢复/模板注入）后换行不再被折叠成空格 */
   white-space: pre-wrap;
 }
 
@@ -804,15 +818,15 @@ body:has(#meeting-room-panel[style*="display: flex"] .mr-group-composer) #chatgp
 }
 
 
-/* 2026-07-20 道雪 [修#3a]：休眠成员头像灰显（配合 JS 的 disabled 禁勾） */
+/* 2026-07-20 maintainer [修#3a]：休眠成员头像灰显（配合 JS 的 disabled 禁勾） */
 .mr-free-avatar-chk.dormant img { opacity: 0.45; filter: grayscale(0.8); }
 .mr-free-avatar-chk.dormant { cursor: not-allowed; }
 
-/* 2026-07-20 道雪 [修#8]：可点击 chip（循环状态停止钮） */
+/* 2026-07-20 maintainer [修#8]：可点击 chip（循环状态停止钮） */
 .mr-input-preflight-chip.clickable { cursor: pointer; }
 .mr-input-preflight-chip.clickable:hover { border-color: rgba(245, 215, 110, 0.6); background: rgba(245, 215, 110, 0.16); }
 
-/* 2026-07-29 道雪 [群聊运行中可操作]：「⏹ 停止本轮」chip —— 本轮有 AI 在跑时常驻，
+/* 2026-07-29 maintainer [群聊运行中可操作]：「⏹ 停止本轮」chip —— 本轮有 AI 在跑时常驻，
    与输入框可用状态并存（运行中既能追加提问，也能一键叫停）。 */
 .mr-input-preflight-chip.stop {
   border-color: rgba(233, 105, 105, 0.55);

@@ -3,8 +3,8 @@
 const fs = require('fs');
 const path = require('path');
 
-const HUB_APP_USER_MODEL_ID = require('./distribution').community ? 'com.ai-hub.community' : 'com.ai-group-chat-hub';
-const HUB_SHORTCUT_NAME = require('./distribution').community ? 'AI Hub Community.lnk' : 'AI 群聊 Hub.lnk';
+const HUB_APP_USER_MODEL_ID = 'com.ai-hub.community';
+const HUB_SHORTCUT_NAME = 'AI Hub Community.lnk';
 const LEGACY_ELECTRON_SHORTCUT_NAME = 'Electron.lnk';
 const LEGACY_DESKTOP_SHORTCUT_NAME = 'AI Group Chat Hub.lnk';
 
@@ -36,7 +36,7 @@ function buildShortcutDetails(options) {
     target: launch.target,
     args: launch.args,
     cwd: launch.cwd,
-    description: 'AI 群聊 Hub',
+    description: 'AI Hub Community',
     icon: launch.icon,
     iconIndex: 0,
     appUserModelId: HUB_APP_USER_MODEL_ID,
@@ -50,8 +50,8 @@ function buildNewWindowTask(options) {
     arguments: launch.args,
     iconPath: launch.icon,
     iconIndex: 0,
-    title: '新建 AI 群聊 Hub',
-    description: '打开一个新的 AI 群聊 Hub 窗口',
+    title: '新建 AI Hub Community',
+    description: '打开一个新的 AI Hub Community 窗口',
     workingDirectory: launch.cwd,
   };
 }
@@ -85,7 +85,7 @@ function isPoisonedLegacyElectronShortcut(details, expected) {
 // 会把快捷方式和 Jump List 任务项一起归一化成它的裸登记版本 —— target=exe、
 // args 清空、cwd 改成 exe 目录。实测（2026-08-17，Electron 41 / Win11）：
 //   - 重写登记快捷方式后 setUserTasks → 数秒后快捷方式与任务项双双丢参数，
-//     任务栏"新建 AI 群聊 Hub"打开 Electron 空壳；
+//     任务栏"新建 AI Hub Community"打开 Electron 空壳；
 //   - 不动登记快捷方式、只 setUserTasks → 任务项参数完整保留。
 // 所以归一化裸版不算漂移，绝不能"修复"它 —— 每修一次，下一次提交就再被抹一次，
 // 形成永远修不好的循环。只有 target/icon/AUMID 真错了或文件缺失才重写。
@@ -110,7 +110,7 @@ function timestampForFile(date = new Date()) {
  *
  * 判定收得很紧：args 必须正好是 Hub 的 appRoot，且 target 是同一个 electron dist
  * 目录下的可执行文件。满足这两条就不可能是别的程序 —— 只是同一个 Hub 的另一个
- * 启动入口（claudeWX.lnk / AI 群聊 Hub.lnk 这些用户手建的）。文件名、备注、
+ * 启动入口（claudeWX.lnk / AI Hub Community.lnk 这些用户手建的）。文件名、备注、
  * 图标全部保留，只换 target/cwd。
  *
  * 存在的理由：窗口类图标取自"创建窗口的那个 exe"的资源。只要还有一个入口指着
@@ -287,7 +287,7 @@ function ensureWindowsShellIntegration({
   // Older development launches created an English-named Desktop shortcut.
   // Keep a working user-customized link untouched; repair only this exact
   // Hub-owned filename when its executable, cwd, or icon no longer exists.
-  if (!require('./distribution').community && fsModule.existsSync(desktopLegacyPath)) {
+  if (false) {
     try {
       let desktopShortcut = null;
       try { desktopShortcut = shell.readShortcutLink(desktopLegacyPath); } catch {}
@@ -302,7 +302,7 @@ function ensureWindowsShellIntegration({
           result.desktopShortcutUpdated = true;
           result.desktopBackupPath = backupPath;
         } catch (error) {
-          if (fsModule.existsSync(desktopLegacyPath)) {
+  if (false) {
             fsModule.rmSync(desktopLegacyPath, { force: true });
           }
           if (fsModule.existsSync(backupPath)) {
@@ -337,7 +337,7 @@ function ensureWindowsShellIntegration({
       buildNewWindowTask({ appRoot, execPath, isPackaged, iconPath }),
     ]);
     if (!result.userTasksUpdated) {
-      result.errors.push('Windows Jump List 拒绝更新“新建 AI 群聊 Hub”任务');
+      result.errors.push('Windows Jump List 拒绝更新“新建 AI Hub Community”任务');
     }
   } catch (error) {
     result.errors.push(`Windows Jump List 更新失败：${error.message}`);
@@ -347,7 +347,7 @@ function ensureWindowsShellIntegration({
   // 注意：抹掉参数的元凶不是 setUserTasks 本身，而是 Explorer 发现登记快捷方式被
   // 外部改写后做的异步归一化（见 isWindowsNormalizedShortcut 的实测记录）。因此
   // 这里绝不能把归一化裸版再改回带参数版——那只会让下一次 Jump List 提交再把
-  // 任务项参数抹掉，"新建 AI 群聊 Hub"反复退回 Electron 空壳。文件缺失时才补建，
+  // 任务项参数抹掉，"新建 AI Hub Community"反复退回 Electron 空壳。文件缺失时才补建，
   // 且本次提交已完成，补建不会影响刚登记的 Jump List。
   try {
     let current = null;

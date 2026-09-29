@@ -7,8 +7,7 @@ const {
 } = require('./ai-kinds.js');
 const { isStableSessionTitle } = require('./session-title-guards.js');
 const {
-  DEFAULT_MODEL_BY_KIND,
-  isCodexConversationModelId,
+  normalizeCodexSessionModel,
   normalizeDeepSeekModel,
 } = require('./model-options.js');
 
@@ -31,6 +30,7 @@ function runtimeKindForSession(session) {
 }
 
 function sessionProviderFamily(session) {
+  if (session?.agentRuntime === 'pty' && require('./acp-profiles').isAcpKind(session.kind)) return 'acp';
   if (session?.runtimeBackend === 'acp') return 'acp';
   const runtimeKind = runtimeKindForSession(session);
   if (isClaudeFamily(runtimeKind)) return 'claude';
@@ -44,7 +44,7 @@ function sessionProviderFamily(session) {
 
 function nativeSessionIdentity(session) {
   if (!session || typeof session !== 'object') return null;
-  if (session.runtimeBackend === 'acp') return session.acpSid ? {family:'acp',field:'acpSid',value:session.acpSid} : null;
+  if (sessionProviderFamily(session) === 'acp') return session.acpSid ? {family:'acp',field:'acpSid',value:session.acpSid} : null;
   const family = sessionProviderFamily(session);
   const field = family === 'claude'
     ? 'ccSessionId'
@@ -62,12 +62,14 @@ function nativeSessionIdentity(session) {
 
 function supportsRecoverableSession(session) {
   if (!session) return false;
+  if (session.agentRuntime === 'pty' && sessionProviderFamily(session) === 'acp') return true;
   if (session.runtimeBackend === 'acp') return !!(session.acpCapabilities?.loadSession || session.acpCapabilities?.sessionCapabilities?.resume);
   return ['claude', 'codex', 'gemini', 'kimi'].includes(sessionProviderFamily(session));
 }
 
 function supportsForkSession(session) {
-  if (!session || session.purpose === 'chuxin-research') return false;
+  if (!session || session.purpose === 'xresearch-research') return false;
+  if (session.agentRuntime === 'pty' && sessionProviderFamily(session) === 'acp') return session.kind.replace(/-resume$/, '') === 'qwen';
   if (session.runtimeBackend === 'acp') return session.kind === 'qwen' || !!session.acpCapabilities?.sessionCapabilities?.fork;
   return ['claude', 'codex'].includes(sessionProviderFamily(session));
 }
@@ -84,9 +86,7 @@ function sessionModelId(session) {
   }
   if (!candidate) return null;
   const kind = baseKind(session.kind);
-  if (kind === 'codex' && !isCodexConversationModelId(candidate)) {
-    return DEFAULT_MODEL_BY_KIND.codex;
-  }
+  if (kind === 'codex') return normalizeCodexSessionModel(candidate);
   if (kind === 'deepseek' && sessionProviderFamily(session) === 'codex') {
     return normalizeDeepSeekModel(candidate);
   }
@@ -161,7 +161,7 @@ function buildSessionResumeMeta(session, overrides = {}) {
       : null,
     purpose: session.purpose || null,
     researchSessionId: session.researchSessionId || null,
-    chuxinTaskId: session.chuxinTaskId || null,
+    xresearchTaskId: session.xresearchTaskId || null,
     heroIds: Array.isArray(session.heroIds) ? session.heroIds.slice() : null,
     promptPolicyVersion: session.promptPolicyVersion || null,
     hiddenFromSidebar: !!session.hiddenFromSidebar,

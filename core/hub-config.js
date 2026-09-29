@@ -23,22 +23,31 @@ const {
 } = require('./card-display-config.js');
 
 // 默认值
-const { community } = require('./distribution');
 const DEFAULTS = {
-  proxy: community ? '' : 'http://127.0.0.1:7890',
+  proxy: '',
   claude_backend: 'subscription',
-  // Official API defaults; subscription login remains the default backend.
+  // API 模式默认指向官方地址；订阅登录仍是默认后端。
   claude_api_base_url: 'https://api.anthropic.com',
-  claude_api_model: DEFAULT_MODEL_BY_KIND.claude,
+  claude_api_model: 'claude-fable-5',
   codex_backend: 'subscription',
   codex_subscription_profile: 'default',
   codex_api_base_url: 'https://api.openai.com/v1',
   codex_api_model: DEFAULT_MODEL_BY_KIND.codex,
-  codex_api_provider: 'openai',
+  codex_api_provider: 'openai-api',
+  // 用户在新建会话面板点「设为默认」存下来的 per-CLI 默认模型，形如
+  // { claude: 'claude-opus-5-5[1m]', codex: 'gpt-6-astra' }。空表示沿用
+  // model-options.js 里的出厂默认值。config.json 里落在 models.defaults，
+  // 校验与解析见 core/default-model-preference.js。
+  models_defaults: {},
   ui_tool_fold_threshold: 15,
   ui_code_fold_threshold: 30,
   ui_card_font_size: DEFAULT_CARD_FONT_SIZE,
   ui_card_font_family: DEFAULT_CARD_FONT_FAMILY,
+  // Native Claude quota auto-resume (core/claude-quota-watchdog.js). Defaults on
+  // for parity with the CLI's own behaviour before the stream-json transport --
+  // an opt-in would have to be clicked at the moment of failure, which is
+  // exactly when nobody is watching.
+  claude_quota_auto_resume: true,
 };
 
 /**
@@ -51,6 +60,26 @@ function loadConfigJson() {
     return JSON.parse(raw);
   } catch {
     return {};
+  }
+}
+
+/**
+ * 供「读-改-写」使用的配置读取。
+ *
+ * 和上面的 loadConfigJson 的区别在错误语义：那个吞掉一切错误返回 {}，只读场景
+ * 够用；但读-改-写里把「读不到」当成「空配置」会导致整份写回时静默抹掉其它字段
+ * （API key 之类）。所以这里只把 ENOENT（首次运行）当成空对象，其它错误一律抛给
+ * 调用方去中止本次保存。
+ *
+ * BOM 必须剥：Windows 上用记事本手改过 config.json 就会带 ﻿，
+ * 直接 JSON.parse 会抛 Unexpected token，让调用方误判成「配置读不到」。
+ */
+function readConfigJsonForUpdate() {
+  try {
+    return JSON.parse(fs.readFileSync(getConfigPath(), 'utf8').replace(/^﻿/, ''));
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return {};
+    throw error;
   }
 }
 
@@ -82,7 +111,6 @@ function normalizeBaseUrl(url) {
 }
 
 function defaultCodexSubscriptionProfiles() {
-  if (community) return [{ id: 'default', label: '本机账号', home: '' }];
   return [
     { id: 'default', label: '主账号', home: '' },
     { id: 'second', label: '新账号', home: path.join(os.homedir(), '.codex-profiles', 'second') },
@@ -130,10 +158,18 @@ function getConfig() {
     codexApiBaseUrl: normalizeBaseUrl(getConfigValue('codexApiBaseUrl', 'HUB_CODEX_API_BASE_URL', 'providers.codex.base_url', DEFAULTS.codex_api_base_url)),
     codexApiModel: getConfigValue('codexApiModel', 'HUB_CODEX_API_MODEL', 'providers.codex.model', DEFAULTS.codex_api_model),
     codexApiProvider: getConfigValue('codexApiProvider', 'HUB_CODEX_API_PROVIDER', 'providers.codex.provider', DEFAULTS.codex_api_provider),
+    // 每个 CLI 的默认模型。对象类型，不走 getConfigValue（那条路是给标量用的）。
+    defaultModels: (rawConfig.models && rawConfig.models.defaults) || DEFAULTS.models_defaults,
     uiToolFoldThreshold: parseInt(getConfigValue('uiToolFoldThreshold', 'HUB_UI_TOOL_FOLD', 'ui.tool_fold_threshold', DEFAULTS.ui_tool_fold_threshold), 10),
     uiCodeFoldThreshold: parseInt(getConfigValue('uiCodeFoldThreshold', 'HUB_UI_CODE_FOLD', 'ui.code_fold_threshold', DEFAULTS.ui_code_fold_threshold), 10),
     cardFontSize: normalizeCardFontSize(getConfigValue('cardFontSize', 'HUB_UI_CARD_FONT_SIZE', 'ui.card_font_size', DEFAULTS.ui_card_font_size)),
     cardFontFamily: normalizeCardFontFamily(getConfigValue('cardFontFamily', 'HUB_UI_CARD_FONT_FAMILY', 'ui.card_font_family', DEFAULTS.ui_card_font_family)),
+    // Claude / Codex 的会话后端。默认 pty（真实 CLI + 卡片旁读）；native 只是回退开关。
+    agentRuntime: getConfigValue('agentRuntime', 'CLAUDE_HUB_AGENT_RUNTIME', 'runtime.agent', 'pty'),
+    // Only an explicit false turns the watchdog off; an absent or malformed
+    // value keeps CLI-parity behaviour rather than silently disabling it.
+    claudeQuotaAutoResume: String(getConfigValue('claudeQuotaAutoResume', 'HUB_CLAUDE_QUOTA_AUTO_RESUME',
+      'providers.claude.quota_auto_resume', DEFAULTS.claude_quota_auto_resume)) !== 'false',
     // 回答完成通知；飞书接收对象可由 config.json 或 HUB_NOTIFY_FEISHU_TARGET 提供。
     notifications: normalizeNotificationConfig(rawConfig.notifications),
     // 梦境系统（dream-consolidation）配置段，config.json 的 consolidation 键。
@@ -186,10 +222,12 @@ function checkMissingConfig() {
 }
 
 module.exports = {
+  normalizeCodexSubscriptionProfiles,
   getConfig,
   clearConfigCache,
   saveConfig,
   getConfigPath,
+  readConfigJsonForUpdate,
   checkMissingConfig,
   DEFAULTS,
 };

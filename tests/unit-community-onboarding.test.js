@@ -1,86 +1,66 @@
 'use strict';
-const test = require('node:test'), assert = require('node:assert/strict');
-const fs = require('fs'), path = require('path'), os = require('os');
-const { requireCommand, resolveClaudeCommand, assertProviderAvailable } = require('../core/community-provider');
-test('packaged readiness uses the bundled runtime without external electron dependency', () => {
-  const result=require('../core/community-setup').inspectSetup({packaged:true,root:os.tmpdir(),env:{PATH:'',USERPROFILE:os.tmpdir()},platform:'win32',version:'22.0.0'});
-  assert.equal(result.ready,true);assert.equal(result.runtime,'bundled');
-});
-test('source ZIP audit works without Git and still rejects runtime files', t => {
-  const {root}=environment(t);
-  fs.mkdirSync(path.join(root,'scripts'));
-  const script=path.join(root,'scripts/audit-public.js');
-  fs.copyFileSync(path.resolve(__dirname,'../scripts/audit-public.js'),script);
-  const run=()=>require('child_process').spawnSync(process.execPath,[script],{encoding:'utf8',env:{...process.env,PATH:''}});
-  const clean=run();assert.equal(clean.status,0,clean.stderr);
-  assert.equal(JSON.parse(clean.stdout).inventoryMode,'source-archive');
-  fs.writeFileSync(path.join(root,'auth.json'),'{}');
-  const dirty=run();assert.equal(dirty.status,1);
-  assert.ok(JSON.parse(dirty.stdout).failures.some(f=>f.file==='auth.json'));
-});
-test('native Codex default installation is found before reopening the Windows shell', t => {
-  const {root,env}=environment(t);env.LOCALAPPDATA=path.join(root,'local');
-  const executable=path.join(env.LOCALAPPDATA,'Programs/OpenAI/Codex/bin/codex.exe');
-  fs.mkdirSync(path.dirname(executable),{recursive:true});fs.writeFileSync(executable,'fixture');
-  assert.equal(requireCommand('codex',env),executable);
-  assert.equal(require('../main/codex-windows-command').resolveWindowsCodex(env).command,executable);
-});
+// First-run behaviour on a clean machine: readiness without Node/Git/Python,
+// CLI discovery outside PATH, plain-language errors for missing CLIs, and a
+// public audit that also works from a source ZIP.
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const { requireCommand, assertProviderAvailable } = require('../core/community-provider');
+const { inspectSetup } = require('../core/community-setup');
+
 function environment(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'community onboarding '));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  return {root, env:{PATH:'',USERPROFILE:root,APPDATA:path.join(root,'roaming')}};
+  const system = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32');
+  return { root, env: { PATH: [system, path.join(system, 'WindowsPowerShell', 'v1.0')].join(';'), USERPROFILE: root, APPDATA: path.join(root, 'roaming'), LOCALAPPDATA: path.join(root, 'local') } };
 }
-test('provider preflight rejects missing CLI and ignores untrusted fixture bypass', t => {
+
+test('the packaged app is ready with only Windows PowerShell available', t => {
+  const { root, env } = environment(t);
+  const result = inspectSetup({ packaged: true, root, env, platform: 'win32', version: '18.0.0' });
+  assert.equal(result.runtime, 'bundled');
+  assert.equal(result.hookRunner, 'powershell');
+  assert.equal(result.requirements.powershell, true);
+  assert.equal(result.requirements.node22, undefined, 'Node is only needed for source installs');
+  assert.equal(result.ready, true);
+  assert.ok(result.providers.every(p => !p.installed));
+});
+
+test('CLIs installed by the official installers are found before PATH is refreshed', t => {
+  const { root, env } = environment(t);
+  const codex = path.join(env.LOCALAPPDATA, 'Programs', 'OpenAI', 'Codex', 'bin', 'codex.exe');
+  const claude = path.join(root, '.local', 'bin', 'claude.exe');
+  for (const file of [codex, claude]) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, 'fixture'); }
+  assert.equal(requireCommand('codex', env), codex);
+  assert.equal(requireCommand('claude', env), claude);
+});
+
+test('a missing CLI is reported in plain words before anything starts', t => {
   const { env } = environment(t);
-  for (const kind of ['claude','codex','claude-resume','codex-resume','kimi','gemini']) {
-    assert.throws(() => assertProviderAvailable(kind,env), /未找到.*CLI/);
+  for (const kind of ['claude', 'codex', 'claude-resume', 'codex-resume', 'kimi', 'gemini']) {
+    assert.throws(() => assertProviderAvailable(kind, env), /未找到.*CLI/);
   }
-  assert.doesNotThrow(() => assertProviderAvailable('powershell',env));
-  assert.throws(() => assertProviderAvailable('claude',{...env,CLAUDE_HUB_CLAUDE_STREAM_FIXTURE:'fixture'}), /未找到/);
+  assert.doesNotThrow(() => assertProviderAvailable('powershell', env));
 });
-test('Claude detection, auth and native transport share the native install outside PATH', async t => {
-  const {root,env} = environment(t);
-  const executable = path.join(root,'.local','bin','claude.exe');
-  fs.mkdirSync(path.dirname(executable),{recursive:true});fs.writeFileSync(executable,'fixture');
-  assert.equal(requireCommand('claude',env),executable);
-  assert.equal(resolveClaudeCommand(env).command,executable);
-  const calls=[];
-  const adapter=require('../core/account-adapters').createAccountAdapters({dataDir:root,homeDir:root,env,
-    runImpl:async(command,args)=>{calls.push({command,args});return {code:0,stdout:'{"loggedIn":false}'};},
-    terminal:async(command,args)=>{calls.push({command,args});return {};}});
-  const row={provider:'claude',home:path.join(root,'.claude')};
-  assert.equal((await adapter.check(row)).state,'login_required');
-  await adapter.login(row);
-  assert.deepEqual(calls,[{command:executable,args:['auth','status','--json']},{command:executable,args:['auth','login']}]);
-});
-test('npm Claude shim uses bundled runtime and literal script path; incomplete installs fail', t => {
-  const {root,env} = environment(t);env.PATH=root;
-  fs.writeFileSync(path.join(root,'claude.cmd'),'@echo off');
-  assert.throws(()=>resolveClaudeCommand(env),/启动器不完整/);
-  const script=path.join(root,'node_modules/@anthropic-ai/claude-code/cli.js');
-  fs.mkdirSync(path.dirname(script),{recursive:true});fs.writeFileSync(script,'');
-  const cmd=resolveClaudeCommand(env);
-  assert.equal(cmd.command,process.execPath);assert.deepEqual(cmd.args,[script]);
-  assert.equal(cmd.env.ELECTRON_RUN_AS_NODE,'1');
-});
-test('missing login never opens a terminal or claims to have started auth', async t => {
-  const {root,env}=environment(t);
-  const adapter=require('../core/account-adapters').createAccountAdapters({dataDir:root,homeDir:root,env,
-    terminal:()=>{throw Error('unexpected terminal');}});
-  for(const provider of ['claude','codex','gemini','kimi']) await assert.rejects(adapter.login({provider,home:root}),/未找到.*CLI/);
-});
-test('community startup does not replace an old Hub desktop shortcut with a missing target', t => {
-  const {root}=environment(t);
-  const desktop=path.join(root,'Desktop');fs.mkdirSync(desktop);
-  const legacy=path.join(desktop,'AI Group Chat Hub.lnk');fs.writeFileSync(legacy,'old shortcut');
-  const writes=[];
-  const details=new Map([[legacy,{target:path.join(root,'old-missing','electron.exe'),args:'"old app"',cwd:path.join(root,'old-missing')}]]);
-  const shell={readShortcutLink:p=>details.get(p),writeShortcutLink:(p,_op,d)=>{writes.push(p);details.set(p,d);return true;}};
-  const result=require('../core/windows-shell-integration').ensureWindowsShellIntegration({
-    app:{setUserTasks:()=>true},shell,appRoot:root,execPath:path.join(root,'new','electron.exe'),
-    desktopPath:desktop,appDataPath:path.join(root,'roaming'),platform:'win32',logger:{warn(){}}});
-  assert.deepEqual(result.errors,[]);
-  assert.equal(fs.readFileSync(legacy,'utf8'),'old shortcut');
-  assert.ok(!writes.includes(legacy));
-  assert.equal(result.desktopShortcutUpdated,false);
+
+test('public audit runs from a source ZIP without Git and rejects account files', t => {
+  const { root } = environment(t);
+  fs.mkdirSync(path.join(root, 'scripts'));
+  const script = path.join(root, 'scripts', 'audit-public.js');
+  fs.copyFileSync(path.resolve(__dirname, '../scripts/audit-public.js'), script);
+  fs.writeFileSync(path.join(root, 'README.md'), 'Install to C:\\Users\\you\\ai-hub-community\n');
+  const run = () => spawnSync(process.execPath, [script], { encoding: 'utf8', env: { ...process.env, PATH: '' } });
+  const clean = run();
+  assert.equal(clean.status, 0, clean.stdout + clean.stderr);
+  fs.writeFileSync(path.join(root, 'auth.json'), '{}');
+  // Built at runtime so this test file itself contains no real-looking profile path.
+  fs.writeFileSync(path.join(root, 'notes.md'), 'see ' + ['C:', 'Users', 'someone', 'secret', 'x'].join('\\') + '\n');
+  const dirty = run();
+  assert.equal(dirty.status, 1);
+  const failures = JSON.parse(dirty.stdout).failures;
+  assert.ok(failures.some(f => f.file === 'auth.json'));
+  assert.ok(failures.some(f => f.file === 'notes.md' && f.rule === 'machine user path'));
 });

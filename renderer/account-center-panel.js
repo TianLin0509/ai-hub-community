@@ -1,41 +1,190 @@
 'use strict';
-function createAccountCenterPanel({document,ipcRenderer,escapeHtml:esc,configModal,closeOtherPanels=()=>{}}){
- const page=document.getElementById('account-page'),body=page.querySelector('.ac-content');
- let snapshot={connections:[],history:[]},selected='',filter='all',query='',tab='overview',epoch=0,viewEpoch=0,error='',notice='',loading=false,busy=new Set(),timer,previousFocus;
- const batchUI=require('./account-batch-ui').createAccountBatchUI({page,call,refresh,escapeHtml:esc,notice:(message,failed=false)=>{if(failed)error=message;else notice=message;render();}});
- const labels={signed_in:'已登录',login_required:'需要登录',configured:'已配置',unknown:'未确认',offline:'未在线',unavailable:'工具不可用',opening:'等待验证'};
- const when=t=>t?new Date(t).toLocaleString('zh-CN',{hour12:false}):'尚无检查记录';
- const state=r=>r.stale?'上次'+(labels[r.state]||'未确认'):labels[r.state]||'未确认';
- const btn=(title,action,id,cls='')=>`<button class="ac-btn ${cls}" data-ac="${action}" data-id="${esc(id||'')}" ${busy.has(id)?'disabled':''}>${title}</button>`;
- async function call(action,args){const r=await ipcRenderer.invoke('accounts:'+action,args);if(!r?.ok)throw Error(r?.error||'账号服务未响应');return r.data;}
- function position(){const rail=document.getElementById('scene-rail')?.getBoundingClientRect();if(rail){page.style.left=rail.right+'px';page.style.top=rail.top+'px';}}
- function render(){
-  if(page.hidden)return;position();
-  const all=snapshot.connections,issues=all.filter(r=>r.state==='login_required').length;
-  const count=document.getElementById('accounts-attention');if(count){count.textContent=issues;count.hidden=!issues;}
-  page.querySelectorAll('[data-ac-tab]').forEach(b=>{b.classList.toggle('active',b.dataset.acTab===tab);b.setAttribute('aria-selected',String(b.dataset.acTab===tab));});
-  const editor=document.getElementById('account-editor');editor.hidden=tab!=='config';body.hidden=tab==='config';
-  page.querySelector('.ac-status').textContent=error||notice||(loading?'正在读取账号状态…':'');page.querySelector('.ac-status').classList.toggle('error',!!error);
-  if(tab==='config')return;
-  if(tab==='history'){body.innerHTML=`<h2>最近活动</h2><p class="ac-muted">仅记录账号操作结果，不保存验证码或密钥。</p>${snapshot.history.length?snapshot.history.map(x=>`<div class="ac-log"><time>${esc(when(x.at))}</time><strong>${esc(x.name)}</strong><span>${esc(x.message)}</span></div>`).join(''):'<p class="ac-empty">暂无账号操作记录</p>'}`;return;}
-  if(tab==='bindings'){body.innerHTML=`<h2>功能与账号</h2><p class="ac-muted">同名账号的 CLI、网页和 API 授权分别管理。原生默认账号修改只影响新会话。</p><div class="ac-table"><table><thead><tr><th>功能</th><th>使用的连接</th><th>登录状态</th><th></th></tr></thead><tbody>${all.map(r=>`<tr><td>${esc(r.uses.join(' / '))}</td><td>${esc(r.name)}</td><td>${esc(state(r))}</td><td>${btn('查看','select',r.id)}</td></tr>`).join('')}</tbody></table></div>`;return;}
-  const list=all.filter(r=>(filter==='all'||filter===r.type)&&[r.name,...r.uses].join(' ').toLowerCase().includes(query.toLowerCase()));
-  if(!all.some(r=>r.id===selected))selected=(all.find(r=>r.state==='login_required')||all[0]||{}).id||'';
-  const row=all.find(r=>r.id===selected);
-  body.innerHTML=`<div class="ac-summary"><span><b>${all.length}</b> 份连接</span><span><b>${all.filter(r=>r.state==='signed_in'&&!r.stale).length}</b> 已确认登录</span><span><b>${issues}</b> 需要登录</span><span class="ac-muted">状态以实际检查结果为准</span></div><div class="ac-filters">${[['all','全部'],['native','原生 Agent'],['web','网页账号'],['api','API'],['service','其他服务']].map(([id,name])=>`<button class="ac-btn ${filter===id?'active':''}" data-ac="filter" data-id="${id}">${name}</button>`).join('')}<input id="ac-search" aria-label="搜索账号或用途" placeholder="搜索账号 / 用途" value="${esc(query)}"></div><div class="ac-grid"><div>${list.length?list.map(r=>`<article class="ac-row ${selected===r.id?'selected':''}"><div><button class="ac-name" data-ac="select" data-id="${esc(r.id)}">${esc(r.name)}${r.isDefault?' · 默认':''}</button><p>${esc(r.identity||'身份未确认')}</p><small>${esc(r.uses.join(' · '))}</small></div><div><span class="ac-badge ${esc(r.state)} ${r.stale?'stale':''}">${esc(state(r))}</span><small>${esc(r.pending?'登录窗口已打开':r.observedAt?when(r.observedAt):'尚未检查')}</small></div><div class="ac-row-actions">${r.action==='login'?btn(r.pending?'验证中':'登录','login',r.id,'primary'):btn('配置','config',r.configProvider)}${btn('检查','check',r.id)}</div></article>`).join(''):'<p class="ac-empty">没有匹配的账号连接</p>'}</div><aside class="ac-detail">${row?`<h2>${esc(row.name)}</h2><span class="ac-badge ${esc(row.state)}">${esc(state(row))}</span><dl><dt>账号身份</dt><dd>${esc(row.identity||'身份未确认')}</dd><dt>确认来源</dt><dd>${esc(row.source||'配置发现')}</dd><dt>检查时间</dt><dd>${esc(when(row.observedAt))}</dd><dt>用于</dt><dd>${esc(row.uses.join(' / '))}</dd></dl><p class="ac-note">${esc(row.message||'尚未检查')}</p>${row.toolState?`<p class="ac-muted">${esc(row.toolState)}</p>`:''}<div class="ac-detail-actions">${row.action==='login'?btn(row.pending?'查看登录提示':'登录此账号','login',row.id,'primary'):''}${btn('检查登录','check',row.id)}${row.configProvider?btn('接入与账号配置','config',row.configProvider):''}${row.pending?btn('登录窗口已关闭，解除等待','release',row.id):''}</div><p class="ac-muted">${row.type==='native'?'切换默认账号只影响新会话，运行中的会话保持原身份。':row.type==='api'?'API Key 与网页登录独立。配置存在不代表有效或有余额。':'登录在官方窗口完成，沿用该工具的专用浏览器配置。验证码不经过 Agent。'}${row.stale?' 上次结果已超过 5 分钟，请重新检查。':''}</p>`:'<p>选择一个连接查看详情</p>'}</aside></div>`;
-  batchUI.decorate(snapshot);
- }
- async function refresh(){const ticket=++epoch;loading=true;render();try{const value=await call('snapshot');if(ticket!==epoch||page.hidden)return;snapshot=value;error='';}catch(e){if(ticket===epoch)error=e.message;}finally{if(ticket===epoch){loading=false;render();}}}
- async function operate(action,id){if(busy.has(id))return;busy.add(id);error='';notice='';render();const ticket=viewEpoch;try{const result=await call(action,{id});if(page.hidden||ticket!==viewEpoch)return;notice=result?.message||(action==='release'?'已结束等待，没有退出账号。':'检查完成。');await refresh();}catch(e){if(!page.hidden&&ticket===viewEpoch){error=e.message;render();}}finally{busy.delete(id);render();}}
- async function configure(provider='codex'){const ticket=viewEpoch;try{await configModal.openAccountConfig(provider);if(page.hidden||ticket!==viewEpoch)return;tab='config';render();}catch(e){error=e.message;render();}}
- function close(){if(page.hidden)return;page.hidden=true;batchUI.clear();epoch++;viewEpoch++;clearInterval(timer);document.body.classList.remove('accounts-open');document.getElementById('btn-rail-accounts')?.setAttribute('aria-expanded','false');if(previousFocus?.isConnected)previousFocus.focus();}
- async function open(provider){closeOtherPanels();configModal.close();previousFocus=document.activeElement;page.hidden=false;document.body.classList.add('accounts-open');document.getElementById('btn-rail-accounts')?.setAttribute('aria-expanded','true');tab='overview';error='';notice='';render();await refresh();clearInterval(timer);timer=setInterval(()=>{if(!page.hidden&&tab!=='config'&&busy.size===0&&!page.querySelector('.ac-code-dialog[open]')&&!['ac-batch-phone','ac-search'].includes(document.activeElement?.id))void refresh();},5000);if(provider)await configure(provider);}
- page.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;if(b.dataset.acTab){tab=b.dataset.acTab;render();return;}const action=b.dataset.ac,id=b.dataset.id;if(action==='close')close();else if(action==='refresh')void refresh();else if(action==='select'){selected=id;tab='overview';render();}else if(action==='filter'){filter=id;render();}else if(action==='config')void configure(id);else if(['check','login','release'].includes(action))void operate(action,id);});
- page.addEventListener('input',e=>{if(e.target.id==='ac-search'){const pos=e.target.selectionStart;query=e.target.value;render();const field=page.querySelector('#ac-search');field.focus();field.setSelectionRange(pos,pos);}});
- document.addEventListener('click',e=>{if(e.target.closest('#btn-rail-accounts')){if(page.hidden)void open();else close();}else if(e.target.closest('#scene-rail button')&&!page.hidden)close();if(e.target.closest('#btn-config-accounts'))void open();});
- document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!page.hidden&&!page.querySelector('.ac-code-dialog[open]')){e.preventDefault();close();}});
- document.addEventListener('hub-account-config-saved',()=>{notice='账号接入配置已保存，仅影响新会话。';void refresh();});
- window.addEventListener('resize',position);
- return {open,close,refresh};
+const { companyCards } = require('./account-center-view');
+const { TABS, aiHtml, cliHtml, servicesHtml, toolConnections } = require('./account-workspace-view');
+function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, configModal, closeOtherPanels = () => {} }) {
+  const page = document.getElementById('account-page'), body = page.querySelector('.ac-content');
+  let tab = 'ai';
+  const search = page.querySelector('.ac-search'), tabs = page.querySelector('.ac-tabs');
+  let state = null, signature = '', view = 'list', error = '', notice = '', busy = '', timer, previousFocus, epoch = 0, request = 0;
+  let toolGroups = null;
+  let toolAccounts = null, toolAccountsError = '', toolAccountsFlight = null;
+  const toolChoices = {};
+  function selectTab(id) {
+    if (!TABS.some(t => t.id === id)) return;
+    tab = id; search.value = ''; error = ''; notice = ''; body.scrollTop = 0; render();
+    tabs.querySelector('[aria-selected="true"]')?.focus();
+  }
+  function footerHtml() {
+    return `<footer class="ac-footnote"><span>网页共用 AI Hub 专属 Chrome · 打开网页只记录打开时间</span><details class="ac-connections" data-details="connections"><summary>工具连接</summary>${toolConnections(toolAccounts, esc)}${toolAccountsError ? `<p class="ac-item-error">${esc(toolAccountsError)}</p>` : ''}${toolsHtml()}</details></footer>`;
+  }
+  async function call(action, args) {
+    const r = await ipcRenderer.invoke('hub-accounts:' + action, args);
+    if (!r?.ok) throw Error(r?.error || '账号服务未响应');
+    return r.data;
+  }
+  function renderStatus() {
+    const el = page.querySelector('.ac-status'), text = error || notice;
+    el.textContent = text; el.hidden = !text; el.classList.toggle('error', !!error);
+    for (const b of page.querySelectorAll('[data-ac="open"],[data-ac="login"],[data-ac="add"],[data-ac="preferred"],[data-ac="authorize"],[data-ac="tools"],[data-ac="tools-connect"],[data-ac="external"]')) b.disabled = !!busy || state?.setupProgress?.status === 'running';
+  }
+  function toolsHtml() {
+    const progress = state?.setupProgress;
+    const status = progress ? `<p class="ac-tool-help" role="status">${esc(progress.error || progress.stage)}</p>` : '';
+    if (!toolGroups) return `<button class="ac-btn" data-ac="tools">管理已有工具连接</button>${status}`;
+    const options = (state.identities || []).map(i => ({ id: i.id, label: (i.id === 'main' ? '账号 1' : '账号 2') + ' · ' + (i.account || '身份待确认') }));
+    return `<div class="ac-tool-setup"><p>为工具选择它原来使用的 ChatGPT 账号。接入会等待工具空闲，保留任务、历史和旧登录资料。</p>${toolGroups.map(g => `<label><span>${esc(g.name)}${g.labels?.length ? ' · ' + esc(g.labels.join(' / ')) : ''}<small>${g.lanes} 个工作页面</small></span><select data-tool-choice="${esc(g.id)}"><option value="">请选择对应账号</option>${options.map(o => `<option value="${o.id}" ${toolChoices[g.id] === o.id ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</select></label>`).join('')}<button class="ac-btn" data-ac="tools-connect" ${progress?.status === 'running' ? 'disabled' : ''}>保存并接入</button>${status}</div>`;
+  }
+  function render() {
+    if (page.hidden) return;
+    position();
+    const n = Object.values(state?.activity?.entries || {}).filter(a => ['login_required', 'verification_required'].includes(a.outcome)).length, count = document.getElementById('accounts-attention');
+    if (count) { count.textContent = n; count.hidden = !n; }
+    document.getElementById('account-editor').hidden = view !== 'config'; body.hidden = view === 'config';
+    page.querySelector('[data-ac="back"]').hidden = view !== 'config';
+    tabs.hidden = search.hidden = view === 'config';
+    if (view === 'config') return renderStatus();
+    tabs.innerHTML = TABS.map(t => `<button role="tab" id="ac-tab-${t.id}" aria-selected="${tab === t.id}" aria-controls="ac-list-panel" tabindex="${tab === t.id ? 0 : -1}" data-ac="tab" data-tab="${t.id}">${t.name}</button>`).join('');
+    body.setAttribute('aria-labelledby', 'ac-tab-' + tab);
+    if (!state) { body.innerHTML = '<p class="ac-empty">正在读取账号…</p>'; return renderStatus(); }
+    const expanded = [...body.querySelectorAll('details[open]')].map(d => d.dataset.details);
+    body.innerHTML = tab === 'ai' ? aiHtml(state, search.value, esc) : tab === 'cli' ? cliHtml(state, search.value, esc) : servicesHtml(toolAccounts, tab, search.value, state, esc, toolAccountsError);
+    if (tab === 'ai' && state.tools?.some(tool => tool.tool === 'images' && tool.state === 'changed')) {
+      body.innerHTML = '<p class="ac-connection-notice" role="status">生图工具连接配置已变化，生图记录暂不能归入共享账号。请在下方「工具连接」核对。</p>' + body.innerHTML;
+    }
+    if (tab === 'ai' && !search.value) body.innerHTML += footerHtml();
+    if (state.activity?.warnings?.length) body.innerHTML += `<p class="ac-item-error">${esc(state.activity.warnings.join(' / '))}</p>`;
+    for (const d of body.querySelectorAll('details')) d.open = expanded.includes(d.dataset.details);
+    renderStatus();
+  }
+  function apply(next) {
+    const sig = Math.floor(Date.now() / 60000) + ':' + JSON.stringify(next);
+    if (sig === signature) return renderStatus();
+    const top = body.scrollTop, focus = page.contains(document.activeElement) ? { ...document.activeElement.dataset } : null;
+    state = next; signature = sig; render();
+    if (focus && Object.keys(focus).length) [...page.querySelectorAll('button')].find(b => Object.entries(focus).every(([k, v]) => b.dataset[k] === v))?.focus({ preventScroll: true });
+    body.scrollTop = top;
+  }
+  function renderTools() {
+    const top = body.scrollTop, focus = page.contains(document.activeElement) ? { ...document.activeElement.dataset } : null;
+    render();
+    if (focus && Object.keys(focus).length) [...page.querySelectorAll('button,select')].find(b => Object.entries(focus).every(([k, v]) => b.dataset[k] === v))?.focus({ preventScroll: true });
+    body.scrollTop = top;
+  }
+  function position() {
+    const rail = document.getElementById('scene-rail')?.getBoundingClientRect();
+    if (rail) { page.style.left = rail.right + 'px'; page.style.top = rail.top + 'px'; }
+  }
+  function schedule() {
+    clearTimeout(timer);
+    if (!page.hidden && view === 'list') timer = setTimeout(() => void refresh(), state?.setupProgress?.status === 'running' ? 800 : 5000);
+  }
+  async function refresh() {
+    const ticket = epoch, seq = ++request;
+    try { const next = await call('state'); if (ticket === epoch && seq === request && !page.hidden) {
+      const newlyConnected = next.setupProgress?.status === 'complete' && state?.setupProgress?.status !== 'complete';
+      apply(next); if (newlyConnected) void refreshToolAccounts();
+    } }
+    catch (e) { if (ticket === epoch && !page.hidden) { error = e.message; renderStatus(); } }
+    finally { schedule(); }
+  }
+  async function refreshToolAccounts(force = false) {
+    if (toolAccountsFlight) return toolAccountsFlight;
+    const ticket = epoch;
+    toolAccountsError = '';
+    toolAccountsFlight = call('tool-accounts', { refresh: force }).then(data => {
+      if (ticket === epoch && !page.hidden) { toolAccounts = data; renderTools(); }
+    }).catch(e => { if (ticket === epoch && !page.hidden) { toolAccountsError = e.message; renderTools(); } })
+      .finally(() => { toolAccountsFlight = null; if (ticket !== epoch && !page.hidden) void refreshToolAccounts(); });
+    return toolAccountsFlight;
+  }
+  async function action(name, args) {
+    if (busy) return;
+    busy = name; error = ''; notice = ''; renderStatus();
+    if (['external', 'open', 'login'].includes(name)) { notice = '正在打开官方入口…'; renderStatus(); }
+    const ticket = epoch; ++request;
+    try {
+      const result = await call(name, args);
+      if (ticket !== epoch) return;
+      if (name === 'tools') { toolGroups = result.groups; if (!toolGroups.length) notice = '未发现需要接入的生图或中转工具'; render(); }
+      else if (name === 'tools-connect') { state.setupProgress = result; render(); }
+      else if (name === 'external') { notice = result.message; await refresh(); await refreshToolAccounts(); }
+      else if (name === 'open' || name === 'login') { notice = result.message; await refresh(); }
+      else apply(result);
+    } catch (e) { if (ticket === epoch) error = e.message; }
+    finally { busy = ''; if (ticket === epoch) renderStatus(); schedule(); }
+  }
+  async function authorize(id) {
+    if (busy) return;
+    busy = 'authorize'; error = ''; notice = ''; renderStatus();
+    const ticket = epoch;
+    try {
+      const nativeId = id.startsWith('codex:') ? id.replace('codex:', 'codex-') : ({ gemini: 'gemini-cli' }[id] || id);
+      const r = await ipcRenderer.invoke('accounts:login', { id: nativeId });
+      if (!r?.ok) throw Error(r?.error || '授权入口未打开');
+      if (ticket === epoch) notice = r.data?.message || '已打开官方授权入口';
+    } catch (e) { if (ticket === epoch) error = e.message; }
+    finally { busy = ''; if (ticket === epoch) renderStatus(); }
+  }
+  async function configure(provider = 'codex') {
+    try { await configModal.openAccountConfig(provider); if (!page.hidden) { view = 'config'; clearTimeout(timer); render(); } }
+    catch (e) { error = e.message; renderStatus(); }
+  }
+  function close() {
+    if (page.hidden) return;
+    page.hidden = true; epoch++; clearTimeout(timer);
+    document.body.classList.remove('accounts-open');
+    document.getElementById('btn-rail-accounts')?.setAttribute('aria-expanded', 'false');
+    if (previousFocus?.isConnected) previousFocus.focus();
+  }
+  async function open(provider) {
+    closeOtherPanels(); configModal.close();
+    epoch++; clearTimeout(timer); previousFocus = document.activeElement;
+    page.hidden = false; document.body.classList.add('accounts-open');
+    document.getElementById('btn-rail-accounts')?.setAttribute('aria-expanded', 'true');
+    view = 'list'; error = ''; notice = ''; render(); await refresh();
+    void refreshToolAccounts();
+    if (provider && !page.hidden) await configure(provider);
+  }
+  page.addEventListener('click', e => {
+    const currentMenu = e.target.closest('.ac-more');
+    for (const menu of page.querySelectorAll('.ac-more[open]')) if (menu !== currentMenu) menu.open = false;
+    const b = e.target.closest('button'); if (!b || b.disabled) return;
+    if (currentMenu) currentMenu.open = false;
+    const a = b.dataset.ac, args = { site: b.dataset.site, identity: b.dataset.identity };
+    if (a === 'close') close();
+    else if (a === 'back') { view = 'list'; render(); void refresh(); }
+    else if (a === 'tab') selectTab(b.dataset.tab);
+    else if (a === 'open') void action('open', args);
+    else if (a === 'login') void action('login', args);
+    else if (a === 'add' || a === 'preferred') void action('preference', { ...args, add: a === 'add' });
+    else if (a === 'authorize') void authorize(b.dataset.id);
+    else if (a === 'config') void configure(b.dataset.id);
+    else if (a === 'tools') void action('tools');
+    else if (a === 'external') void action('external', { service: b.dataset.service, action: b.dataset.operation });
+    else if (a === 'tool-accounts-refresh') void refreshToolAccounts(true);
+    else if (a === 'tools-connect') {
+      const choices = Object.fromEntries(Object.entries(toolChoices).filter(([, value]) => value));
+      if (!Object.keys(choices).length) { error = '请先选择工具对应的 ChatGPT 账号'; renderStatus(); }
+      else void action('tools-connect', { choices });
+    }
+  });
+  search.addEventListener('input', renderTools);
+  tabs.addEventListener('keydown', e => { const i = TABS.findIndex(t => t.id === tab); const next = ({ArrowRight: (i+1)%TABS.length, ArrowLeft: (i+TABS.length-1)%TABS.length, Home: 0, End: TABS.length-1})[e.key]; if (next !== undefined) { e.preventDefault(); selectTab(TABS[next].id); } });
+  page.addEventListener('change', e => { if (e.target.dataset.toolChoice) toolChoices[e.target.dataset.toolChoice] = e.target.value; });
+  document.addEventListener('click', e => {
+    if (e.target.closest('#btn-rail-accounts')) { if (page.hidden) void open(); else close(); }
+    else if (e.target.closest('#scene-rail button') && !page.hidden) close();
+    if (e.target.closest('#btn-config-accounts')) void open();
+  });
+  document.addEventListener('keydown', e => {
+    if (page.hidden || view !== 'list' || e.isComposing || e.repeat) return;
+    if (e.key === 'Escape' && !page.querySelector('dialog[open]')) { e.preventDefault(); const expanded = page.querySelector('details[open]'); if (expanded) expanded.open = false; else close(); return; }
+    if (tab !== 'ai' || !e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || busy || e.target.closest('input,textarea,select,[contenteditable="true"]')) return;
+    const n = Number(e.key), card = state && companyCards(state)[n - 1];
+    if (card && n >= 1 && n <= 7) { e.preventDefault(); void action('open', { site: card.site }); }
+  });
+  document.addEventListener('hub-account-config-saved', () => { notice = '接入配置已保存。'; void refresh(); });
+  window.addEventListener('resize', position);
+  return { open, close, refresh };
 }
-module.exports={createAccountCenterPanel};
+module.exports = { createAccountCenterPanel };

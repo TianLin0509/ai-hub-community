@@ -170,7 +170,7 @@ function registerGroupChatForkIpc(ipcMain, deps) {
     const sessions = typeof sessionManager.getAllSessions === 'function' ? sessionManager.getAllSessions() : [];
     return sessions
       .filter(session => session && !already.has(session.id))
-      .filter(session => session.purpose !== 'chuxin-research' && !session.hiddenFromSidebar)
+      .filter(session => session.purpose !== 'xresearch-research' && !session.hiddenFromSidebar)
       .filter(session => forkabilityOf(session).ok)
       .map(session => {
         const owner = session.meetingId && typeof meetingManager.getMeeting === 'function'

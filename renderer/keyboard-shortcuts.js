@@ -1,6 +1,7 @@
 const { supportsForkSession } = require('../core/session-capabilities.js');
 const { compareSidebarPlacement } = require('./session-list-renderer.js');
 const { isBlockingModalOpen, isElementOpen } = require('./modal-layer-guard.js');
+const { isCodexOwnedTranscript, navigateCodexTranscript } = require('./terminal-input-controller');
 
 function createKeyboardShortcuts({
   document,
@@ -28,7 +29,7 @@ function createKeyboardShortcuts({
     : sessionId => ipcRenderer.invoke('close-session', sessionId);
   function getSortedVisibleSessionIds() {
     return Array.from(sessions.values())
-      .filter((session) => session && !session.hiddenFromSidebar && session.purpose !== 'chuxin-research')
+      .filter((session) => session && !session.hiddenFromSidebar && session.purpose !== 'xresearch-research')
       .sort(compareSidebarPlacement)
       .map(s => s.id);
   }
@@ -216,15 +217,25 @@ function createKeyboardShortcuts({
     }
 
     if (!e.shiftKey && !e.altKey && e.key === 'End') {
-      e.preventDefault();
       const c = terminalCache.get(getActiveSessionId());
+      if (isCodexOwnedTranscript(sessions.get(getActiveSessionId()), c?.terminal)) {
+        if (!e.defaultPrevented) navigateCodexTranscript(sessions.get(getActiveSessionId()), c.terminal, 'bottom');
+        e.preventDefault();
+        return;
+      }
+      e.preventDefault();
       if (c) c.terminal.scrollToBottom();
       return;
     }
 
     if (!e.shiftKey && !e.altKey && e.key === 'Home') {
-      e.preventDefault();
       const c = terminalCache.get(getActiveSessionId());
+      if (isCodexOwnedTranscript(sessions.get(getActiveSessionId()), c?.terminal)) {
+        if (!e.defaultPrevented) navigateCodexTranscript(sessions.get(getActiveSessionId()), c.terminal, 'top');
+        e.preventDefault();
+        return;
+      }
+      e.preventDefault();
       if (c) c.terminal.scrollToTop();
       return;
     }

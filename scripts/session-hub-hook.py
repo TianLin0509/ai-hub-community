@@ -54,6 +54,7 @@ last_assistant_message = None
 notification_type = None
 notification_message = None
 notification_title = None
+payload = {}
 try:
     # Read raw bytes and decode as UTF-8 explicitly. On Chinese Windows
     # sys.stdin defaults to cp936, which mangles UTF-8 Chinese characters
@@ -103,6 +104,31 @@ try:
             body['prompt'] = prompt
         if hook_event_name:
             body['hookEventName'] = str(hook_event_name)[:80]
+        # SessionStart 的来源（startup / resume / clear / compact / fork）决定
+        # Hub 是否允许把会话改绑到新线程。
+        if event == 'session-start' and payload.get('source'):
+            body['source'] = str(payload.get('source'))[:40]
+        # SessionEnd 的原因（clear / prompt_input_exit / logout …）：只有已绑定的会话
+        # 自己宣布结束之后，Hub 才接受随后的新身份（见 core/claude-identity-switch.js）。
+        if event == 'session-end' and payload.get('reason'):
+            body['reason'] = str(payload.get('reason'))[:40]
+        if event in ('session-start', 'session-end') and agent_id:
+            body['agentId'] = str(agent_id)[:180]
+        # /clear、/compact 的确认归属（core/claude-local-command-acks.js）：prompt_id 标识执行周期，
+        # PreCompact 的 trigger（manual / auto）与 custom_instructions（/compact 的参数）决定确认哪条提交。
+        if event in ('session-start', 'session-end', 'pre-compact') and payload.get('prompt_id'):
+            body['promptId'] = str(payload.get('prompt_id'))[:120]
+        if event == 'pre-compact':
+            if payload.get('trigger'):
+                body['trigger'] = str(payload.get('trigger'))[:20]
+            if isinstance(payload.get('custom_instructions'), str):
+                body['customInstructions'] = payload.get('custom_instructions')[:2000]
+        if event == 'instructions-loaded':
+            body['instructionPath'] = str(payload.get('file_path') or '')[:8192]
+            body['loadReason'] = str(payload.get('load_reason') or '')[:80]
+            body['memoryType'] = str(payload.get('memory_type') or '')[:80]
+            if agent_id:
+                body['agentId'] = str(agent_id)[:180]
         if isinstance(background_tasks, list):
             body['backgroundTasks'] = [
                 {

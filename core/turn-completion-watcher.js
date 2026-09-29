@@ -115,7 +115,7 @@ function createTurnCompletionWatcher(opts) {
         }
         if (!PATCHABLE_SIGNAL_SOURCES.has(evt.signalSource)) return;
         if (!evt.text || evt.text === settledText) return;
-        // 2026-07-20 道雪 [修#1]：手动提取可能抓到上一轮旧答案（提取方曾无时间窗），
+        // 2026-07-20 maintainer [修#1]：手动提取可能抓到上一轮旧答案（提取方曾无时间窗），
         //   其 settled 文本可信度低——final 无论长短都允许覆盖纠正；completed 仍要求
         //   "更长"，防短 emit 把真答案截断。此前一刀切"更长才 patch"，真实答案更短时
         //   误抓的旧答案会永久留在卡片与 state.turns。
@@ -331,7 +331,7 @@ function createTurnCompletionWatcher(opts) {
     },
 
     /**
-     * 抢占式结算（2026-06-24 道雪）：用户在本轮还没答完时就发了下一轮 —— 立即把
+     * 抢占式结算（2026-06-24 maintainer）：用户在本轮还没答完时就发了下一轮 —— 立即把
      *   这家「未完成的旧轮」结算掉，让 dispatcher 的 Promise.allSettled 立刻 resolve、
      *   串行队列放行新轮，不再因卡死的 AI 无限期挂起。
      *   状态 'superseded'（被新问题覆盖），空文本 —— 下游 prompt 构建器按 content
@@ -355,7 +355,7 @@ function createTurnCompletionWatcher(opts) {
     },
 
     /**
-     * 用户中断（2026-07-29 道雪 · 群聊运行中可操作）：用户点「停止本轮」时立即结算。
+     * 用户中断（2026-07-29 maintainer · 群聊运行中可操作）：用户点「停止本轮」时立即结算。
      *   与 supersede() 的差别：supersede 是"被下一问覆盖"（丢弃半截），interrupt 是
      *   "用户主动叫停"——已经生成的半截文本有价值，调用方会把 PTY 里已流出的内容
      *   传进来一并落盘。

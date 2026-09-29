@@ -151,7 +151,7 @@
   color: var(--mark-red-strong);
   font-weight: 600;
 }
-/* 2026-05-05 道雪 P0 2B：stuck 时流光从 slot 配色统一改琥珀色，视觉一眼分辨"这家不正常" */
+/* 2026-05-05 maintainer P0 2B：stuck 时流光从 slot 配色统一改琥珀色，视觉一眼分辨"这家不正常" */
 .mr-ft.send-stuck .mr-ft-progress-bar,
 .mr-ft.send-stuck .mr-gc-think-bar {
   background: linear-gradient(90deg, #f59e0b 0%, rgba(245,158,11,0.3) 50%, transparent 100%) !important;
@@ -241,7 +241,7 @@
   flex: 1 1 auto;
   min-height: 0;
   height: 100%;
-  /* 2026-06-21 道雪：基础 display:grid 此前丢失（疑历史重构），导致并列模式 N 张 AI 卡
+  /* 2026-06-21 maintainer：基础 display:grid 此前丢失（疑历史重构），导致并列模式 N 张 AI 卡
      竖叠、被 .mr-gc-panel overflow:hidden 裁到只剩第 1 张可见（tab 模式因只显 1 张而掩盖）。
      card-modes.css 下方 tab 规则给本元素设 grid-template-columns 已证本意为 grid。恢复
      grid + 自动列，让并列模式 N 张卡横向等宽并排（真机 harness 已验证 strip.png）。 */

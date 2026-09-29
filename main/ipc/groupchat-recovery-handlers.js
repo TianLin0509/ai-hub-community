@@ -28,7 +28,7 @@ function registerGroupchatRecoveryIpc(ipcMain, deps) {
     const nativeCodex = sessionManager.getNativeCodex?.(sid);
     const isNativeCodex = !!nativeCodex || session?.runtimeBackend === 'codex-app-server';
 
-    // 2026-07-12 道雪：轮次窗口改由 orchestrator 状态推导，不再信 renderer 的
+    // 2026-07-12 maintainer：轮次窗口改由 orchestrator 状态推导，不再信 renderer 的
     //   _gcTurnStartTs（那是"当前轮"的开始时间，对旧轮重提取完全错位；Hub 重启后是 0）。
     //   u{n}.createdAt 做下界、u{n+1}（该轮之后首条用户消息）做上界。
     const requestedTurn = Number.isFinite(Number(turnNum)) ? Number(turnNum) : null;

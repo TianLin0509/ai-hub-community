@@ -8,7 +8,7 @@
 //   [Pasted text +N lines]，没人再按一次回车，也没有任何 UI 提示，用户干等。
 //
 // 项目里其他调用方早就不走裸 'terminal-input' 了（study-handlers.js 那条注释写得很清楚），
-//   agent-league / chatgpt-bridge / chuxin / 群聊派发全部走 group-chat-watcher.sendToPty。
+//   agent-league / relay-tool / xresearch / 群聊派发全部走 group-chat-watcher.sendToPty。
 //   这里把最后一条裸路径也接进去，普通会话与群聊从此共用同一套：
 //     分块投喂 → 体积自适应 settle（等折叠标记出现就提前收工）→ 单发 \r
 //     → 等 Claude UserPromptSubmit / Codex task_started 语义确认 → 缺确认才补一次回车
@@ -49,6 +49,8 @@ function supportsMessageReceipt(kind, text) {
   return (isClaudeFamily(kind) || isCodexCliKind(kind) || require('../../core/acp-profiles').isAcpKind(kind)) && !String(text).trimStart().startsWith('/');
 }
 
+const LATE_LOCAL_ACK_MAX_MS = 10 * 60 * 1000;
+
 function registerPromptSubmitIpc(ipcMain, deps) {
   const {
     sessionManager,
@@ -61,8 +63,11 @@ function registerPromptSubmitIpc(ipcMain, deps) {
   for (const operation of ['read', 'save']) {
     ipcMain.handle('native-draft:' + operation, (_event, request = {}) => {
       const session = sessionManager.getSession(request.sessionId);
-      if (!['claude-stream-json', 'codex-app-server', 'acp'].includes(session?.runtimeBackend)) {
-        return { ok: false, error: '当前会话不是原生会话' };
+      // 草稿按 Hub 会话 id 持久化：原生会话与 PTY 的 Claude/Codex 会话共用同一份，
+      // 原生时代存下的草稿在改走 PTY 后照样读得回来。
+      if (!['claude-stream-json', 'codex-app-server', 'acp'].includes(session?.runtimeBackend)
+          && !require('../../core/agent-runtime-mode').isPtyAgentSession(session)) {
+        return { ok: false, error: '当前会话不支持草稿持久化' };
       }
       try {
         nativeDraftStore ||= new (require('../../core/native-draft-store').NativeDraftStore)();
@@ -125,13 +130,16 @@ function registerPromptSubmitIpc(ipcMain, deps) {
     });
   }
 
-  for (const action of ['reconnect', 'inspect-recovery', 'reconcile']) {
+  for (const action of ['reconnect', 'inspect-recovery', 'reconcile', 'reconcile-history']) {
     ipcMain.handle('claude-native:' + action, async (_event, request = {}) => {
       const native = sessionManager.getNativeClaude?.(request.sessionId);
       if (!native) return { ok: false, error: 'Claude 原生连接不存在' };
       try {
         if (action === 'reconnect') await native.reconnect();
         if (action === 'reconcile') await native.reconcile(request.identity || {});
+        // 输入框上那个「核对上次任务」按钮：和连上后的自动核对同一条路，
+        // 只读原生历史、只登记不重发。群聊席位的人工关卡就靠这一条解开。
+        if (action === 'reconcile-history') await native.reconcileFromHistory({ source: 'user' });
         return { ok: true, runtime: native.runtime, records: native.recoveryRecords() };
       } catch (error) { return { ok: false, error: error.message }; }
     });
@@ -173,7 +181,7 @@ function registerPromptSubmitIpc(ipcMain, deps) {
   }
 
   // 梦境索引只随用户亲手输入的消息附带（renderer 显式传 memoryIndex:true）；
-  //   群聊派发、会议、初心、定时任务等自动 prompt 一律原样发送。
+  //   群聊派发、会议、扩展投研、定时任务等自动 prompt 一律原样发送。
   function sendWithMemory(request, sessionId, text, kind, options) {
     const memory = sessionManager.memoryService;
     const send = body => groupChatWatcher.sendToPty(sessionId, body, kind, options);
@@ -200,7 +208,14 @@ function registerPromptSubmitIpc(ipcMain, deps) {
           return await sendWithMemory(request, sessionId, text, kind, {
             clientSubmissionId: request.clientSubmissionId, attachments: request.attachments,
           });
-        } catch (error) { return { ok: false, error: error.code || 'native-send-failed', message: error.message }; }
+        } catch (error) {
+          // A write that reached the engine but lost its confirmation is not a
+          // failed send: it may be running, and Main publishes the late receipt.
+          const record = request.clientSubmissionId ? native.records?.get(request.clientSubmissionId) : null;
+          const unconfirmed = record?.writeStarted === true && !['rejected', 'content-mismatch'].includes(record.status);
+          return { ok: false, error: error.code || 'native-send-failed', message: error.message,
+            ...(unconfirmed ? { unconfirmed: true } : {}) };
+        }
       });
     }
 
@@ -224,22 +239,36 @@ function registerPromptSubmitIpc(ipcMain, deps) {
       catch (error) { return { ok:false, notSent:true, error:error.code || 'native-recovery-failed', message:error.message }; }
       const receipt = clientSubmissionId && supportsMessageReceipt(kind, text)
         ? receipts.begin(sessionId, clientSubmissionId, text, Date.now(), {nativeOnly:!!(sessionManager.getNativeSession?.(sessionId) || sessionManager.getNativeCodex?.(sessionId))}) : null;
+      // PTY Claude 的 /clear、/compact：以各自的确认事件收尾，而不是等一个永远不会来的开工信号。
+      const identitySwitch = require('../../core/claude-identity-switch');
+      const localCommand = /^claude/.test(String(kind)) ? identitySwitch.claudeLocalCommand(text) : null;
+      const clearObserver = localCommand
+        && require('../../core/agent-runtime-mode').isPtyAgentSession(sessionManager.getSession(sessionId))
+        ? identitySwitch.observeClaudeLocalCommand(sessionManager, sessionId, localCommand,
+          require('../../core/claude-local-command-acks').parseLocalCommand(text).args) : null;
+      let awaitLateLocalAck = false;
       try {
         // requireReady:false —— 输入框就摆在用户面前，CLI 已经在跑；
         //   再走一次 60s 冷启动 ready 轮询会把「打完字立刻发」变成有时干等几十秒。
         const result = await sendWithMemory(request, sessionId, text, kind, {
           requireReady: false, submissionReceipt: receipt,
           clientSubmissionId, attachments:request.attachments,
+          ...(clearObserver ? { localCommandObserver: clearObserver } : {}),
         });
         if (receipt) receipts.finish(receipt, result || { ok: false });
         if (!result || result === false) {
           return { ok: false, error: 'send-failed', kind };
         }
         const sendStatus = (result && result.sendStatus) || 'ok';
+        // /clear、/compact 的确认在期限内没来：回车已经写进去了，结果是「未知」而不是「失败」。
+        // 观察者不销毁，转入迟到确认：/compact 期间提交的 /clear 要等压缩结束才执行。
+        const localAckPending = !!clearObserver && result.acknowledgementSource === 'local-command' && result.ok === false;
+        awaitLateLocalAck = localAckPending && !!clientSubmissionId;
         if (sendStatus === 'stuck') {
           logger.warn(`[prompt-submit] ${kind}(${sessionId.slice(0, 8)}) prompt not acknowledged; renderer will offer manual resend`);
         }
         return {
+          ...(localAckPending ? { unconfirmed: true } : {}),
           ok: result.ok !== false && sendStatus !== 'content-mismatch',
           kind,
           sendStatus,
@@ -249,6 +278,10 @@ function registerPromptSubmitIpc(ipcMain, deps) {
           ...(typeof result.commandOutput === 'string' ? { commandOutput: result.commandOutput } : {}),
           ...(result.message ? {message:result.message} : {}),
           ...(result.error ? {error:result.error} : {}),
+          // 明确没执行（例如 Codex 收尾中拒绝斜杠命令）：渲染层据此退回原文、不亮「补发」。
+          ...(result.notSent ? {notSent:true} : {}),
+          // 千问 / GLM 超时报 {ok:false,unconfirmed:true}：结果未知，不能被渲染层当成失败。
+          ...(result.unconfirmed ? {unconfirmed:true} : {}),
           ...(result.threadId ? {threadId:result.threadId,turnId:result.turnId} : {}),
           ...(receipt ? { receipt: receipts.snapshot(receipt) } : {}),
         };
@@ -256,9 +289,31 @@ function registerPromptSubmitIpc(ipcMain, deps) {
         if (receipt) receipts.finish(receipt, { ok: false });
         logger.warn('[prompt-submit] send threw:', error && error.message);
         return { ok: false, error: 'send-threw', message: error && error.message, kind, ...(error?.notSent ? {notSent:true} : {}) };
+      } finally {
+        if (awaitLateLocalAck) armLateLocalCommandAck(clearObserver, sessionId, clientSubmissionId, localCommand);
+        else clearObserver?.dispose();
       }
     });
   };
+
+  // 迟到确认只收敛这一条提交：renderer 按 clientSubmissionId 匹配回执，之后另一条真正
+  // 失败的提交不受影响。从不自动重发。最长等 10 分钟。
+  function armLateLocalCommandAck(observer, sessionId, clientSubmissionId, command) {
+    const expire = setTimeout(() => observer.dispose(), LATE_LOCAL_ACK_MAX_MS);
+    expire.unref?.();
+    observer.onConfirm(() => setTimeout(() => {
+      clearTimeout(expire);
+      observer.dispose();
+      logger.log?.(`[prompt-submit] late /${command} confirmation for ${sessionId.slice(0, 8)}; clearing its resend prompt`);
+      try { sendToRenderer('session:prompt-receipt', { sessionId, clientSubmissionId, status: 'confirmed', source: 'late-local-command-ack' }); }
+      catch (error) { logger.warn('[prompt-submit] late receipt broadcast failed:', error && error.message); }
+      try {
+        const store = deps.commandTranscriptStore || require('../../core/command-transcript-store').commandTranscriptStore();
+        store.finish(sessionId, clientSubmissionId, { ok: true, sendStatus: 'ok', mode: 'closed-loop', acknowledgementSource: 'late-local-command' });
+        sendToRenderer('session:command-updated', { sessionId });
+      } catch (error) { logger.warn('[prompt-submit] late command history update failed:', error && error.message); }
+    }, 0));
+  }
 
   ipcMain.handle('session:send-prompt', async (event, request = {}) => {
     const session = sessionManager.getSession(request.sessionId);

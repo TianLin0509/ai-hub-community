@@ -1,4 +1,4 @@
-/* 串行工作流（2026-06-17 道雪）：群聊输入框旁「串行工作流」按钮 + 配置弹窗。
+/* 串行工作流（2026-06-17 maintainer）：群聊输入框旁「串行工作流」按钮 + 配置弹窗。
    复用 meeting-create-modal.css 的 mcm-* 骨架（overlay/dialog/header/body/footer/primary）；
    本文件只定义工作流专属元素 wf-* + 触发按钮 .mr-workflow-btn。色板全部跟随全局 theme variables。 */
 

@@ -17,8 +17,8 @@ const TRANSIENT_RENAME_CODES = new Set(['EACCES', 'EBUSY', 'EPERM']);
 const RENAME_SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
 const DEFAULT_RECOMMENDED_CATEGORIES = [
   { id: 'ai', directory: 'AI', label: 'AI', description: 'Agent / 应用开发' },
-  { id: 'projects', directory: 'Projects', label: '项目', description: '日常项目与团队协作' },
-  { id: 'documents', directory: 'Documents', label: '文档', description: '写作与资料整理' },
+  { id: 'wireless', directory: 'Wireless', label: 'Wireless', description: '无线通信研究' },
+  { id: 'research', directory: 'Stock', label: '投研', description: '股票与策略研究' },
 ];
 
 // ── 平铺工作根（2026-08-31 用户决策）────────────────────────────────────────────
@@ -32,12 +32,12 @@ const DEFAULT_RECOMMENDED_CATEGORIES = [
 // 平铺后这些全变成同一个 cwd 下的相对路径。
 //
 // 所以默认改成「所有新会话直接开在工作根」。但**不是无条件拆掉根守卫**——
-// classifyWorkspace() 里那条「聚合根不能当 workspace」是为 C:\Vibe 写的，那里
+// classifyWorkspace() 里那条「聚合根不能当 workspace」是为 C:\Workspace 写的，那里
 // 确实不该干活（用户根规则第一条就禁止）。用一个显式标记区分两种根：
 //   <root>\.aiwork-root 存在 → 这是专门的工作根，允许直接在上面开会话
 //   标记不存在             → 沿用旧行为，根仍然硬拦，默认落 _scratch
 // 标记是文件而不是配置项，因为它跟着目录走：把 AI_HUB_WORKSPACE_ROOT 指回
-// C:\Vibe 时守卫自动恢复，不需要记得改任何开关。
+// C:\Workspace 时守卫自动恢复，不需要记得改任何开关。
 const WORK_ROOT_MARKER = '.aiwork-root';
 
 function normalizeKey(value) {
@@ -275,18 +275,18 @@ class WorkspaceService {
 
   // workspace 分层（2026-07-29 第五轮，用户决策 2）。
   //
-  // 上一轮有人主张「禁止把 C:\Vibe\AI 这类分类根当 workspace」。不采纳：跨项目的审查、
+  // 上一轮有人主张「禁止把 C:\Workspace\AI 这类分类根当 workspace」。不采纳：跨项目的审查、
   // 对比、领域规划本来就不属于任何单个项目，分类根正是它们该待的地方——这轮三方审查
-  // 报告就写在 C:\Vibe\AI\artifacts\，完全合理。硬门禁会把正当用途一起堵死。
+  // 报告就写在 C:\Workspace\AI\artifacts\，完全合理。硬门禁会把正当用途一起堵死。
   //
-  // 真正该拦的只有**聚合根本身**（C:\Vibe）：在那里搜索会扫穿所有领域，产物会落在组织根，
+  // 真正该拦的只有**聚合根本身**（C:\Workspace）：在那里搜索会扫穿所有领域，产物会落在组织根，
   // 根规则第一条就明写禁止。分类根的实际代价只有「搜索范围大」，那是 AI 的行为约束
   // （根规则「禁止全盘搜索」已覆盖），不是路径本身的问题。
   //
   // 所以给出层级、让 UI 说清楚用户选的是什么，而不是没收选项：
-  //   root     C:\Vibe 本身          —— 唯一硬拦
-  //   category C:\Vibe\<领域>        —— 允许，UI 标注「领域工作区」
-  //   scratch  C:\Vibe\_scratch\*    —— 允许，走归档提示
+  //   root     C:\Workspace 本身          —— 唯一硬拦
+  //   category C:\Workspace\<领域>        —— 允许，UI 标注「领域工作区」
+  //   scratch  C:\Workspace\_scratch\*    —— 允许，走归档提示
   //   project  其余                  —— 常规项目
   //   external 工作区之外            —— 允许（Hub 自己的仓库就在外面）
   classifyWorkspace(cwd) {
@@ -495,10 +495,10 @@ class WorkspaceService {
   // ── seed 副本与 Codex root 标记必须成对出现（2026-07-29 第五轮，用户决策 1）────────
   // Kimi 无 .git 时只读 cwd 自己那份，所以必须 seed；而 Codex 从 project root 向下逐层
   // 收集，会把沿途每一份 seed 副本都读进去——副本内容又恰好等于根规则全文，于是同一份
-  // 规则被注入 N 遍（实测 C:\Vibe\AI 4426B 里 62% 是重复；再深一层 AI\proj 变成 4 份）。
+  // 规则被注入 N 遍（实测 C:\Workspace\AI 4426B 里 62% 是重复；再深一层 AI\proj 变成 4 份）。
   //
-  // 试过但不够的方案：只在工作区根/分类根放 `.vibe-root`。它把 root 从 C:\Vibe 收到
-  // C:\Vibe\AI，解决了浅层，但 AI\proj 这类更深的 seed 目录仍然读到 AI + proj 两份
+  // 试过但不够的方案：只在工作区根/分类根放 `.vibe-root`。它把 root 从 C:\Workspace 收到
+  // C:\Workspace\AI，解决了浅层，但 AI\proj 这类更深的 seed 目录仍然读到 AI + proj 两份
   // （Codex 2 实测证伪，沙盘复现一致）。
   //
   // 成立的方案：**seed 到哪，`.vibe-root` 就放到哪**。Codex root 收缩到该目录本身 →
@@ -624,8 +624,8 @@ class WorkspaceService {
         }
         // 正文与源不一致，且没有 seed 标记可用来区分「源变了」和「用户接管了」。
         //
-        // 原先在这里保守跳过——实测直接卡死：2026-07-29 往 C:\Vibe\AGENTS.md 加了「工具自身
-        // 豁免迁移」一节后，C:\Vibe\AI\AGENTS.md 这份存量副本再也刷不动，Codex / Kimi 读到的
+        // 原先在这里保守跳过——实测直接卡死：2026-07-29 往 C:\Workspace\AGENTS.md 加了「工具自身
+        // 豁免迁移」一节后，C:\Workspace\AI\AGENTS.md 这份存量副本再也刷不动，Codex / Kimi 读到的
         // 规则与 Claude 读到的永久不一致。「不覆盖」又一次被做成了「不处理」——正是本轮
         // 三方共同定下的规约要禁的那个反模式（memory-link:59 / seed / ensureHooksDeployed
         // 已经是同一个错误的第四次出现）。
@@ -674,7 +674,7 @@ class WorkspaceService {
   // 有 git 根的目录不插手：根上有没有 AGENTS.md 是项目自己的事（可用 /init 生成）。
   seedUngovernedAgentsFile(cwd) {
     const resolved = this.path.resolve(String(cwd || ''));
-    // 只补工作区内的目录——工作区外的 cwd 不该被塞进 C:\Vibe 的规则。
+    // 只补工作区内的目录——工作区外的 cwd 不该被塞进 C:\Workspace 的规则。
     if (!isPathInside(this.getWorkspaceRoot(), resolved)) return false;
     // Hub 创建的 scratch 会先 seed、再 git init。存量 scratch 因而天然已有 .git；
     // 如果先走下面的 git 守卫，旧副本就永远不会补 hash / .vibe-root，也不会随源刷新。
@@ -712,9 +712,10 @@ class WorkspaceService {
     const name = `inbox-${timestampSlug(new Date(this.now()))}-${this.randomId()}`;
     const cwd = this.path.join(this.getScratchRoot(), name);
     this.fs.mkdirSync(cwd, { recursive: false });
-    this.seedScratchAgentsFile(cwd);
     let gitInitialized = false;
-    try { gitInitialized = !!this.initGit(cwd); } catch (err) {
+    // Temporary conversations are not projects. Shared rules are resolved at
+    // submission; no per-session rule copy or artificial Git root is needed.
+    try { if (meta.initGit === true) gitInitialized = !!this.initGit(cwd); } catch (err) {
       this.logger.warn('[workspace] scratch git init failed:', err && err.message);
     }
     return this.touchWorkspace(cwd, {

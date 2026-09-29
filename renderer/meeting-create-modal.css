@@ -53,7 +53,7 @@
   overflow-y: auto;
 }
 
-/* 2026-05-05 道雪：房名输入框，置于 slots 之上。label 紧凑，input 占满剩余宽度。 */
+/* 2026-05-05 maintainer：房名输入框，置于 slots 之上。label 紧凑，input 占满剩余宽度。 */
 .mcm-name-row {
   display: flex;
   align-items: center;

@@ -4,7 +4,7 @@
 
 ## 交给公司 Agent 的开工任务
 
-> 以 https://github.com/TianLin0509/ai-hub-community 的 v0.1.0-preview.2 为可复现基线，先读 AGENTS.md、docs/ARCHITECTURE.md、docs/CUSTOMIZE.md。为我们建立独立工作分支或新库，保留 MIT LICENSE 和上游来源。先完成安装和现有 GUI/协议回归，然后调查我们内部 agent 的真实接口、认证方式和部署平台，给出适配映射。沿下文顺序实现公司专用工作台；不得捏造内部 API，不得带入个人账号、聊天或网关，不得把未知提交当作成功。每一步交付源码、验证命令、截图和明确边界。
+> 以 https://github.com/TianLin0509/ai-hub-community 的 v0.2.0 为可复现基线，先读 AGENTS.md、docs/ARCHITECTURE.md、docs/CUSTOMIZE.md。为我们建立独立工作分支或新库，保留 MIT LICENSE 和上游来源。先完成安装和现有 GUI/协议回归，然后调查我们内部 agent 的真实接口、认证方式和部署平台，给出适配映射。沿下文顺序实现公司专用工作台；不得捏造内部 API，不得带入个人账号、聊天或网关，不得把未知提交当作成功。每一步交付源码、验证命令、截图和明确边界。
 
 ## 先确定是哪一种改造
 
@@ -17,7 +17,7 @@
 
 ## 第 1 步：可重复基线与独立运行
 
-使用独立依赖副本执行 `install.ps1 -NoShortcut`，随后 `npm test`、`node tests/e2e-community-cdp.js`、`node tests/e2e-community-onboarding.js`。这些 GUI 测试使用临时目录和受控协议，不需要公司账号。
+使用独立依赖副本执行 `install.ps1 -NoShortcut`，随后 `npm test`、`node tests/e2e-community-cdp.js`。GUI 测试使用临时目录和模拟 CLI，不需要公司账号。
 
 安装包可直接用 [examples/company-hub/start.ps1](../examples/company-hub/start.ps1) 指定公司独立数据目录；它只为新子进程设置 `CLAUDE_HUB_DATA_DIR`，不改系统环境或现有 Hub。账号仍由 CLI 管理，并不会随数据目录隔离自动创建新账号。若要隔离 CLI 身份，使用 CLI 支持的 `CODEX_HOME` / `CLAUDE_CONFIG_DIR`，再让用户在新位置授权；不要复制凭据。
 
@@ -26,8 +26,8 @@
 1. `renderer/workspace-controller.js` / `renderer/meeting-create-modal.js`：表单、模型和工作目录选择。
 2. `main/ipc/session-handlers.js` / `main/ipc/meeting-create-handlers.js`：请求校验与建会话/群聊。
 3. `core/session-manager.js`：provider 路由、打开/关闭、归属和恢复。
-4. `core/codex-native-session.js` / `core/claude-native-session.js`：会话状态、提交回执、原生身份和历史。
-5. `main/codex-app-server-client.js` / `main/claude-stream-client.js`：独立子进程和结构化协议传输。
+4. `core/pty-prompt-submit.js`：往真实 CLI 的输入框投递消息，并等 hook 的语义确认。
+5. `core/claude-hook-integration.js` / `core/codex-hook-integration.js` / `core/hook-payload.js`：CLI 的状态回报如何登记、转发和解析。
 6. `main/ipc/prompt-submit-handlers.js`：统一发送、停止和审批入口；不要另造裸终端写入路径。
 7. `core/native-agent-journal.js`、`core/session-store.js`：提交、事件与会话存储。
 8. `renderer/renderer.js` / `renderer/meeting-room.js`：只消费已确认事件，渲染普通/群聊卡片。
@@ -60,7 +60,7 @@
 
 独立 fork 至少统一修改 `package.json` 的 name/productName/build.appId、Windows 安装器/ZIP 文件名与图标、`core/windows-shell-integration.js` 的应用标识/快捷方式、UI 标题。版本必须同步 `package.json` 和 lockfile 的两处版本。默认数据路径散布于兼容模块：优先统一到 `core/data-dir.js`，逐处检查 `.ai-hub-community` 引用并加迁移测试；不要只改包名就声称隔离完成。
 
-公开版脚本中的 GitHub owner/repo、发布资产名、固定 tag 也要随 fork 修改。`scripts/install-release.ps1` 的同版本校验与拒绝覆盖应保留。企业正式发行按内部要求签名、分发和审计；本预览版未配置商业代码签名。
+公开版脚本中的 GitHub owner/repo、发布资产名、固定 tag 也要随 fork 修改。`scripts/install-release.ps1` 的同版本校验与拒绝覆盖应保留。企业正式发行按内部要求签名、分发和审计；当前版本未配置商业代码签名。
 
 ## 合并前验收清单
 

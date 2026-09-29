@@ -8,8 +8,7 @@
 const { app, BrowserWindow } = require('electron');
 const path = require('path');
 
-const { community } = require('./core/distribution');
-const configuredDataDir = String(process.env.CLAUDE_HUB_DATA_DIR || (community ? require('./core/data-dir').getHubDataDir() : '')).trim();
+const configuredDataDir = String(process.env.CLAUDE_HUB_DATA_DIR || '').trim();
 if (configuredDataDir) {
   app.setPath('userData', path.join(configuredDataDir, 'electron-userdata'));
 }

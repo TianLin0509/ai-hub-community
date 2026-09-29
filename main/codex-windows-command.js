@@ -6,8 +6,7 @@ const { createRequire } = require('module');
 // Resolve the binary belonging to the selected npm shim, never another PATH version.
 // The npm JS wrapper spawns a console process without windowsHide on Windows.
 function resolveWindowsCodex(env = process.env, options = {}) {
-  const shim = options.shim || (require('../core/distribution').community && require('../core/community-setup').findCommand('codex', env, 'win32')) || path.join(env.APPDATA || '', 'npm', 'codex.cmd');
-  if (/\.exe$/i.test(shim)) return { command: shim, args: [], env: { ...env } };
+  const shim = options.shim || path.join(env.APPDATA || '', 'npm', 'codex.cmd');
   const match = fs.readFileSync(shim, 'utf8').match(/"([^"\r\n]*[\\/]bin[\\/]codex(?:-managed)?\.js)"/i);
   if (!match) throw new Error('无法解析 Codex npm 启动器：' + shim);
   const script = match[1].replace(/%dp0%/gi, path.dirname(shim) + path.sep);

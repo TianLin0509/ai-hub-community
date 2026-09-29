@@ -24,6 +24,63 @@ const {
 const devWorkbenchFeed = require('./dev-workbench-feed');
 const transcript = require('./group-chat-transcript');
 const { remapForkedGroupState } = require('./group-chat-fork');
+const { checkCompaction } = require('./context-compaction');
+
+// 「已读」游标只能由真正送进 CLI 的 prompt 推进（2026-09-26）。
+// 缺席（dormant/不可达）和发送失败的成员这一轮什么都没收到：以前 completeTurn 把它们的
+// 游标一并推到末尾，结果它们永远收不到漏掉的那段发言；首次参与就失败的成员还会被当成
+// 老成员，从此拿不到群规则和群聊记录路径。没带 promptDelivered 的老调用方保持原样。
+function wasPromptDelivered(result) {
+  if (!result || !result.sid) return false;
+  if (result.promptDelivered === false) return false;
+  return result.status !== 'absent';
+}
+
+// 群成员名单只写「名字 + CLI/模型」，不写角色、职责或立场（用户明确反对给 AI 预设角色）。
+function normalizeRoster(roster) {
+  if (!Array.isArray(roster)) return null;
+  const seen = new Set();
+  const out = [];
+  for (const item of roster) {
+    if (!item || !item.sid) continue;
+    const sid = String(item.sid);
+    if (seen.has(sid)) continue;
+    seen.add(sid);
+    out.push({
+      sid,
+      name: String(item.name || item.displayName || item.kind || 'AI'),
+      cli: item.kind || item.cli ? String(item.kind || item.cli) : '',
+      model: item.model ? String(item.model) : '',
+    });
+  }
+  return out;
+}
+
+function rosterMemberLabel(entry) {
+  const detail = [entry.cli, entry.model].filter(Boolean).join(' / ');
+  return detail ? `${entry.name}（${detail}）` : entry.name;
+}
+
+function buildRosterBlock(roster, selfSid) {
+  if (!roster || roster.length === 0) return '';
+  const lines = roster.map(entry => `- ${rosterMemberLabel(entry)}${entry.sid === selfSid ? '（你）' : ''}`);
+  return ['## 群成员', ...lines].join('\n');
+}
+
+/** 名单增减时给老成员的一行提示；没有增减返回空串。 */
+function buildRosterChangeLine(previous, roster, selfSid) {
+  if (!Array.isArray(previous) || !roster) return '';
+  const before = new Set(previous.map(entry => entry && String(entry.sid)));
+  const now = new Set(roster.map(entry => entry.sid));
+  const joined = roster.filter(entry => !before.has(entry.sid) && entry.sid !== selfSid);
+  const left = previous.filter(entry => entry && !now.has(String(entry.sid)) && String(entry.sid) !== selfSid);
+  if (joined.length === 0 && left.length === 0) return '';
+  const parts = [];
+  if (joined.length) parts.push(`新加入 ${joined.map(rosterMemberLabel).join('、')}`);
+  if (left.length) parts.push(`已离开 ${left.map(entry => rosterMemberLabel({ name: 'AI', ...entry })).join('、')}`);
+  const current = roster.map(entry => entry.name).join('、');
+  return `（群成员变更：${parts.join('；')}。当前成员：${current}）`;
+}
 
 // 过程汇报（recordProgressUpdate 写入的 `UPDATE: …`）也是一条 assistant 消息，
 //   role / turnNum / sid 与正式答复完全一样，而且落盘更早。凡是按「本轮 + 本席位」
@@ -118,6 +175,10 @@ function normalizeDispatchMeta(dispatch) {
       attempt: Number(dispatch.attempt) > 0 ? Number(dispatch.attempt) : 1,
       runId: dispatch.runId ? String(dispatch.runId) : null,
       role: dispatch.role ? String(dispatch.role) : '',
+      ...(dispatch.kind==='delivery' ? {
+        goal:typeof dispatch.goal==='string'?dispatch.goal:'',
+        stageName:typeof dispatch.stageName==='string'?dispatch.stageName:'',
+      } : {}),
     },
     toMemberIds: memberIds,
     toLabels: labels,
@@ -168,36 +229,12 @@ function _memberLabel(member) {
   return member.displayName || member.alias || KIND_LABELS[member.kind] || member.kind || member.memberId || 'AI';
 }
 
-const RESEARCH_SCENE_PROMPT = [
-  '## 投研场景',
-  '优先补充他人未覆盖的角度、证据缺口或反例。在评价已知材料的基础上，尽量挖掘新线索、变量或解释路径，为讨论带回新信息、方向。涉及股票、板块、消息和近期行情时，尽量查证；事实和数字标来源，未查证就说明不确定。不要只顺着已有倾向，主动指出风险或证伪信号。若信息不足或判断分叉，先问用户 1-2 个会改变结论的问题。',
-  '涉及具体 A 股、板块或买卖时机时，优先主动调用已注入的 stock_market(symbol)、stock_news(symbol)，stock_static(symbol) 仅在单只核心标的需要估值/基本面画像时再补。不要在同一轮对多只股票批量发 static+market；多股对比先 news 或至多 1-3 个 market，避免 MCP 客户端 120s 工具超时。',
-  '涉及用户当前持仓、个股/板块旧记录、投资理念或交易纪律时，先调用 chuxin_context(topic) 读取初心个人上下文；它是用户历史记录，不是实时事实，当前价格、公告、财报和消息仍需用 stock_* 核验。',
-  '只有问题涉及过去的加减仓、历史成本或曾经持有时才调用 chuxin_portfolio_history；只在用户明确说“记入初心/保存到初心/归档到初心”时调用 chuxin_inbox_add，并压缩成一条研究胶囊，禁止自动保存普通对话。',
-  '用户写“@英灵”、点名巴菲特/利弗莫尔镜头或要求英灵对抗时：先用 stock_* 补齐与该镜头有关的证据，再调用 spirit_prepare 生成统一 Lens Packet；所有席位按同一 rule_id 与 manifest_hash 发言。英灵只是有边界的方法论，禁止自称历史人物本人，也不得把英灵建议当成交易执行。',
-  '只引用工具返回中能改变判断的关键字段；工具不可用或数据缺失时明确说未查到，不要凭记忆补数字。',
-  'stock_static 返回的估值/基本面字段带 `confidence` 标签（HIGH/MEDIUM/LOW/CONFLICT/UNAVAILABLE，详细措辞规则见该工具 description），引用前先看 `_meta.warnings` 扫一眼非 HIGH 字段；CONFLICT/UNAVAILABLE 时 value=null，禁止编数值或填默认值。',
-  `反空话铁律：结论必须落到具体数字或可查事实上，禁用空话套话（${BANNED_PHRASES.join('、')} 等同类表述）——出现即视为无效结论，请用带数字/来源的判断重写。`,
-].join('\n');
-
-// 右侧交易战法纪律（投委会「纪律底色」，常驻 research 场景）。与「流程档位」解耦：
-// 纪律永远在（自由聊也带），五幕固定流程只在 committee-conductor 投委会档激活。
-// 内容 = 用户锁定的追涨/低吸右侧画像表（preference_invest_chase_vs_dip）。
-const COMMITTEE_DISCIPLINE = [
-  '## 右侧交易战法纪律（底色）',
-  '本群偏中短线**右侧交易**。评估个股先归位是「追涨」还是「低吸」——两者**都是右侧、都在上升趋势**，差异只在阶段，不是方向：',
-  '- 共同底座（缺一即降级）：右侧上升趋势 · 板块龙头/认同度高 · 题材正宗够硬 · 基本面硬 · 关键趋势线不破。',
-  '- **追涨**（主升进行中）：5/10 日线强趋势、空中加油、接力强势龙；主升浪里跟随。',
-  '- **低吸**（回调赌第二波）：强势股大涨后回调 15–30%、重新站上 20 日线、缩量企稳、有催化预期。**这是右侧回调再进场，不是左侧抄底/价值反弹**。',
-  '否决线（命中即降级到观察/风险隔离，不进买入）：趋势破位 · 题材不正宗(蹭概念/相关营收占比极低) · 量价背离 · 高位假强势 · 基本面证伪。',
-  '每条信息都想一层：它对「追涨」更有价值，还是对「低吸」更有价值？给出倾向。选股看：睡得着 · 预期差 · 催化剂 · 资金利用效率。**宁可错过，不可做错**。',
-].join('\n');
 
 // 2026-06-05 联邦记忆下线：原 MEMORY_DISCIPLINE_PROMPT 教各家 AI 写 memory 的指令段已删除。
 // 记忆维护完全交给 Claude/Codex 各自原生 auto-memory 能力，群聊 prompt 不再越俎代庖。
 
 // 产物落点：跟着 workspace 走，不再写死 home 下的公共 artifacts 目录。
-// 旧写法 `C:\Users\example-user\artifacts\` 是 workspace 重构之前的遗留，结果是
+// 旧写法 `C:\Users\you\artifacts\` 是 workspace 重构之前的遗留，结果是
 // 三家 AI 都老老实实把报告写回用户最想摆脱的 home 目录 —— 规则层没跟上目录层
 // 的重构，AI 就会照旧规则执行（2026-07-28）。
 function artifactsInstruction(workspace) {
@@ -218,9 +255,6 @@ function buildSystemPromptText(displayName, scene, opts = {}) {
     '## 输出',
     artifactsInstruction(opts.workspace),
   ];
-  if (scene === 'research') {
-    parts.push('', RESEARCH_SCENE_PROMPT, '', COMMITTEE_DISCIPLINE);
-  }
   return parts.join('\n');
 }
 
@@ -248,6 +282,11 @@ class GroupChatOrchestrator {
       pendingPrompts: {},
       // 真实用户补充（群聊插话）的逐成员投递账本。见 appendUserSupplement 的注释。
       userSupplements: { pendingBySid: {}, deliveredBySid: {} },
+      // 群规则 / 成员名单的逐成员送达回执：{ peakContext, roster, rulesDeliveredAt }。
+      // 压缩检测（已用上下文跌破峰值一半）后重发一次群规则；名单增减时附一行变更。
+      groupContextBySid: {},
+      // buildFirstDelta 准备好、尚未确认送达的部分；送达后才并入上面的回执。
+      groupContextPendingBySid: {},
       turns: [],
       aiStats: {},
     };
@@ -287,6 +326,9 @@ class GroupChatOrchestrator {
           activeRun: raw.activeRun && typeof raw.activeRun === 'object' ? raw.activeRun : null,
           pendingPrompts: raw.pendingPrompts && typeof raw.pendingPrompts === 'object' ? raw.pendingPrompts : {},
           userSupplements: normalizeSupplementLedger(raw.userSupplements),
+          groupContextBySid: raw.groupContextBySid && typeof raw.groupContextBySid === 'object' ? raw.groupContextBySid : {},
+          groupContextPendingBySid: raw.groupContextPendingBySid && typeof raw.groupContextPendingBySid === 'object'
+            ? raw.groupContextPendingBySid : {},
         };
         let nextMessageSeq = 1;
         for (const message of this.state.messages) {
@@ -301,7 +343,7 @@ class GroupChatOrchestrator {
           const message = this.state.messages[Number(indexValue)];
           this.state.lastDeliveredSeq[sid] = message && Number.isInteger(message.seq) ? message.seq : 0;
         }
-        // 2026-07-20 道雪 [修#9]：崩溃/重启后的悬空轮标记——用户消息所在轮没有任何
+        // 2026-07-20 maintainer [修#9]：崩溃/重启后的悬空轮标记——用户消息所在轮没有任何
         //   turn 记录时，给该消息打"已被重启打断"标记（此前问题孤悬、无任何提示）。
         const turnNums = new Set((this.state.turns || []).map(t => t && t.n));
         let touched = this.state.schemaVersion !== Number(raw.schemaVersion)
@@ -505,6 +547,9 @@ class GroupChatOrchestrator {
       resultTextLength: String(result.text || '').length,
       reason: result.reason || null,
       failure: result.failure || null,
+      // 重启续作会从 attempt 还原结果再 completeTurn；没送达的标记要跟着留下来，
+      // 否则续作会把发送失败者的游标推过去。
+      ...(result.promptDelivered === false ? { promptDelivered: false } : {}),
     }, 'attempt_settled', options);
   }
 
@@ -569,7 +614,12 @@ class GroupChatOrchestrator {
     for(const m of safe)merged.set(m.id,m);
     const next=[...merged.values()];
     if(JSON.stringify(previous)===JSON.stringify(next))return false;
-    byAttempt[attemptId]=next;
+      byAttempt[attemptId]=next;
+      if(attempt.supplementSeq){
+        const message=this.state.messages.find(m=>m.id==='supp-'+attemptId);
+        const last=next.findLast(m=>m.phase==='final_answer');
+        if(message && last){message.content=last.text;message.status='completed';attempt.status='completed';}
+      }
     try { this._saveState('conversation_items_saved',{attemptId}); }
     catch(error) {
       // Do not let in-memory equality suppress the next durable write retry.
@@ -742,6 +792,8 @@ class GroupChatOrchestrator {
       origin: ORIGIN_USER,
       supplement: true,
       supplementSource: String(opts.source || 'input-box'),
+      toSids: recipients,
+      toLabels: Array.isArray(opts.toLabels) ? [...opts.toLabels] : [],
       runId: (this.state.activeRun && this.state.activeRun.runId) || null,
     });
     if (!this.state.userSupplements) this.state.userSupplements = { pendingBySid: {}, deliveredBySid: {} };
@@ -766,6 +818,7 @@ class GroupChatOrchestrator {
     if (!key) return [];
     const ledger = this.state.userSupplements || { pendingBySid: {} };
     const pending = new Set(ledger.pendingBySid[key] || []);
+    for(const seq of ledger.uncertainBySid?.[key] || [])pending.delete(seq);
     if (!pending.size) return [];
     return this.listUserSupplements().filter(item => pending.has(item.seq));
   }
@@ -774,7 +827,7 @@ class GroupChatOrchestrator {
    * 确认送达。**只在实际发送返回成功之后调**——发送失败或确认不明时不要调它，
    * 那种情况要保留待确认，不能提前标已读，也不要盲目重发（任务书 C06）。
    */
-  markUserSupplementsDelivered(sid, seqs) {
+  markUserSupplementsDelivered(sid, seqs, {queued=false}={}) {
     const key = String(sid || '');
     const list = _seqList(seqs);
     if (!key || !list.length) return [];
@@ -786,8 +839,64 @@ class GroupChatOrchestrator {
     if (pending.size) ledger.pendingBySid[key] = _seqList([...pending]);
     else delete ledger.pendingBySid[key];
     ledger.deliveredBySid[key] = _seqList([...(ledger.deliveredBySid[key] || []), ...list]);
+    if(ledger.uncertainBySid?.[key])ledger.uncertainBySid[key]=ledger.uncertainBySid[key].filter(seq=>!list.includes(seq));
+    for(const message of this.state.messages){
+      const d=message.supplementDelivery;if(!message.supplement || !list.includes(message.seq) || !d)continue;
+      for(const field of ['pendingSids','uncertainSids','deliveredNow','queuedSids'])d[field]=(d[field] || []).filter(s=>s!==sid);
+      d[queued?'queuedSids':'deliveredNow'].push(sid);
+    }
     if (moved.length) this._saveState('user_supplement_delivered', { sid: key, count: moved.length });
     return moved;
+  }
+
+  // An unconfirmed write may already be in the CLI. Do not replay it as part
+  // of a later automatic workflow prompt; keep the original visible record.
+  markUserSupplementsUncertain(sid, seqs) {
+    const ledger=this.state.userSupplements;
+    if(!ledger)return;
+    ledger.uncertainBySid ||= {};
+    ledger.uncertainBySid[sid]=_seqList([...(ledger.uncertainBySid[sid] || []),...seqs]);
+    this._saveState('user_supplement_uncertain',{sid,seqs});
+  }
+
+  releaseUserSupplementsUnsent(sid, seqs) {
+    const ledger=this.state.userSupplements;
+    if(!ledger?.uncertainBySid?.[sid])return;
+    ledger.uncertainBySid[sid]=ledger.uncertainBySid[sid].filter(seq=>!seqs.includes(seq));
+    this._saveState('user_supplement_unsent',{sid,seqs});
+  }
+
+  recordSupplementPrompt(sid, prompt, details) {
+    const runId=this.state.activeRun?.runId || createRunId(this.meetingId,this.state.currentTurn || 0);
+    const attemptId=createAttemptId(runId,details.memberId || sid),at=Date.now();
+    const attempt={attemptId,runId,sid,memberId:details.memberId,kind:details.kind,turnNum:this.state.currentTurn || 0,
+      mode:'group',status:'submitting',supplementSeq:details.seq,promptHash:promptFingerprint(prompt),dispatchAt:at,createdAt:at,updatedAt:at};
+    this.state.attempts ||= {};this.state.attempts[attemptId]=attempt;
+    // Native projection needs an anchor; PTY history appends source messages.
+    // Neither path replaces the workflow's pending prompt or active attempt.
+    if(details.native)this._appendMessage({id:'supp-'+attemptId,role:'assistant',sid,speaker:details.label,
+      turnNum:attempt.turnNum,runId,attemptId,content:'',status:'running',supplementReply:true});
+    this._saveState('supplement_prompt_recorded',{attemptId});
+    return {attemptId,prompt,promptHash:attempt.promptHash};
+  }
+
+  finishSupplementPrompt(attemptId,result={}) {
+    const attempt=this.state.attempts?.[attemptId];if(!attempt?.supplementSeq)return;
+    const prior=Object.values(this.state.attempts).find(a=>a.attemptId!==attemptId && !a.supplementAliasOf && a.sid===attempt.sid
+      && result.threadId && a.providerThreadId===result.threadId && result.turnId && a.providerTurnId===result.turnId);
+    Object.assign(attempt,{status:result.ok?(attempt.status==='completed'?'completed':'accepted'):'submission_unknown',updatedAt:Date.now(),
+      providerThreadId:result.threadId || null,providerTurnId:result.turnId || null,userMessageId:result.userMessageId || null});
+    if(prior){attempt.supplementAliasOf=prior.attemptId;this.state.messages=this.state.messages.filter(m=>m.id!=='supp-'+attemptId);}
+    const message=this.state.messages.find(m=>m.id==='supp-'+attemptId);
+    if(message && !result.ok){message.status='submission_unknown';message.failureReason=result.reason || result.error || '补充提交待核对';}
+    this._saveState('supplement_prompt_receipt',{attemptId});
+  }
+
+  recordUserSupplementDelivery(seq, result) {
+    const message=this.state.messages.find(m=>m.supplement && m.seq===seq);
+    if(!message)return;
+    message.supplementDelivery=result;
+    this._saveState('supplement_delivery_saved',{seq});
   }
 
   /**
@@ -1093,14 +1202,85 @@ class GroupChatOrchestrator {
    * 第一次给这位成员发言时才带的开场：整套群规 + 群聊记录路径。
    * 新成员、分支加入的成员都走这里，它们的游标是空的。
    */
+  //
+  // opts.roster：当前群成员 [{ sid, name, kind, model }]。首轮随群规则给全量名单；
+  //   之后名单有增减，只给一行变更。不传就完全不碰名单（投委会等内部编排）。
+  // opts.contextUsed：该成员 CLI 当前已用上下文。与梦境索引 / 工作区规则共用同一个
+  //   压缩判据（core/context-compaction.js）：跌破送达后峰值的一半，就把群规则重发一次。
+  // 这里只登记「准备发了什么」，真正送达后由 _advanceDeliveryCursors 提交回执；
+  // 没送达就什么都不记，下一轮照样重发。
   buildFirstDelta(selfSid, userInput, systemPromptText, opts = {}) {
-    if (this.state.lastDeliveredIdx[selfSid] === undefined) {
-      const intro = [String(systemPromptText || ''), this._transcriptPointerBlock()]
+    const roster = normalizeRoster(opts.roster);
+    const firstTime = this.state.lastDeliveredIdx[selfSid] === undefined;
+    if (!this.state.groupContextBySid || typeof this.state.groupContextBySid !== 'object') this.state.groupContextBySid = {};
+    if (!this.state.groupContextPendingBySid || typeof this.state.groupContextPendingBySid !== 'object') {
+      this.state.groupContextPendingBySid = {};
+    }
+    const receipt = this.state.groupContextBySid[selfSid] || null;
+    let includeRules = firstTime;
+    let compacted = false;
+    if (!firstTime && receipt) {
+      const check = checkCompaction(receipt.peakContext, opts.contextUsed);
+      if (check.compacted) {
+        includeRules = true;
+        compacted = true;
+      } else {
+        receipt.peakContext = check.peak;
+      }
+    }
+    this.state.groupContextPendingBySid[selfSid] = {
+      rules: includeRules,
+      ...(compacted ? { reason: 'compacted' } : {}),
+      ...(roster ? { roster } : {}),
+    };
+    const delta = this.buildDelta(selfSid, userInput, opts);
+    if (includeRules) {
+      const intro = [String(systemPromptText || ''), buildRosterBlock(roster, selfSid), this._transcriptPointerBlock()]
         .filter(part => part && part.trim())
         .join('\n\n');
-      return intro + '\n\n' + this.buildDelta(selfSid, userInput, opts);
+      return intro + '\n\n' + delta;
     }
-    return this.buildDelta(selfSid, userInput, opts);
+    if (roster) {
+      // 老成员：回执里没有名单（本功能上线前加入的）就补一次全量，之后只报增减。
+      const rosterPart = receipt && Array.isArray(receipt.roster)
+        ? buildRosterChangeLine(receipt.roster, roster, selfSid)
+        : buildRosterBlock(roster, selfSid);
+      if (rosterPart) return rosterPart + '\n\n' + delta;
+    }
+    return delta;
+  }
+
+  /** 送达后才把 buildFirstDelta 登记的群规则 / 名单并入回执。 */
+  _commitGroupContext(sid) {
+    if (!this.state.groupContextBySid || typeof this.state.groupContextBySid !== 'object') this.state.groupContextBySid = {};
+    const pendingTable = this.state.groupContextPendingBySid || {};
+    const pending = pendingTable[sid] || null;
+    const existing = this.state.groupContextBySid[sid];
+    const receipt = existing && typeof existing === 'object' ? existing : {};
+    if (!existing || (pending && pending.rules)) {
+      // 规则刚送达（首次或压缩后重发）：峰值从零重新观测。
+      receipt.peakContext = 0;
+      if (pending && pending.rules) receipt.rulesDeliveredAt = Date.now();
+    }
+    if (pending && Array.isArray(pending.roster)) receipt.roster = pending.roster;
+    this.state.groupContextBySid[sid] = receipt;
+    if (pending) delete pendingTable[sid];
+  }
+
+  /** 只推进真正送达者的游标；缺席、发送失败的保持原位，下一轮补上漏掉的内容。 */
+  _advanceDeliveryCursors(results) {
+    const lastIdx = this.state.messages.length - 1;
+    for (const r of results || []) {
+      if (!wasPromptDelivered(r)) continue;
+      this.state.lastDeliveredIdx[r.sid] = Number.isInteger(r.deliveredIdx) ? r.deliveredIdx : lastIdx;
+      const deliveredMessage = Number.isInteger(r.deliveredSeq)
+        ? null
+        : this.state.messages[Number.isInteger(r.deliveredIdx) ? r.deliveredIdx : lastIdx];
+      this.state.lastDeliveredSeq[r.sid] = Number.isInteger(r.deliveredSeq)
+        ? r.deliveredSeq
+        : (deliveredMessage && Number.isInteger(deliveredMessage.seq) ? deliveredMessage.seq : 0);
+      this._commitGroupContext(r.sid);
+    }
   }
 
   /** 群里已经有人发过言，才值得告诉新人「完整记录在哪」。空群不加这段噪声。 */
@@ -1133,7 +1313,7 @@ class GroupChatOrchestrator {
         if (!m || m.role !== 'assistant' || Number(m.turnNum) !== Number(turnNum) || !m.sid) continue;
         // 过程汇报只是半路进展，不是答案：拿它当合并基线会把「本轮跑空」记成
         //   by[sid] = 'UPDATE: …'，这一轮的答复就被一句中途汇报顶掉了。
-        if (isProgressUpdateMessage(m)) continue;
+        if (isProgressUpdateMessage(m) || m.supplementReply) continue;
         if (m.content && String(m.content).trim()) by[m.sid] = m.content;
         if (m.status) byStatus[m.sid] = m.status;
         if (typeof m.thinkSec === 'number') thinkSecBy[m.sid] = m.thinkSec;
@@ -1153,9 +1333,9 @@ class GroupChatOrchestrator {
       const _srcPrompt = (this._activePrompts[turnNum] && this._activePrompts[turnNum][sid])
         || (_durablePrompt && _durablePrompt.prompt)
         || '';
-      // 2026-06-21 道雪：与 patchTurnResult 对齐——仅确有新文本时写正文；
+      // 2026-06-21 maintainer：与 patchTurnResult 对齐——仅确有新文本时写正文；
       //   errored/超时返回空文本时保留已有答案，防重发/串行工作流抹掉已生成内容。
-      // 2026-07-12 道雪收紧：completed 空文本（process_exit_clean 兜底 settle）同样
+      // 2026-07-12 maintainer收紧：completed 空文本（process_exit_clean 兜底 settle）同样
       //   不得覆盖——旧规则"成功态无条件写"会让干净退出的 CLI 把已有/已手动同步的
       //   答案抹成空气泡。真理源统一为 by[sid]，消息正文从 by[sid] 取，不再直接用 r.text。
       const _rStatus = r.status || 'completed';
@@ -1163,7 +1343,7 @@ class GroupChatOrchestrator {
       const _writeContent = !!(r.text && String(r.text).trim().length);
       const _prevStatus = byStatus[sid];
       const _existingMsg = this.state.messages.find(m => m && m.role === 'assistant'
-        && Number(m.turnNum) === Number(turnNum) && m.sid === sid && !isProgressUpdateMessage(m));
+        && Number(m.turnNum) === Number(turnNum) && m.sid === sid && !m.supplementReply && !isProgressUpdateMessage(m));
       const _hasManualResult = _prevStatus === 'manual_extracted'
         && !!(by[sid] && String(by[sid]).trim().length);
       const _incomingIsManual = _rStatus === 'manual_extracted';
@@ -1332,16 +1512,7 @@ class GroupChatOrchestrator {
     }
     if (activeRunMatches) delete this._activePrompts[turnNum];
     this._clearPendingPromptsForRun(turnNum, runId);
-    const lastIdx = this.state.messages.length - 1;
-    for (const r of results) {
-      this.state.lastDeliveredIdx[r.sid] = Number.isInteger(r.deliveredIdx) ? r.deliveredIdx : lastIdx;
-      const deliveredMessage = Number.isInteger(r.deliveredSeq)
-        ? null
-        : this.state.messages[Number.isInteger(r.deliveredIdx) ? r.deliveredIdx : lastIdx];
-      this.state.lastDeliveredSeq[r.sid] = Number.isInteger(r.deliveredSeq)
-        ? r.deliveredSeq
-        : (deliveredMessage && Number.isInteger(deliveredMessage.seq) ? deliveredMessage.seq : 0);
-    }
+    this._advanceDeliveryCursors(results);
     this._saveState('run_completed', { runId, turnNum, status: runStatus });
     return turn;
   }
@@ -1349,18 +1520,9 @@ class GroupChatOrchestrator {
   // silent 内部编排（投委会五幕）每幕后调：标记这些委员已收到 systemPrompt 并对齐到当前 messages
   // 末尾，使后续幕 buildFirstDelta 走增量、不再每幕全量重发规则（点2 上下文污染根因）。故意不写
   // messages（silent 不污染自由聊 transcript）——委员靠各自持久 CLI 会话记忆延续上下文。
+  // 发送失败的委员同样不推进：它没收到这一幕的规则与增量。
   markDeliveredSilent(results) {
-    const lastIdx = this.state.messages.length - 1;
-    for (const r of results || []) {
-      if (!r || !r.sid) continue;
-      this.state.lastDeliveredIdx[r.sid] = Number.isInteger(r.deliveredIdx) ? r.deliveredIdx : lastIdx;
-      const deliveredMessage = Number.isInteger(r.deliveredSeq)
-        ? null
-        : this.state.messages[Number.isInteger(r.deliveredIdx) ? r.deliveredIdx : lastIdx];
-      this.state.lastDeliveredSeq[r.sid] = Number.isInteger(r.deliveredSeq)
-        ? r.deliveredSeq
-        : (deliveredMessage && Number.isInteger(deliveredMessage.seq) ? deliveredMessage.seq : 0);
-    }
+    this._advanceDeliveryCursors(results);
     this._saveState('silent_delivery_advanced');
   }
 
@@ -1436,7 +1598,7 @@ class GroupChatOrchestrator {
     const providerTurnIdBy = pending ? {} : (turn.providerTurnIdBy = turn.providerTurnIdBy || {});
     const failureBy = pending ? {} : (turn.failureBy = turn.failureBy || {});
     let msg = this.state.messages.find(m => m && Number(m.turnNum) === Number(turnNum)
-      && m.role === 'assistant' && m.sid === sid && !isProgressUpdateMessage(m));
+      && m.role === 'assistant' && m.sid === sid && !m.supplementReply && !isProgressUpdateMessage(m));
     if (status === 'handed_off' && !String(text || '').trim()
         && msg?.status === 'completed' && msg.finality === 'provider_final'
         && msg.attemptId === attemptId && String(msg.content || '').trim()) return msg;
@@ -1577,13 +1739,15 @@ module.exports = {
   rawMessageAnchor,
   buildSystemPromptText,
   normalizeDispatchMeta,
+  wasPromptDelivered,
   _private: {
+    buildRosterBlock,
+    buildRosterChangeLine,
+    normalizeRoster,
     HISTORY_INLINE_BUDGET,
     SINGLE_MESSAGE_INLINE_LIMIT,
     buildSystemPromptText,
     normalizeDispatchMeta,
-    RESEARCH_SCENE_PROMPT,
-    COMMITTEE_DISCIPLINE,
     GroupChatOrchestrator,
     resetCache: () => _cache.clear(),
   },

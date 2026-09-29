@@ -5,6 +5,8 @@ const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { isMainThread, parentPort, workerData } = require('node:worker_threads');
 const { ALL_AI_KINDS, getKindLabel } = require('./ai-kinds');
+const {presentation}=require('./capability-presentation');
+const {notePath}=require('./capability-notes');
 
 // A deliberately narrow TOML projection: table names and enabled only. No secrets,
 // commands or environment values cross the inventory IPC boundary.
@@ -63,6 +65,7 @@ function collectCapabilities({ homeDir, dataDir, projects = [] }) {
       };
       const name = field('name') || entry.name;
       for (const agent of agents) add('skill', name, field('description'), {agent,scope,path:file,realPath:real(file), enabled:true,...extra,
+        declaredOrigin:['self','external'].includes(field('origin'))?field('origin'):undefined,
         hash:createHash('sha256').update(s.replace(/\r\n/g,'\n')).digest('hex')});
     }
   }
@@ -71,7 +74,7 @@ function collectCapabilities({ homeDir, dataDir, projects = [] }) {
     if(!servers || typeof servers!=='object' || Array.isArray(servers))return;
     for (const [name, c] of Object.entries(servers)) {
       if(!c || typeof c!=='object' || Array.isArray(c)){warnings.push(`${file}：MCP 条目格式无效`);continue;}
-      add('mcp',name,'标准 MCP 服务器',{agent,scope,path:file,...extra,enabled:extra.enabled!==false && c.enabled!==false && c.disabled!==true,
+      add('mcp',name,typeof c.description==='string'?c.description:'标准 MCP 服务器',{agent,scope,path:file,...extra,enabled:extra.enabled!==false && c.enabled!==false && c.disabled!==true,
         transport:['stdio','http','sse','streamable-http'].includes(c.type)?c.type:(c.url ? 'HTTP' : 'stdio')});
     }
   }
@@ -151,6 +154,8 @@ function collectCapabilities({ homeDir, dataDir, projects = [] }) {
   jsonMcp(home('.kimi-code','mcp.json'),'kimi','user');
   jsonMcp(home('.gemini','settings.json'),'gemini','user');
   jsonMcp(home('.qwen','settings.json'),'qwen','user');
+  // Skill-invoked MCPs are real dependencies too, even when no native CLI loads them.
+  jsonMcp(home('.mcporter','mcporter.json'),'external','user');
   const enabled = json(home('.claude','settings.json')).enabledPlugins || {};
   const installed = json(home('.claude','plugins','installed_plugins.json')).plugins || {};
   for (const name of new Set([...Object.keys(enabled),...Object.keys(installed)])) {
@@ -185,9 +190,12 @@ function collectCapabilities({ homeDir, dataDir, projects = [] }) {
       }
     }
   }
-  return {generatedAt:Date.now(),warnings:[...new Set(warnings)],agents:ALL_AI_KINDS.map(id=>({id,label:getKindLabel(id)})),rows:[...rows.values()].map(r=>({...r,
+  const allRows = [...rows.values()];
+  const decorated=allRows.map(r=>presentation({...r,
+    accountDependency: require('./tool-account-catalog').dependencyFor(r, allRows),
     shared:r.sources.some(s=>s.scope==='shared'), conflict:r.type==='skill' && new Set(r.sources.map(s=>s.hash).filter(Boolean)).size>1,
-    agents:[...new Set(r.sources.map(s=>s.agent))]})).sort((a,b)=>a.name.localeCompare(b.name))};
+    agents:[...new Set(r.sources.map(s=>s.agent))]},json(notePath(dataDir,r.id))));
+  return {generatedAt:Date.now(),warnings:[...new Set(warnings)],agents:ALL_AI_KINDS.map(id=>({id,label:getKindLabel(id)})),rows:decorated.sort((a,b)=>a.name.localeCompare(b.name))};
 }
 if (!isMainThread) {
   try { parentPort.postMessage({ok:true,data:collectCapabilities(workerData)}); }

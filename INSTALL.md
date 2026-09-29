@@ -4,7 +4,7 @@
 
 普通用户和代装 Agent 优先使用 [AGENT-QUICKSTART.md](docs/AGENT-QUICKSTART.md) 的固定版本命令。`scripts/install-release.ps1` 自动下载 Windows x64 ZIP、SHA256 校验、按版本安装并启动，支持重复执行、JSON 回执及离线包。不要为了运行发布版先装整套开发环境。
 
-安装目录默认 `%LOCALAPPDATA%\Programs\AIHubCommunity\v0.1.0-preview.2`。程序包含 `resources/scripts/install-provider.ps1` 和 `resources/guides`，可离线阅读安装/定制文档。可以手动运行其中的 `AI Hub Community.exe`。卸载便携版仅在关闭对应程序后移除该版本目录；用户数据不自动删除。
+安装目录默认 `%LOCALAPPDATA%\Programs\AIHubCommunity\v0.2.0`。程序包含 `resources/scripts/install-provider.ps1` 和 `resources/guides`，可离线阅读安装/定制文档。可以手动运行其中的 `AI Hub Community.exe`。卸载便携版仅在关闭对应程序后移除该版本目录；用户数据不自动删除。
 
 ## 路线 A：源码安装（人和 agent 均可执行）
 
@@ -18,7 +18,7 @@
 
 ## 路线 B：Windows 安装包
 
-从仓库 Releases 下载已发布的 `AIHubCommunity-Setup-*.exe`，运行后从快捷方式启动。Hub 自带 Electron 运行时，但各 AI CLI 仍需按自己的官方依赖安装。预览安装包未配置商业代码签名；组织有软件准入策略时按组织流程处理。
+从仓库 Releases 下载已发布的 `AIHubCommunity-Setup-*.exe`，运行后从快捷方式启动。Hub 自带 Electron 运行时，但各 AI CLI 仍需按自己的官方依赖安装。安装包未配置商业代码签名；组织有软件准入策略时按组织流程处理。
 
 ## 接入自己的 AI
 
@@ -31,7 +31,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-provider.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-provider.ps1 -Provider gemini
 ```
 
-Claude 和 Codex 使用官方原生安装脚本，无需 Node；保留对已有 npm CLI 的兼容。Git for Windows 可选，Claude 当前官方版本在没有 Git Bash 时可以使用 PowerShell。Gemini 使用官方 npm 包，需要 Node/npm。CLI 版本由执行安装时的官方发布决定；安装脚本不会替已有 CLI 自动升级。Kimi 及其他可选提供方按官方说明安装。
+Claude 和 Codex 使用官方原生安装脚本，无需 Node；保留对已有 npm CLI 的兼容。Claude Code 在 Windows 上需要 Git for Windows（Git Bash），首页检测会提示。Gemini 使用官方 npm 包，需要 Node/npm。CLI 版本由执行安装时的官方发布决定；安装脚本不会替已有 CLI 自动升级。Kimi 及其他可选提供方按官方说明安装。
 
 登录首选 Hub 首页「登录 / 检查账号」：
 
@@ -55,11 +55,11 @@ node scripts/doctor.js
 
 doctor 输出 JSON：退出码 `0` = 源码运行环境齐全；`2` = 缺少必需项；`1` = 诊断本身失败。`providers[].installed` 只表示发现 CLI；`auth: not_checked` 明确没有登录证据。
 
-运行验收：窗口出现、首页能刷新安装检测、账号中心可打开、创建自己的单会话能收到回复。只有最后一步验证了你的真实账号/网络/模型。Agent 如使用仓库的 GUI 测试，应报告「协议夹具通过」，不能冒充在线模型测试。
+运行验收：窗口出现、首页能刷新安装检测、账号中心可打开、创建自己的单会话能收到回复。只有最后一步验证了你的真实账号/网络/模型。Agent 如使用仓库的 GUI 测试，应报告「模拟 CLI 通过」，不能冒充在线模型测试。
 
 默认数据：`%USERPROFILE%\.ai-hub-community`；可用 `CLAUDE_HUB_DATA_DIR` 显式隔离。首次不会导入旧 Hub 会话。CLI 登录保留在 CLI 自己的目录中。本机历史搜索和记忆文件库按用户操作读取本机资料；调用模型时，选中的消息和文件会发送给对应提供方。
 
-上游的 Codex 与部分群聊流程默认允许自动执行，具备修改工作目录文件和运行命令的能力。此预览版保留该运行语义，尚未把各 provider 的权限统一成一个开关。安装脚本本身不启动 AI 任务。不要把本机 hook/CDP 端口暴露到公网。
+Hub 启动的 Claude 与 Codex 会话默认自动执行，能直接修改工作目录文件和运行命令；这只作用于 Hub 启动的会话，不改你在终端里单独使用 CLI 时的权限设置。Hub 为了知道会话何时完成，会在 `~/.claude` 与 `~/.codex` 里登记状态回报（hook），完整清单见 [PRIVACY.md](PRIVACY.md)。安装脚本本身不启动 AI 任务。不要把本机 hook/CDP 端口暴露到公网。
 
 ## 常见故障
 

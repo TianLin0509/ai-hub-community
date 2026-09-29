@@ -55,18 +55,27 @@ function _isPathInside(parent, candidate) {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
+// 2026-09-26：测试 Hub 默认「后台窗口」—— 照常渲染，但在屏幕外、不激活、不进任务栏，
+// 不会从正在 Hub 里打字的用户手里抢走键盘（见 core/e2e-desktop-sandbox.js）。
+// 写 'visible' 的老测试同样按后台跑；真要看着它跑，设 HUB_E2E_SHOW_WINDOWS=1。
+const WINDOW_MODES = new Set(['background', 'visible', 'hidden']);
+function effectiveWindowMode(windowMode, env = process.env) {
+  if (!WINDOW_MODES.has(windowMode)) {
+    throw new Error('isolated Hub windowMode must be background, visible or hidden');
+  }
+  return windowMode === 'visible' && env.HUB_E2E_SHOW_WINDOWS !== '1' ? 'background' : windowMode;
+}
+
 function buildIsolatedHubEnv(dataDir, extraEnv = {}, baseEnv = process.env, {
   allowExternalState = false,
-  windowMode = 'visible',
+  windowMode = 'background',
 } = {}) {
-  if (windowMode !== 'visible' && windowMode !== 'hidden') {
-    throw new Error('isolated Hub windowMode must be visible or hidden');
-  }
+  windowMode = effectiveWindowMode(windowMode, baseEnv);
   const resolvedDataDir = path.resolve(dataDir);
   const testRoot = path.dirname(resolvedDataDir);
   const requestedDataDir = extraEnv.CLAUDE_HUB_DATA_DIR;
   const requestedHomeDir = extraEnv.CLAUDE_HUB_HOME_DIR;
-  const requestedAgentLeagueDir = extraEnv.CHUXIN_AGENT_LEAGUE_DIR;
+  const requestedAgentLeagueDir = extraEnv.XRESEARCH_AGENT_LEAGUE_DIR;
   const requestedStudyDir = extraEnv.AGENT_STUDY_DIR;
   const requestedCodexHome = extraEnv.CODEX_HOME;
   const requestedClaudeConfigDir = extraEnv.CLAUDE_CONFIG_DIR;
@@ -83,7 +92,7 @@ function buildIsolatedHubEnv(dataDir, extraEnv = {}, baseEnv = process.env, {
       throw new Error('isolated Hub requires CLAUDE_HUB_HOME_DIR inside the test root');
     }
     if (requestedAgentLeagueDir && !_isPathInside(testRoot, requestedAgentLeagueDir)) {
-      throw new Error('isolated Hub requires CHUXIN_AGENT_LEAGUE_DIR inside the test root');
+      throw new Error('isolated Hub requires XRESEARCH_AGENT_LEAGUE_DIR inside the test root');
     }
     if (requestedStudyDir && !_isPathInside(testRoot, requestedStudyDir)) {
       throw new Error('isolated Hub requires AGENT_STUDY_DIR inside the test root');
@@ -101,7 +110,7 @@ function buildIsolatedHubEnv(dataDir, extraEnv = {}, baseEnv = process.env, {
   delete safeExtraEnv.CLAUDE_HUB_DATA_DIR;
   delete safeExtraEnv.CLAUDE_HUB_HOME_DIR;
   delete safeExtraEnv.DEEPSEEK_API_KEY;
-  delete safeExtraEnv.CHUXIN_AGENT_LEAGUE_DIR;
+  delete safeExtraEnv.XRESEARCH_AGENT_LEAGUE_DIR;
   delete safeExtraEnv.AGENT_STUDY_DIR;
   delete safeExtraEnv.CLAUDE_HUB_E2E_WINDOW_MODE;
   const env = {
@@ -109,14 +118,20 @@ function buildIsolatedHubEnv(dataDir, extraEnv = {}, baseEnv = process.env, {
     ...safeExtraEnv,
     CLAUDE_HUB_DATA_DIR: allowExternalState && requestedDataDir ? requestedDataDir : resolvedDataDir,
     CLAUDE_HUB_HOME_DIR: requestedHomeDir || path.join(resolvedDataDir, 'isolated-home'),
-    CHUXIN_AGENT_LEAGUE_DIR: requestedAgentLeagueDir || path.join(resolvedDataDir, 'agent-league'),
+    XRESEARCH_AGENT_LEAGUE_DIR: requestedAgentLeagueDir || path.join(resolvedDataDir, 'agent-league'),
     // 2026-09-08：学习任务的产物目录也必须隔离。合并位撞到过 —— 测试 Hub 起来后
-    // 自动开了学习任务，真的往 C:\Vibe\AIgent-study 写了新文件。
+    // 自动开了学习任务，真的往 C:\Workspace\AIgent-study 写了新文件。
     AGENT_STUDY_DIR: requestedStudyDir || path.join(resolvedDataDir, 'agent-study'),
     DEEPSEEK_API_KEY: allowExternalState && requestedKey ? requestedKey : '',
     CLAUDE_HUB_E2E_WINDOW_MODE: windowMode,
   };
   if (windowMode === 'hidden') env.CLAUDE_HUB_E2E = '1';
+  // 2026-09-25 起 Claude / Codex 默认跑 PTY。带原生协议夹具的用例测的就是原生后端，
+  // 这里替它们打开回退开关；显式传了 CLAUDE_HUB_AGENT_RUNTIME 的以调用方为准。
+  if (!safeExtraEnv.CLAUDE_HUB_AGENT_RUNTIME
+      && (safeExtraEnv.CLAUDE_HUB_CODEX_APP_SERVER_FIXTURE || safeExtraEnv.CLAUDE_HUB_CLAUDE_STREAM_FIXTURE)) {
+    env.CLAUDE_HUB_AGENT_RUNTIME = 'native';
+  }
   return env;
 }
 
@@ -251,11 +266,12 @@ async function launchIsolatedHub({
   extraEnv = {},
   executablePath = ELECTRON_EXE,
   allowExternalState = false,
-  windowMode = 'visible',
+  windowMode = 'background',
   entryPath = HUB_ROOT,
 } = {}) {
   if (!dataDir) throw new Error('dataDir required');
   if (!port) throw new Error('port required');
+  windowMode = effectiveWindowMode(windowMode);
 
   const env = buildIsolatedHubEnv(dataDir, extraEnv, process.env, {
     allowExternalState,
@@ -282,6 +298,11 @@ async function launchIsolatedHub({
 
   const pid = child.pid;
   if (!pid) throw new Error(`[${label}] spawn failed, no PID`);
+  // Test Hubs yield the CPU to the person using the production Hub. Children
+  // (renderers, CLI fixtures) inherit a below-normal priority class on Windows.
+  if (process.env.HUB_TEST_PRIORITY !== 'normal' && os.constants.priority) {
+    try { os.setPriority(pid, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
+  }
 
   const logLines = [];
   child.stdout?.on('data', d => {
@@ -433,6 +454,7 @@ async function gracefulQuit(hub, { timeoutMs = 20_000, allowAlreadyExited = fals
         error.exit = cleanExit;
         throw error;
       }
+      _recordRealHubRun(hub);
       return cleanExit;
     }
     await _waitMs(200);
@@ -443,6 +465,16 @@ async function gracefulQuit(hub, { timeoutMs = 20_000, allowAlreadyExited = fals
   error.termination = termination;
   error.logTail = hub.log ? hub.log().slice(-30).join('\n') : '';
   throw error;
+}
+
+// Evidence for the commit guard (~/.claude/scripts/unified_bash_guard.py): a
+// real isolated Hub was launched, driven over CDP and shut down cleanly.
+function _recordRealHubRun(hub) {
+  try {
+    fs.writeFileSync(path.join(os.tmpdir(), '.e2e-tested'), JSON.stringify({
+      ts: Date.now() / 1000, tool: 'hub-launcher', label: hub.label || 'hub', windowMode: hub.windowMode || null,
+    }));
+  } catch {}
 }
 
 // 列出 CDP 上所有 page targets（用于挑选 main window 来 attach）

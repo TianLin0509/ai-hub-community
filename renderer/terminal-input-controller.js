@@ -2,6 +2,26 @@
 
 const IMAGE_PATH_RE = /[A-Za-z]:[\\/](?:[^\\/:*?"<>|\r\n\s]+[\\/])*[^\\/:*?"<>|\r\n\s]+\.(?:png|jpe?g|gif|webp|bmp)(?![A-Za-z0-9])/gi;
 
+// xterm sends capability/color replies through onData too. These bytes must
+// reach the PTY, but are not edits to the user's draft or approval answers.
+function isTerminalProtocolReply(data) {
+  return typeof data === 'string' && /^(?:\x1b\](?:10|11|12);rgb:[0-9a-f/]+(?:\x07|\x1b\\)|\x1b\[[?>]?[\d;]*c|\x1b\[\d+;\d+R|\x1b\[[IO])+$/.test(data);
+}
+
+function isCodexOwnedTranscript(session, terminal) {
+  return !!(require('../core/ai-kinds').isCodexCliKind(session?.kind)
+    && terminal?.buffer?.active?.type === 'alternate' && terminal.modes?.mouseTrackingMode
+    && terminal.modes.mouseTrackingMode !== 'none');
+}
+
+function navigateCodexTranscript(session, terminal, direction) {
+  if (!isCodexOwnedTranscript(session, terminal)) return false;
+  const key = { up:'\x1b[5~', down:'\x1b[6~', top:'\x1b[1;5H', bottom:'\x1b[1;5F' }[direction];
+  if (!key) return false;
+  terminal.input(key, true);
+  return true;
+}
+
 // 剪贴板里「复制的文件」在 Windows 上是 CF_HDROP。2026-08-28 用真 Electron 41 实测
 // 三条事实，决定了下面两条读取路径：
 //   1. 复制文件后 clipboard.availableFormats() 只有 ['text/uri-list']，readText() 是
@@ -81,7 +101,7 @@ function createTerminalInputController({ document, window, ipcRenderer, clipboar
     if (text) cached.terminal.paste(text);
   }
   
-  // 卡片优化（2026-05-03 道雪）：自定义输入框（contenteditable div）粘贴图片支持。
+  // 卡片优化（2026-05-03 maintainer）：自定义输入框（contenteditable div）粘贴图片支持。
   //   xterm 的 paste handler 不能用（xterm.paste 是 xterm-only API）。这里给
   //   普通 session 浮动输入框 / AI 群聊输入框等 contenteditable 元素用：
   //   1. 监听 'paste' 事件（contenteditable 默认会 fire，与 xterm 不同）
@@ -128,9 +148,12 @@ function createTerminalInputController({ document, window, ipcRenderer, clipboar
 
   // Text paste is normalized to text/plain; image-only paste still inserts a
   // saved local image path. Keep the public name for existing callers.
-  function attachContenteditablePasteImage(inputEl) {
+  // options.collapseLongText：长文本收成 CLI 式粘贴块（见 composer-paste-chips.js）。
+  // 只有会话输入框打开——群聊输入框有十几处直接读 innerText，接入前得先把它们收口。
+  function attachContenteditablePasteImage(inputEl, options = {}) {
     if (!inputEl || inputEl.dataset.imgPasteBound === '1') return;
     inputEl.dataset.imgPasteBound = '1';
+    const collapseLongText = options.collapseLongText === true;
     inputEl.addEventListener('paste', async (e) => {
       // 文件优先于文本和图片：复制一个文件时 text/plain 本来就是空的，而图片文件
       // 若先被图片分支接走，会被另存成一张新截图、丢掉用户真正想引用的那条路径。
@@ -145,6 +168,12 @@ function createTerminalInputController({ document, window, ipcRenderer, clipboar
       const plainText = getPastePlainText(e);
       if (plainText) {
         e.preventDefault();
+        const chips = collapseLongText ? require('./composer-paste-chips.js') : null;
+        if (chips && chips.shouldCollapsePaste(plainText)) {
+          chips.insertPasteChip(inputEl, plainText.replace(/\r\n?/g, '\n'), { document, window });
+          inputEl.dispatchEvent(new EventCtor('input', { bubbles: true }));
+          return;
+        }
         insertContenteditableText(inputEl, plainText);
         return;
       }
@@ -320,6 +349,9 @@ function createTerminalInputController({ document, window, ipcRenderer, clipboar
 }
 
 module.exports = {
+  isTerminalProtocolReply,
+  isCodexOwnedTranscript,
+  navigateCodexTranscript,
   clipboardFilePathFromNative,
   clipboardFilePathsFromPasteEvent,
   createTerminalInputController,

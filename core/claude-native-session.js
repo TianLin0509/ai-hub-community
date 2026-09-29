@@ -3,11 +3,13 @@ const { EventEmitter } = require('events');
 const { randomUUID, createHash } = require('crypto');
 const { ClaudeStreamClient, protocolError } = require('../main/claude-stream-client');
 const { resolveHandshakeBudget } = require('./claude-handshake-timeout.js');
-const { claudeTranscriptTurns, tailClaudeRecords } = require('./claude-native-transcript');
+const { CONTINUATION_ORIGINS, claudeTranscriptTurns, tailClaudeRecords } = require('./claude-native-transcript');
 const { findNativeClaudeHistory, processExists, renameNativeClaudeHistory } = require('./claude-native-history');
 const ownership = require('./native-session-ownership');
 const { ClaudeNativeActivities } = require('./claude-native-activities');
 const { NATIVE_CONFIRMATION_MS } = require('./native-confirmation-policy');
+const { probeSubmissionReceipt } = require('./claude-receipt-probe');
+const { noteSessionStart } = require('./claude-model-discovery');
 
 const BACKEND = 'claude-stream-json';
 const TERMINAL = new Set(['completed', 'failed', 'interrupted']);
@@ -78,7 +80,7 @@ class ClaudeNativeSession extends EventEmitter {
       const terminal = TERMINAL.has(savedStatus);
       const status = terminal ? savedStatus : 'unknown';
       this.records.set(saved.submissionId, { ...saved, fingerprint: saved.promptFingerprint, status,
-        accepted: saved.accepted === true || terminal, started: terminal, durable: true,
+        accepted: saved.accepted === true || (saved.accepted == null && terminal), started: terminal, durable: true,
         messages: new Map((saved.transcriptMessages || []).map(frame => [frame.uuid || frame.message?.id, frame])),
         resolve() {}, reject() {}, ack: Promise.resolve(null) });
       if (!terminal && !saved.reconciliation) this.unreconciled = true;
@@ -101,6 +103,7 @@ class ClaudeNativeSession extends EventEmitter {
     this.tasks = new Map();
     this.activities = new ClaudeNativeActivities(options);
     this.activities.recoverTasks(options.restoredRuntime?.backgroundTasks || [], this.runtime.epoch - 1, false);
+    this.activities.settleUnknown('hub', { persist: false });
     for (const record of this.records.values()) this.activities.rememberTools(record);
     if (this.activities.pending().length) this.unreconciled = true;
     this.completedResultIds = new Set([...this.records.values(), ...this.activities.records.values()]
@@ -173,6 +176,9 @@ class ClaudeNativeSession extends EventEmitter {
   }
 
   update(patch) {
+    // 这里清的是一次**还在期限内**的停止，所以判据必须是正面证据：所有活儿都
+    // 拿到了终局回执。判成 unknown 不是证据 —— 用它清停止等于替 Claude 说「停好了」。
+    // 超时之后那条另有出路（clearUnresolvedStop），不靠这里放宽。
     if (this.cancellation?.hadWork && !this.active && !this.activities.pending().length && !this.tasks.size) {
       clearTimeout(this.cancellation.timer); this.cancellation = null;
       patch = { ...patch, cancellation:null };
@@ -182,10 +188,22 @@ class ClaudeNativeSession extends EventEmitter {
     if (['completed', 'failed', 'interrupted', 'idle'].includes(patch.state)) this.foregroundState = patch.state;
     if (!this.active && !this.unreconciled && this.runtime.connection === 'connected'
         && patch.connection !== 'disconnected') {
-      const busy = backgroundTasks.some(task => DELEGATED.has(task.type)) || backgroundActivities.length;
+      const busy = backgroundTasks.some(task => DELEGATED.has(task.type)) || this.activities.live().length;
       const requests = patch.requests || this.runtime.requests;
-      patch = { ...patch, state: requests.length ? 'waiting' : busy ? 'running' : this.foregroundState,
-        ...(busy && !requests.length ? { reason: 'Claude 后台活动仍在进行；用户回合已单独结算' } : {}) };
+      // 一次没得到确认的停止推翻的正是「它还在跑」这个判断本身，所以它压过
+      // busy。继续报「工作中」会把核对按钮挡掉，用户就没有任何出口了 —— 这正是
+      // 2026-09-23 那个会话被锁死两个多小时的那一步。
+      const unresolvedStop = !!this.cancellation?.unresolved;
+      // 没有活儿在跑、却还留着一条没有结局的后台活动：同样是待核对，不是工作中。
+      const staleActivity = !busy && !requests.length
+        && backgroundActivities.some(activity => activity.state === 'unknown');
+      patch = unresolvedStop
+        ? { ...patch, state: 'unknown',
+          reason: patch.reason || this.runtime.reason || 'Claude 停止结果待核对；不会自动重发' }
+        : staleActivity
+          ? { ...patch, state: 'unknown', reason: patch.reason || 'Claude 后台活动没有结果，需要核对；不会自动重发' }
+          : { ...patch, state: requests.length ? 'waiting' : busy ? 'running' : this.foregroundState,
+            ...(busy && !requests.length ? { reason: 'Claude 后台活动仍在进行；用户回合已单独结算' } : {}) };
     }
     this.runtime = { ...this.runtime, ...patch, recoveryReady: this.recoveryReady,
       backgroundTasks, backgroundActivities,
@@ -247,9 +265,7 @@ class ClaudeNativeSession extends EventEmitter {
       launchArgs.push('--resume', this.options.resumeSessionId);
       if (this.options.fork) launchArgs.push('--fork-session', '--session-id', this.sessionId);
     } else launchArgs.push('--session-id', this.sessionId);
-    // resume / fork 要先把父会话整段读进来才会回握手，等待预算必须跟着历史体积走。
-    // 写死 60 秒的后果见 core/claude-handshake-timeout.js 的注释：大会话必然被判成
-    // 连接失败，然后一分钟后自己连上 —— 报错和恢复都发生在用户看不懂的地方。
+    // 保留 resume / fork 的容错预算；历史体积不能证明初始化的实际耗时或阶段。
     const handshake = resolveHandshakeBudget({
       resumeSessionId: this.options.resumeSessionId,
       homeDir: this.options.homeDir,
@@ -257,7 +273,7 @@ class ClaudeNativeSession extends EventEmitter {
     if (handshake.reason) {
       this.update({ connection: 'connecting', state: 'unknown', reason: handshake.reason });
       // 放宽过的预算要留痕：出问题时第一个要回答的问题就是「当时到底等了多久」。
-      this.backstage.note('载入历史', `${handshake.reason}；握手等待放宽到 ${Math.round(handshake.timeoutMs / 1000)} 秒`);
+      this.backstage.note('连接 Claude', `${handshake.reason}；握手超时上限 ${Math.round(handshake.timeoutMs / 1000)} 秒（非预计耗时）`);
       console.log(`[claude-native] handshake budget ${Math.round(handshake.timeoutMs / 1000)}s for ${handshake.bytes} bytes of history (${this.sessionId})`);
     }
     const clientOptions = {
@@ -298,12 +314,18 @@ class ClaudeNativeSession extends EventEmitter {
       this.update({ requests, state: this.unreconciled ? 'unknown' : requests.length ? 'waiting'
         : this.active?.accepted ? 'running' : this.runtime.state });
     });
+    const handshakeStarted = performance.now();
     try {
       const starting = this.client.start();
       // Bind the exact spawned child before awaiting the protocol handshake.
       starting.catch(() => undefined);
       if (this.lease && this.pid) ownership.bindServerPid(this.lease, this.pid);
       await starting;
+      if (this.options.resumeSessionId) {
+        const elapsedMs = Math.round(performance.now() - handshakeStarted);
+        this.backstage.note('Claude 连接完成', `initialize 已确认，耗时 ${elapsedMs} ms；历史 ${handshake.bytes} bytes`);
+        console.log(`[claude-native] initialize completed in ${elapsedMs}ms (${this.sessionId})`);
+      }
     } catch (error) {
       await this.client.close();
       if (this.lease) { ownership.releaseThread(this.lease); this.lease = null; }
@@ -311,6 +333,7 @@ class ClaudeNativeSession extends EventEmitter {
     }
     if (this.closed) throw protocolError('Claude session closed during startup', 'CLAUDE_CLOSED');
     for (const activity of this.activities.pending()) this.activities.save(activity);
+    this.activities.saveUnsavedSettlements();
     // The engine reports whether Fast is actually serving this session and why
     // not. That is the only honest source for the speed chip: the launch
     // overlay is a request, and a subscription or model can refuse it.
@@ -322,6 +345,20 @@ class ClaudeNativeSession extends EventEmitter {
       state: this.unreconciled ? 'unknown' : this.runtime.requests.length ? 'waiting' : 'idle',
       reason: this.unreconciled ? '上次 Claude 提交状态需要核对；不会自动重发' : null });
     this.print('\nClaude 已连接。请使用 Hub 输入框发送消息；本页显示引擎原始输出。\n');
+    // 连上之后立刻把上一轮的悬空提交核对掉。Codex 有 thread/read 可以直接问
+    // App Server「上一轮到底结束了没」，stream-json 没有对应的协议调用，所以
+    // 这里读原生 transcript —— 这是 Hub 手上唯一的证据来源。
+    // 不这么做的后果实测过：2026-09-20 17:04 那一轮被打断后，会话每次打开都
+    // 连上（2388 ms），却永远停在 unknown，只有用户亲手发一条消息才会解开。
+    // 群聊和无人值守席位不在这条路上：那里「停下来等人看一眼」是有意的关卡。
+    // 普通会话用的是和「核对上次任务」按钮完全相同的语义（2026-09-24 用户决定：
+    // 不要再弹这个提示）。此刻 start() 已确认旧 writer 退出、新进程刚起，旧提交
+    // 不可能还在跑；按钮能做的也只是登记「不重发、不追认成功」，让人去点毫无增益。
+    if (this.unreconciled && !this.options.meetingId && this.options.autonomous !== true) {
+      try { await this.reconcileFromHistory({ source: 'hub' }); }
+      // 失败就让它看得见：状态留在「待核对」，界面上的核对按钮仍然可用。
+      catch (error) { this.emit('action-error', '上次任务自动核对未完成：' + error.message); }
+    }
     this.refreshContext().catch(error => this.emit('action-error', '上下文用量读取失败：' + error.message));
     return this.runtime;
   }
@@ -373,13 +410,13 @@ class ClaudeNativeSession extends EventEmitter {
       this.cancelBeforeSend(record);
       return record.ack;
     }
-    const busy = !!this.active || this.activities.pending().length > 0 || this.queue[0] !== record;
+    const busy = !!this.active || this.activities.live().length > 0 || this.queue[0] !== record;
     this.pump().catch(error => this.disconnect(error));
     return busy ? this.receipt(record) : record.ack;
   }
 
   async pump() {
-    if (this.active || this.activities.pending().length || this.closed || this.unreconciled || this.reconnectPending || this.client.failure || !this.queue[0]?.durable) return;
+    if (this.active || this.activities.live().length || this.closed || this.unreconciled || this.reconnectPending || this.client.failure || !this.queue[0]?.durable) return;
     const record = this.queue.shift();
     this.active = record;
     record.status = 'submitting';
@@ -389,7 +426,7 @@ class ClaudeNativeSession extends EventEmitter {
     // reconnect button. A crash here still leaves a non-idle snapshot, so a
     // restore continues to demand reconciliation; disconnect() still marks the
     // record unknown when the outcome really is unknown.
-    this.update({ state: 'starting', reason: '正在提交给 Claude', turnId: record.userMessageId,
+    this.update({ state: 'starting', reason: '正在提交给 Claude', turnId: record.userMessageId, apiRetry: null,
       userMessageId: record.userMessageId, submission: this.receipt(record), requests: [], startedAt: 0, completedAt: 0 });
     // Integration must persist this identity before handing bytes to the engine.
     try {
@@ -410,14 +447,66 @@ class ClaudeNativeSession extends EventEmitter {
       return;
     }
     record.timer = setTimeout(() => {
-      if (record.accepted || this.active !== record) return;
-      this.disconnect(protocolError('Claude 未确认本条输入，提交状态待核对', 'CLAUDE_SUBMISSION_TIMEOUT'));
+      this.receiptDeadline(record).catch(error => this.disconnect(error));
     }, this.options.submissionTimeoutMs || NATIVE_CONFIRMATION_MS);
     try {
       record.writeStarted = true;
       await this.client.write({ type: 'user', uuid: record.userMessageId, session_id: this.sessionId,
         parent_tool_use_id: null, message: { role: 'user', content: record.content }, origin: { kind: 'human' } });
     } catch (error) { this.disconnect(error); }
+  }
+
+  // The deadline asks the engine's own transcript before calling the input
+  // unknown: an API outage delays the echo, not the receipt.
+  async receiptDeadline(record) {
+    if (record.accepted || this.active !== record) return;
+    if (await this.confirmFromHistory(record)) return;
+    if (record.accepted || this.active !== record || this.closed) return;
+    this.disconnect(protocolError('Claude 未确认本条输入，提交状态待核对', 'CLAUDE_SUBMISSION_TIMEOUT'));
+  }
+
+  // Receipt from the transcript row the engine wrote under this exact UUID and
+  // content (see claude-receipt-probe). Only the same live writer and epoch may
+  // use it; it never replays and never settles the turn's outcome.
+  confirmFromHistory(record) {
+    if (record.accepted) return Promise.resolve(true);
+    if (this.active !== record || !record.writeStarted || this.closed) return Promise.resolve(false);
+    if (record.historyProbe) return record.historyProbe;
+    const client = this.client, epoch = this.runtime.epoch;
+    record.historyProbe = (async () => {
+      let verdict;
+      try {
+        verdict = await probeSubmissionReceipt(this.historyPath(), { sessionId: this.sessionId,
+          userMessageId: record.userMessageId, matches: row => this.echoMatches(row, record) });
+      } catch (error) {
+        this.emit('diagnostic', { type: 'receipt-probe-failed', message: error.message });
+        return false;
+      }
+      if (record.accepted) return true;
+      if (verdict !== 'received' || this.closed || this.active !== record || this.client !== client
+          || this.runtime.epoch !== epoch || client?.failure || this.reconnecting || this.reconnectPending) return false;
+      this.acceptSubmission(record, 'history');
+      return true;
+    })().finally(() => { record.historyProbe = null; record.historyProbedAt = Date.now(); });
+    return record.historyProbe;
+  }
+
+  acceptSubmission(record, source) {
+    clearTimeout(record.timer);
+    const recovery=this.lateAckRecovery;
+    const confirmedLateAck=recovery?.record === record && recovery.client === this.client
+      && recovery.epoch === this.runtime.epoch && this.runtime.connection === 'connected'
+      && !this.client.failure && !this.reconnecting && !this.reconnectPending;
+    record.accepted = true; record.status = 'accepted'; record.acceptedAt = Date.now(); record.receiptSource = source;
+    this.lifecycle('submission-accepted', record, { status: 'accepted', accepted: true, acceptedAt: record.acceptedAt }, () => {
+      // Exact receipt from the same live writer proves delivery even after the
+      // local acknowledgement deadline. It cannot clear other failures.
+      if (confirmedLateAck) {this.unreconciled=false;this.lateAckRecovery=null;}
+      this.update({ state: this.unreconciled ? 'unknown' : 'starting', submission: this.receipt(record),
+        reason: this.unreconciled ? 'Claude 已确认收到输入，但连接或历史状态仍需核对' : 'Claude 已收到输入，等待执行' });
+    });
+    if (source === 'history') this.backstage.note('提交确认', 'Claude 原生历史已记录这条输入；等待模型开始输出');
+    record.resolve(this.receipt(record));
   }
 
   cancelBeforeSend(record) {
@@ -447,7 +536,11 @@ class ClaudeNativeSession extends EventEmitter {
       state: 'unknown', requests: [], reason: error.message,
       ...(this.runtime.cancellation ? {cancellation:{...this.runtime.cancellation,status:'unknown'}} : {}),
       submission: record ? this.receipt(record) : this.runtime.submission });
-    this.emit('action-error', error.message);
+    // A missing receipt is a state, already shown by the composer, and a late
+    // echo or transcript row may still clear it. As an action error it lingered
+    // in red after that recovery -- only a reconnect cleared it.
+    if (error.code === 'CLAUDE_SUBMISSION_TIMEOUT') this.backstage.note('提交确认', error.message, 'warning');
+    else this.emit('action-error', error.message);
   }
 
   message(message) {
@@ -477,7 +570,33 @@ class ClaudeNativeSession extends EventEmitter {
     }
     if (message.type === 'user' && !message.parent_tool_use_id && message.message?.role === 'user') {
       if (message.origin?.kind && message.origin.kind !== 'human') {
+        // 后台任务通知只有在引擎空闲时才会被取出来单独跑一轮；主回合还在跑的
+        // 时候 CLI 直接把它并进当前这一轮（原生 transcript 里记作
+        // queue-operation remove / reason=absorbed_mid_turn），**不会**再回一条
+        // 属于它自己的 result。为这种通知开一条后台活动就等于开一条永远等不到
+        // 结局的记录 —— 2026-09-23 实测积了 77 条，把会话锁死在假的「工作中」，
+        // 输出还因为归属歧义整轮不渲染。判据用引擎自己的判据：主回合在不在跑。
+        //
+        // 只对「续跑」类来源成立。channel 这种远端输入是另一场对话，它自己会有
+        // result，并进主回合等于把别人的话算成这一轮的回答。
+        const host = this.active;
+        if (CONTINUATION_ORIGINS.has(message.origin.kind) && host && !TERMINAL.has(host.status) && !this.unreconciled) {
+          // 不把通知正文塞进卡片：原生历史侧同样把 <task-notification> 过滤掉，
+          // 这里只是让后续输出继续归主回合，不新增一行看不懂的用户消息。
+          this.emit('item', { message, userMessageId: host.userMessageId });
+          this.emit('diagnostic', { type: 'absorbed-continuation', origin: message.origin.kind,
+            userMessageId: host.userMessageId });
+          return;
+        }
+        // 引擎一次只跑一轮：新的注入回合开始，上一条还没结局的注入回合就不会
+        // 再有结局。判它 unknown 并让状态变成「待核对」，卡片上立刻出现核对按钮，
+        // 而不是无声无息地攒成一串永远清不掉的「工作中」。
+        const abandoned = this.activities.abandonStale();
         const activity = this.activities.inject(message);
+        if (abandoned.length) {
+          this.activities.settleUnknown();
+          this.backstage.note('后台活动', `${abandoned.length} 条后台活动没有收到结果，已记为结果未知；不会重发`);
+        }
         this.update({});
         this.emit('item', { message, userMessageId: activity.userMessageId });
         return;
@@ -490,28 +609,34 @@ class ClaudeNativeSession extends EventEmitter {
         record.status = 'content-mismatch';
         this.update({ submission: this.receipt(record) }); return;
       }
-      clearTimeout(record.timer);
-      const recovery=this.lateAckRecovery;
-      const confirmedLateAck=recovery?.record === record && recovery.client === this.client
-        && recovery.epoch === this.runtime.epoch && this.runtime.connection === 'connected'
-        && !this.client.failure && !this.reconnecting && !this.reconnectPending;
-      record.accepted = true; record.status = 'accepted'; record.acceptedAt = Date.now();
-      this.lifecycle('submission-accepted', record, { status: 'accepted', accepted: true, acceptedAt: record.acceptedAt }, () => {
-        // An exact echo from the same live writer proves receipt even after
-        // the local acknowledgement deadline. It cannot clear other failures.
-        if (confirmedLateAck) {this.unreconciled=false;this.lateAckRecovery=null;}
-        this.update({ state: this.unreconciled ? 'unknown' : 'starting', submission: this.receipt(record),
-          reason: this.unreconciled ? 'Claude 已确认收到输入，但连接或历史状态仍需核对' : 'Claude 已收到输入，等待执行' });
-      });
-      record.resolve(this.receipt(record));
+      // Already accepted from the transcript: the echo only confirms it again.
+      if (record.accepted) { clearTimeout(record.timer); return; }
+      this.acceptSubmission(record, 'echo');
       return;
     }
     if (message.type === 'system') {
+      // Every engine frame while the input is unconfirmed is a cheap moment to
+      // look for the transcript row -- the first ones (init, status=requesting)
+      // arrive within half a second, long before a slow API lets the echo out.
+      if (record && !record.accepted && record.writeStarted && !record.historyProbe
+          && Date.now() - (record.historyProbedAt || 0) >= 2000) {
+        this.confirmFromHistory(record).catch(error => this.emit('diagnostic', { type: 'receipt-probe-failed', message: error.message }));
+      }
+      if (message.subtype === 'api_retry' && record) {
+        this.update({ apiRetry: { attempt: Number(message.attempt) || 0, maxRetries: Number(message.max_retries) || 0,
+          status: Number(message.error_status) || null, error: message.error || null,
+          delayMs: Number(message.retry_delay_ms) || 0, at: Date.now(), userMessageId: record.userMessageId } });
+      }
       if (message.subtype === 'init') {
         this.update({ actualModel: message.model, capabilities: {
           tools: message.tools || [], commands: message.slash_commands || [], mcpServers: message.mcp_servers || [],
           skills: message.skills || [], plugins: message.plugins || [],
+          cliVersion: message.claude_code_version || '',
           epoch: this.runtime.epoch, sessionId: this.sessionId, observedAt: Date.now() } });
+        // init 帧是本地 CLI 版本唯一可靠的来源，模型下拉靠它判断哪些新模型被
+        // 版本挡住；顺带在缓存过期时后台刷新官方模型目录，这样「开一个新会话」
+        // 就足以发现当天发布的新模型。内部不抛、不等网络。
+        noteSessionStart(message.claude_code_version);
       }
       if (message.subtype === 'task_started' && message.task_id) {
         const owner = this.activities.toolOwners.get(message.tool_use_id) || outputOwner;
@@ -554,6 +679,7 @@ class ClaudeNativeSession extends EventEmitter {
       this.emit('diagnostic', { type: 'unassociated-event', messageType: message.type }); return;
     }
     if (message.type === 'assistant' || message.type === 'stream_event') {
+      if (this.runtime.apiRetry) this.update({ apiRetry: null });
       this.activities.capture(outputOwner, message);
       if (message.type === 'assistant') this.persistLateOutput(outputOwner, message);
       if (outputOwner === record && !record.started && !message.parent_tool_use_id && !this.activities.ambiguous) {
@@ -602,7 +728,7 @@ class ClaudeNativeSession extends EventEmitter {
       record.completedAt = completedAt;
       if (message.uuid) this.completedResultIds.add(message.uuid);
       this.active = null;
-      this.update({ state: status, completedAt,
+      this.update({ state: status, completedAt, apiRetry: null,
         requests: this.runtime.requests.filter(r => r.submissionId !== record.submissionId), reason,
         submission: this.receipt(record), resultId: message.uuid });
     });
@@ -671,6 +797,16 @@ class ClaudeNativeSession extends EventEmitter {
       : requests.length ? 'waiting' : this.active?.accepted ? 'running' : this.runtime.state } : {}) });
   }
 
+  // 超时的停止只剩一个「结果待核对」的标记，它不该继续冒充「正在停止」去挡住
+  // 核对和后续操作。清掉它不等于认定 Claude 已停 —— 状态仍然是 unknown。
+  clearUnresolvedStop() {
+    if (!this.cancellation?.unresolved) return false;
+    clearTimeout(this.cancellation.timer);
+    this.cancellation = null;
+    this.update({ cancellation: null });
+    return true;
+  }
+
   async interrupt() {
     if (this.cancellation) return {requested:true};
     if (this.runtime.connection === 'connecting' && this.client) {
@@ -685,7 +821,7 @@ class ClaudeNativeSession extends EventEmitter {
       pending.cancelled = true;
       return { requested: true, cancelledBeforeSend: true };
     }
-    if (!this.active && !this.runtime.requests.length && !this.activities.pending().length && !this.tasks.size) {
+    if (!this.active && !this.runtime.requests.length && !this.activities.live().length && !this.tasks.size) {
       return { interrupted: false, reason: 'idle' };
     }
     const client=this.client, epoch=this.runtime.epoch, requestedAt=Date.now();
@@ -699,6 +835,9 @@ class ClaudeNativeSession extends EventEmitter {
       if (this.cancellation !== cancellation || this.client !== client || this.runtime.epoch !== epoch) return;
       // Elapsed time cannot prove that the writer stopped. Keep consuming the
       // same stream so its terminal receipt can still settle this cancellation.
+      // 但从这一刻起它不再是「正在停止」，而是「停止结果待核对」：写入闸门照旧
+      // 关着，核对这条出路必须打开，否则会话再也回不来。
+      cancellation.unresolved = true;
       this.update({state:'unknown',reason:error.message,
         cancellation:{...this.runtime.cancellation,status:'unknown'}});
       this.emit('action-error', error.message);
@@ -884,6 +1023,16 @@ class ClaudeNativeSession extends EventEmitter {
     return require('./claude-native-usage').claudeAccountUsageFromControl(response);
   }
 
+  // The quota watchdog's wait rides on the runtime snapshot rather than a
+  // channel of its own, so the composer reads "等额度恢复" from the same place
+  // it reads every other state of this session (main/claude-quota-resume.js).
+  setQuotaWait(wait) {
+    if (this.closed) return;
+    const current = this.runtime.quotaWait || null;
+    if (JSON.stringify(current) === JSON.stringify(wait || null)) return;
+    this.update({ quotaWait: wait || null });
+  }
+
   historyPath() { return findNativeClaudeHistory(this.sessionId, this.options); }
 
   async refreshContext() {
@@ -935,7 +1084,7 @@ class ClaudeNativeSession extends EventEmitter {
     if (this.reconnecting) throw new Error('Claude 正在重连');
     const priorClose = this.closePromise;
     if (priorClose) await priorClose;
-    const busy = this.active || this.activities.pending().length || this.tasks.size;
+    const busy = this.active || this.activities.live().length || this.tasks.size;
     if (stopActive && busy && !this.unreconciled) await this.interrupt();
     if (!stopActive && !this.unreconciled && busy) throw new Error('请先停止当前任务，再重连');
     this.reconnecting = true; this.recoveryReady = false;
@@ -956,6 +1105,7 @@ class ClaudeNativeSession extends EventEmitter {
       this.activities.recoverTasks(this.tasks.values(), this.runtime.epoch);
       this.queue = []; this.active = null; this.seen.clear(); this.tasks.clear();
       this.activities.reset();
+      this.activities.settleUnknown();
       this.runtime = initialRuntime(this.sessionId, this.runtime);
       this.options = { ...this.options, restoredRuntime: null, fork: false,
         resumeSessionId: this.historyPath() ? this.sessionId : undefined };
@@ -987,17 +1137,66 @@ class ClaudeNativeSession extends EventEmitter {
     if (!this.unreconciled && this.runtime.connection !== 'disconnected') return;
     if (this.configurationChange) throw new Error('正在更新设置，请稍后发送');
     if (this.cancellation) throw new Error('正在停止，请等待结束后发送');
+    // A timed-out input the live writer did record is still being worked on
+    // (2026-09-24: 529 retries). Reconnecting here killed it mid-retry and the
+    // engine resumed with "No response requested."; confirm it instead and let
+    // the new prompt queue behind it.
+    const late = this.lateAckRecovery;
+    if (late?.client === this.client && late.record === this.active && this.runtime.connection === 'connected'
+        && await this.confirmFromHistory(late.record) && !this.unreconciled) return;
     // reconnect waits for this owned writer to exit before resuming the UUID.
     await this.reconnect();
+    await this.reconcileFromHistory({ source: 'hub' });
+  }
+
+  // 唯一的「拿原生历史核对上一轮」入口：连上时的自动核对、手点核对、发送前恢复都走它。
+  //
+  // 它只读 transcript，只登记 do-not-replay，既不重发旧消息，也不把旧任务改写成
+  // 成功 —— 记录状态留在 unknown，reconciliation 里存下看到的证据字串
+  // （received / not-found / history-missing）。
+  //
+  // 前置条件是这个 writer 刚由 start() 建立：start() 会先确认旧 writer 已退出
+  // （CLAUDE_WRITER_ACTIVE）并抢到归属，所以此刻没有别的进程在追加这份历史，
+  // 旧提交也不可能还在跑。
+  //
+  // 2026-09-24 以前，连上时的自动路径更严：找不到历史、或只剩后台活动时停下来
+  // 等人点「核对上次任务」。那个按钮能做的也只是同样的登记，用户明确说这种提示
+  // 很蠢、不要再弹，所以普通会话自动走完整语义。群聊 / 无人值守席位在 _start 里
+  // 根本不自动核对，那里停下来防重复派工的关卡不变。
+  async reconcileFromHistory({ source = 'hub' } = {}) {
+    if (this.closed) throw new Error('会话正在关闭，未核对');
+    if (this.configurationChange) throw new Error('正在更新设置，请稍后核对');
+    // 停止还在期限内就等它确认；已经超时的那一条本身就是「结果待核对」，
+    // 再用它去挡核对，就是用问题挡住问题唯一的出路。
+    if (this.cancellation && !this.cancellation.unresolved) throw new Error('正在停止，请等待结束后核对');
+    if (this.reconnecting || this.runtime.connection !== 'connected') throw new Error('连接尚未就绪，未核对');
+    if (!this.unreconciled && !(this.recoveryRecords().length || this.cancellation)) {
+      return { reconciled: 0, pending: 0, skipped: 0 };
+    }
     const epoch = this.runtime.epoch;
     const records = this.recoveryRecords();
+    if (!records.length) {
+      // 没有待核对的记录（例如只剩一个持久化的「上一轮没结论」）就是没有东西要核对。
+      this.recoveryReady = true;
+      this.unreconciled = false;
+      this.clearUnresolvedStop();
+      this.update({ state: this.runtime.requests.length ? 'waiting' : 'idle', reason: null });
+      return { reconciled: 0, pending: 0, skipped: 0 };
+    }
     const evidence = await require('./claude-recovery-history').inspect(this, records);
     if (this.closed || this.runtime.epoch !== epoch || this.runtime.connection !== 'connected') {
-      throw new Error('恢复期间连接已变化，未发送');
+      throw new Error('恢复期间连接已变化，未核对；本次没有发送任何消息');
     }
-    for (const record of records) this.reconcile({ ...record, resolution: 'do-not-replay' },
-      { source: 'hub', history: evidence.get(record.userMessageId) || 'no-user-message' });
+    this.recoveryReady = true;
+    // 核对就是这次没确认的停止的结论：不重发、也不追认成功。先解掉它，
+    // 后面每一次 update 才能发布真实状态而不是继续念「停止结果待核对」。
+    this.clearUnresolvedStop();
+    for (const record of records) {
+      const history = evidence.get(record.userMessageId) || 'no-user-message';
+      this.reconcile({ ...record, resolution: 'do-not-replay' }, { source, history });
+    }
     this.backstage.note('会话恢复', '旧任务结果保留原状；未重发旧消息，可以接收新消息。');
+    return { reconciled: records.length, pending: this.recoveryRecords().length, skipped: 0 };
   }
 
   reconcile(identity, { source = 'user', history } = {}) {

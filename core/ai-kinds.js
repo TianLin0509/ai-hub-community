@@ -46,6 +46,9 @@ const KIND_LABELS = {
   glm: '智谱',
 };
 
+// Initial titles used by provider harnesses, shared with auto-title eligibility.
+const HARNESS_LABELS = { qwen: '千问 · Qwen Code', 'deepseek-acp': 'DeepSeek · 原生 Harness', glm: '智谱 · ZCode' };
+
 // ---------------------------------------------------------------------------
 // Claude 家族（共享 Claude Code CLI 引擎）：
 //   - claude         主 Claude（~/.claude）
@@ -153,7 +156,7 @@ function canonicalAiKind(rawKind) {
 }
 
 // ---------------------------------------------------------------------------
-// 群聊席位（slot）单一真理源 — 2026-05-03 道雪
+// 群聊席位（slot）单一真理源 — 2026-05-03 maintainer
 //   背景：群聊允许 5 选 3 + 同 kind 多份（如 3 claude），按 kind 区分总结人/@对象
 //     不可行（dropdown 只显 1 个 Claude，sidByKind 永远返回首匹配）。改为按 slot 索引
 //     绑定 stable id，@解析、prompt、归档全用 slot id。
@@ -202,6 +205,7 @@ module.exports = {
   CLAUDE_WEB_KINDS,
   CODEX_WEB_KINDS,
   KIND_LABELS,
+  HARNESS_LABELS,
   CLAUDE_FAMILY,
   CLAUDE_HOOK_BACKED,
   PASTE_SENSITIVE_KINDS,

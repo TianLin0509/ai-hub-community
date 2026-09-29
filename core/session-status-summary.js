@@ -7,6 +7,7 @@ const {
   RUNTIME_RUNNING,
   RUNTIME_STARTING,
   RUNTIME_WAITING,
+  RUNTIME_UNKNOWN,
   getSessionRuntimeTruth,
 } = require('./session-runtime-truth.js');
 const { hasStreamDisconnectIssue } = require('./stream-disconnect.js');
@@ -53,6 +54,7 @@ function sessionSpeedLabel(session) {
 }
 
 function sessionContextLeft(session) {
+  if (session?.contextPct == null || session.contextPct === '') return null;
   const used = Number(session && session.contextPct);
   if (!Number.isFinite(used)) return null;
   return Math.max(0, Math.min(100, Math.round(100 - used)));
@@ -113,7 +115,7 @@ const COMPOSER_CTX_DANGER_AT = 90;
 // 上下文预算环。percent 是**已用**百分比（与 status-event 下发的 contextPct 同义），
 // 与 card-session-status 的 ctx 读同一个字段，不另起一套算法。
 function composerContextRing(session) {
-  const raw = Number(session && session.contextPct);
+  const raw = session?.contextPct == null || session.contextPct === '' ? NaN : Number(session.contextPct);
   if (!Number.isFinite(raw)) {
     return { visible: false, percent: null, level: 'ok', title: '', ariaLabel: '' };
   }
@@ -293,27 +295,57 @@ function buildComposerStatusModel(session, options = {}) {
   }
   if (session?.runtimeBackend === 'claude-stream-json') {
     const snapshot = session.nativeRuntime || {};
+    // A quota wait outranks the `failed` line it grew out of: the turn did fail,
+    // but what the user needs to know is that it is scheduled to continue and
+    // when. A wait nobody can see is the failure mode this feature exists to
+    // avoid, so it gets the status line and its own two buttons.
+    if (snapshot.quotaWait) {
+      const wait = require('./claude-quota-watchdog').describeQuotaWait(snapshot.quotaWait, now);
+      if (wait) {
+        // The ■ button doubles as "取消自动继续" here. Stopping something that
+        // is about to happen is the same gesture as stopping something running,
+        // and reusing it keeps one stop affordance instead of two.
+        return { state: snapshot.quotaWait.status === 'stale' ? COMPOSER_STATUS_DEAD : COMPOSER_STATUS_WAITING,
+          text: wait.text, detail: wait.detail, quickReplies: [],
+          action: wait.canResume ? { kind: 'quota-resume-now', label: '现在继续' } : null,
+          canStop: wait.canCancel, stopIntent: 'quota-cancel', runtime };
+      }
+    }
     // Work in flight (starting/running) takes the shared working line, the same
     // "Claude 正在工作 · 12s" Codex shows. Only states that need the user or
     // report a result get a Claude-specific message here.
-    // 连接中且引擎自己说了在干什么（例如「正在载入历史（17.1 MB）」），就照实说。
-    // 干等一句「等待连接响应」时，用户分不出「在读 17 MB 历史」和「卡死了」——
-    // 2026-09-18 群聊分支那次就是这么被误读成功能坏了的。
+    // reason 是 Hub 的连接状态说明，不代表 Claude 提供了历史读取进度。
     const connecting = snapshot.connection !== 'disconnected' && snapshot.connection !== 'connected';
     const loadingText = connecting && snapshot.reason ? String(snapshot.reason) : '';
-    const labels = { unknown: snapshot.connection === 'disconnected' ? '连接已断开' : (loadingText || '等待连接响应'),
+    // 连上了却仍是 unknown，说的是「上一轮提交没有结论」，不是连接没回应。
+    // 2026-09-22 实测：一个 20.1 MB 的会话 2388 ms 就 initialize 完成，界面却一直
+    // 念「等待连接响应」，detail 还被清空 —— 用户只能干等一个永远不会变的字。
+    // 这里把真实原因念出来并给一个按钮，剩下的自动核对在 ClaudeNativeSession 里做。
+    const stalled = snapshot.state === 'unknown' && snapshot.connection === 'connected';
+    // 一条提交拿不到「收到」证据、写入者却还活着：直接发下一条，Main 会自动恢复，
+    // 用不着人核对（2026-09-24 用户决定不再为此弹提示）。只说事实，不给按钮、不亮警示色。
+    const unconfirmedSend = stalled && !snapshot.cancellation
+      && (snapshot.submission?.sendStatus || snapshot.submission?.status) === 'unknown';
+    const labels = { unknown: snapshot.connection === 'disconnected' ? '连接已断开'
+        : unconfirmedSend ? 'Claude 未确认收到上一条，可直接继续发送'
+        : stalled ? '上次任务状态待核对' : (loadingText || '等待连接响应'),
       waiting: 'Claude 在等你回答', failed: '本轮执行失败', interrupted: '已停止' };
     if (labels[snapshot.state]) {
       // New composer sends recover in Main; no manual receipt-review action.
-      return { state: snapshot.state === 'interrupted' ? COMPOSER_STATUS_READY
+      return { state: snapshot.state === 'interrupted' || unconfirmedSend ? COMPOSER_STATUS_READY
           : snapshot.state === 'failed' ? COMPOSER_STATUS_DEAD : COMPOSER_STATUS_WAITING,
         text: labels[snapshot.state],
         detail: snapshot.state === 'waiting'
           ? (snapshot.requests || []).map(require('./claude-native-runtime').claudeRequestSummary).join('; ') || snapshot.reason || ''
-          : snapshot.state === 'unknown' ? '' : snapshot.reason || '',
+          : unconfirmedSend ? ''
+          : stalled ? snapshot.reason || ''
+            : snapshot.state === 'unknown' ? '' : snapshot.reason || '',
         quickReplies: [],
-        action: null,
-        canStop: snapshot.connection === 'connected' && snapshot.state === 'waiting', runtime };
+        // 核对只读原生历史、只做「不重发」的登记，所以可以是一个按钮；
+        // 它不会替用户重发旧消息，也不会把旧任务说成成功。剩下需要它的只有
+        // 群聊/无人值守席位的关卡和一次没确认的停止。
+        action: stalled && !unconfirmedSend ? { kind: 'claude-reconcile', label: '核对上次任务' } : null,
+        canStop: snapshot.connection === 'connected' && (snapshot.state === 'waiting' || unconfirmedSend), runtime };
     }
   }
   const liveQuestion = !native && session?.runtimeBackend !== 'claude-stream-json' && options.liveQuestion && options.liveQuestion.waiting
@@ -324,7 +356,11 @@ function buildComposerStatusModel(session, options = {}) {
   // liveQuestion 是同一件事的第二个证据来源，两者取或。
   const needsRespond = sessionNeedsUserInput(session) || !!liveQuestion;
   const disconnected = native ? truth.state === 'unknown' || truth.connection === 'disconnected' : hasStreamDisconnectIssue(session);
-  const state = native && truth.state === 'failed' && !disconnected
+  // A failed provider turn does not terminate a PTY. Its prompt remains usable;
+  // only process loss / a transport issue warrants a reconnect action.
+  const livePtyFailure = session?.agentRuntime === 'pty' && !session._processLost
+    && session.status !== 'dormant' && truth.state === 'failed';
+  const state = (native || livePtyFailure) && truth.state === 'failed' && !disconnected
     ? COMPOSER_STATUS_READY : composerStateFor(runtime.state, { needsRespond, disconnected });
   const provider = runtime.provider || 'AI';
 
@@ -335,9 +371,18 @@ function buildComposerStatusModel(session, options = {}) {
     };
     const startedAt = composerRunStartedAt(session, truth);
     const elapsed = startedAt > 0 && now >= startedAt ? formatRuntimeSeconds(now - startedAt) : '';
+    const apiRetry = session?.runtimeBackend === 'claude-stream-json'
+      ? require('./claude-native-runtime').claudeApiRetrySummary(session.nativeRuntime) : '';
+    // Before the model streams there is no startedAt; the wait the user feels
+    // runs from the send, so count from there.
+    const submittedAt = Number(session?.nativeRuntime?.submission?.submittedAt) || 0;
+    const waited = apiRetry && !elapsed && submittedAt > 0 && now >= submittedAt ? formatRuntimeSeconds(now - submittedAt) : '';
     return {
       state,
-      text: elapsed ? `${provider} 正在工作 · ${elapsed}` : `${provider} 正在工作`,
+      text: apiRetry ? `${apiRetry}${elapsed || waited ? ' · 已等 '+(elapsed || waited) : ''}`
+        : truth.state === 'starting' && ['codex-app-server','claude-stream-json'].includes(session?.runtimeBackend)
+        ? `${provider} ${['accepted','confirmed'].includes(session.nativeRuntime?.submission?.status || session.nativeRuntime?.submission?.sendStatus) ? '已收到 · 等待输出' : '正在提交'}${elapsed ? ' · '+elapsed : ''}`
+        : elapsed ? `${provider} 正在工作 · ${elapsed}` : `${provider} 正在工作`,
       detail: runtime.visibleDetail || '',
       quickReplies: [],
       action: null,
@@ -402,14 +447,18 @@ function buildComposerStatusModel(session, options = {}) {
     };
   }
 
+  if (runtime.state === RUNTIME_UNKNOWN) return {
+    state: 'unknown', text: '状态未知', detail: '', quickReplies: [],
+    action: null, canStop: false, runtime,
+  };
   // 就绪：runtime.meta 在 COMPLETED 下就是 formatCompletionAge 的结果（「2 分钟前」）。
   const age = runtime.state === RUNTIME_COMPLETED ? String(runtime.meta || '').trim() : '';
   return {
     state: COMPOSER_STATUS_READY,
     text: native && truth.state === 'interrupted' ? '上一轮已中断 · 可继续发送'
-      : native && truth.state === 'failed' ? '上一轮执行失败 · 可继续发送'
+      : (native || livePtyFailure) && truth.state === 'failed' ? '上一轮执行失败 · 可继续发送'
       : age ? `已就绪 · ${age}完成上一轮` : '已就绪',
-    detail: native && truth.state === 'failed' ? truth.evidence || '' : '',
+    detail: (native || livePtyFailure) && truth.state === 'failed' ? truth.evidence || session.lastError || '' : '',
     quickReplies: [],
     action: age ? { kind: 'scroll-latest', label: '查看上一轮 ↑' } : null,
     canStop: false,

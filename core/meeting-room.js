@@ -2,13 +2,13 @@ const { v4: uuid } = require('uuid');
 const meetingStore = require('./meeting-store');
 
 // scene 白名单 (与 core/group-chat-scenes.js SCENE_REGISTRY keys 同步)
-//   2026-05-04 道雪: 'dev' 加入 (plan-dev-scenario.md MVP)
+//   2026-05-04 maintainer: 'dev' 加入 (plan-dev-scenario.md MVP)
 const MEETING_MODES = ['general', 'research', 'dev'];
 
 // 模式 → 房名前缀。前端 +号菜单点击两模式入口时透传 mode,createMeeting 据此生成
 // 自带语义的房名(每模式独立计数,后期允许用户重命名)。未传 mode 时默认 'general' 走
 // 通用 AI 群聊路径,保持向后兼容(老调用 createMeeting() 不会炸)。
-// 2026-05-05 道雪：前缀从历史 "X 群聊" 简化为 "X"，避免侧边栏 ~12 字符上限截断编号。
+// 2026-05-05 maintainer：前缀从历史 "X 群聊" 简化为 "X"，避免侧边栏 ~12 字符上限截断编号。
 //   协作语义已由群聊标题 + sub session 头像承载。
 const MODE_TITLE_PREFIX = {
   general: '通用',
@@ -55,7 +55,7 @@ class MeetingRoomManager {
     const mode = MODE_TITLE_PREFIX[opts.mode] ? opts.mode : 'general';
     const titlePrefix = 'AI 群聊';
     const seq = ++this._counters[mode];
-    // meeting-create-modal（2026-05-05 道雪）：用户在 Modal 房名输入框填了非空字符串
+    // meeting-create-modal（2026-05-05 maintainer）：用户在 Modal 房名输入框填了非空字符串
     //   则用用户的（trim 后），否则走默认编号 title。modal 留空 = undefined，向后兼容。
     const customTitle = typeof opts.title === 'string' ? opts.title.trim() : '';
     const userRenamed = customTitle ? true : !!opts.userRenamed;
@@ -159,7 +159,7 @@ class MeetingRoomManager {
       _timeline: [...m._timeline],
       _cursors: { ...m._cursors },
       slotSpecs: Array.isArray(m.slotSpecs) ? m.slotSpecs.slice() : null,
-      // 2026-05-05 道雪：fallback 从 'pilot' 改 'free'（与新建路径一致），主驾入口废弃。
+      // 2026-05-05 maintainer：fallback 从 'pilot' 改 'free'（与新建路径一致），主驾入口废弃。
       mode: ['pilot', 'free'].includes(m.mode) ? m.mode : 'free',
       groupChat: !!m.groupChat,
       groupMode: m.groupMode || 'deliberation',
@@ -179,7 +179,7 @@ class MeetingRoomManager {
       _timeline: [...m._timeline],
       _cursors: { ...m._cursors },
       slotSpecs: Array.isArray(m.slotSpecs) ? m.slotSpecs.slice() : null,
-      // 2026-05-05 道雪：fallback 从 'pilot' 改 'free'（与新建路径一致），主驾入口废弃。
+      // 2026-05-05 maintainer：fallback 从 'pilot' 改 'free'（与新建路径一致），主驾入口废弃。
       mode: ['pilot', 'free'].includes(m.mode) ? m.mode : 'free',
       groupChat: !!m.groupChat,
       groupMode: m.groupMode || 'deliberation',
@@ -325,24 +325,22 @@ class MeetingRoomManager {
       if (meetingData.researchMode) {
         scene = 'research';
       } else if (typeof meetingData.title === 'string') {
-        // 2026-05-05 道雪：title 兜底推断 — 历史 bug：renderer schedulePersist 漏 scene
-        //   字段写残 state.json，重启后所有 AI 群聊退化为 general（含投研，丢 LinDangAgent MCP）。
+        // 2026-05-05 maintainer：title 兜底推断 — 历史 bug：renderer schedulePersist 漏 scene
+        //   字段写残 state.json，重启后所有 AI 群聊退化为 general（含投研，丢 ResearchAgent MCP）。
         //   schedulePersist 已修但既有 state.json 字段已丢，按 title 前缀推断兜底。
         //   匹配新前缀 "投研" / "开发" / "通用" 与历史前缀。
-        if (meetingData.title.includes('投研')) scene = 'research';
-        else if (meetingData.title.includes('开发')) scene = 'dev';
+          if (meetingData.title.includes('开发')) scene = 'dev';
         else scene = 'general';
       } else {
         scene = 'general';
       }
     } else if (scene === 'general' && typeof meetingData.title === 'string') {
-      // 2026-05-05 道雪：scene-title 不一致检测 — 上次 fix（line 上方）的 title 兜底
+      // 2026-05-05 maintainer：scene-title 不一致检测 — 上次 fix（line 上方）的 title 兜底
       //   只在 scene 字段缺失时生效，但用户既存 state.json 里 scene 已被旧版错写为 'general'，
       //   兜底救不到。补一道：scene='general' 但 title 含 '投研'/'开发' 视为旧版数据迁移
       //   遗留的不一致 → 强制按 title 修正。新建 AI 群聊不会触发（title 由 createMeeting 按
       //   scene 一致生成）；用户极罕见地把通用群聊起名"投研笔记"会被误判，但权衡正确率优先。
-      if (meetingData.title.includes('投研')) scene = 'research';
-      else if (meetingData.title.includes('开发')) scene = 'dev';
+      if (meetingData.title.includes('开发')) scene = 'dev';
     }
     // 标记 mutate 入参，让调用方（main.js boot 时 stateStore.save(bootMeetings)）写盘的
     //   meetings 数组也带上修正后的 scene —— 否则 boot 时 save 用原始 bootMeetings 会把
@@ -387,12 +385,12 @@ class MeetingRoomManager {
       // meeting-create-modal（2026-05-01）：从 state.json 还原 slot 规格；
       //   老 meeting 没有此字段时为 null，渲染逻辑会按 subSessions 顺序兜底分配 slot。
       slotSpecs: meetingData.slotSpecs.slice(),
-      // 2026-05-05 道雪：BUG fix —— 旧版兜底 'pilot' 导致 free 模式 AI 群聊重启后被错误改成主驾。
+      // 2026-05-05 maintainer：BUG fix —— 旧版兜底 'pilot' 导致 free 模式 AI 群聊重启后被错误改成主驾。
       //   主驾入口已废弃，所有未识别 mode 一律 fallback 'free'。同时强制把老 meeting 的 mode='pilot'
       mode: 'free',
       // free-mode（2026-05-04）：null=首次未初始化，空数组=用户已清空（Q11=A）
       participants: Array.isArray(meetingData.participants) ? meetingData.participants : null,
-      // 串行工作流配置（2026-06-17 道雪）：重启恢复
+      // 串行工作流配置（2026-06-17 maintainer）：重启恢复
       serialWorkflow: cloneSerialWorkflow(meetingData.serialWorkflow),
       _timeline: [],
       _cursors: {},

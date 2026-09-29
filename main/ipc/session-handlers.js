@@ -24,6 +24,19 @@ function isSafeNativeSessionId(value) {
   return typeof value === 'string' && NATIVE_SESSION_ID_RE.test(value);
 }
 
+// 旧 PTY 的退出回调把会话从 SessionManager 里删掉，才算收尾完成（归属已释放）。
+function waitForSessionGone(sessionManager, sessionId, { timeoutMs = 15000, intervalMs = 50 } = {}) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const check = () => {
+      if (!sessionManager.getSession(sessionId)) return resolve(true);
+      if (Date.now() >= deadline) return resolve(false);
+      setTimeout(check, intervalMs);
+    };
+    check();
+  });
+}
+
 function registerSessionIpc(ipcMain, deps) {
   const {
     registerSessionForTap = () => {},
@@ -38,6 +51,7 @@ function registerSessionIpc(ipcMain, deps) {
   require('./codex-backstage-handlers').registerCodexBackstageIpc(ipcMain, { sessionManager });
 
   const lastResizeBySid = new Map();
+  ipcMain.handle('hub:feedback-ping', () => ({ok:true}));
   ipcMain.handle('session:open-status', (_event, sessionId) => {
     const owner = sessionManager._openOwners?.()?.owner(sessionId, true);
     if (!owner || (owner.pid === process.pid && sessionManager.getSession(sessionId))) return {available:true};
@@ -371,7 +385,7 @@ function registerSessionIpc(ipcMain, deps) {
   // failed picker interaction from making Hub claim a model that never became active.
   ipcMain.handle('confirm-session-model-switch', async (_event, payload = {}) => {
     const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : '';
-    const modelId = typeof payload.modelId === 'string' ? payload.modelId.trim() : '';
+    let modelId = typeof payload.modelId === 'string' ? payload.modelId.trim() : '';
     const session = sessionId ? sessionManager.getSession(sessionId) : null;
     if (!session) return { ok: false, error: 'session-not-found', message: '会话不存在或已经休眠' };
     if (['codex-app-server','acp'].includes(session.runtimeBackend)) {
@@ -388,6 +402,7 @@ function registerSessionIpc(ipcMain, deps) {
         ? isClaudeModelSelection(modelId)
         : false;
     if (!valid) return { ok: false, error: 'invalid-model', message: '该模型不属于当前 CLI 的会话模型目录' };
+    if (kind === 'codex') modelId = require('../../core/model-options').normalizeCodexSessionModel(modelId);
 
     const displayName = String(payload.displayName || modelId)
       .replace(/[\0\r\n]+/g, ' ')
@@ -483,14 +498,16 @@ function registerSessionIpc(ipcMain, deps) {
     if (!old) {
       return { ok: false, error: 'session-not-found', message: '会话不存在或已经休眠' };
     }
-    if (old.purpose !== 'chuxin-research' && (old.kind === 'codex' || old.kind === 'codex-resume')) {
-      const native = (sessionManager.getNativeSession?.(sessionId) || sessionManager.getNativeCodex?.(sessionId));
+    const nativeCodex = sessionManager.getNativeSession?.(sessionId) || sessionManager.getNativeCodex?.(sessionId);
+    // PTY 跑的 Codex 与 Claude 一样按原生会话 id 恢复；只有 App Server 会话在这里重连。
+    if (old.purpose !== 'xresearch-research' && (old.runtimeBackend === 'codex-app-server' || (nativeCodex && !nativeCodex.isCliProvider))) {
+      const native = nativeCodex;
       if (!native) return {ok:false,error:'unmanaged-codex',message:'旧 Codex 进程尚未接管；请先在原会话结束工作并关闭，再恢复'};
       return native.reconnect().then(()=>sessionManager.getSession(sessionId))
         .catch(error=>({ok:false,message:error.message}));
     }
-    if (old.purpose === 'chuxin-research') {
-      return { ok: false, error: 'protected-session', message: '初心投研任务不能从这里重启' };
+    if (old.purpose === 'xresearch-research') {
+      return { ok: false, error: 'protected-session', message: '扩展投研任务不能从这里重启' };
     }
     const native = sessionManager.getNativeClaude?.(sessionId);
     if (native) {
@@ -513,10 +530,21 @@ function registerSessionIpc(ipcMain, deps) {
 
       const resumeMeta = buildSessionResumeMeta(old);
       lastResizeBySid.delete(sessionId);
-      sessionManager.closeSession(sessionId);
-      return Promise.resolve(resumeSession(resumeMeta)).then((fresh) => (
-        fresh || { ok: false, error: 'resume-failed', message: '原生会话恢复失败' }
-      )).catch((error) => ({
+      // 2026-09-26：kill 只是发信号，旧 PTY 的收尾（保存记录、停 writer、释放归属）在
+      // 退出回调里。以前 close 后立刻 resume，撞上「该会话已在本 Hub 打开」而失败；
+      // 随后旧进程退出又按「用户关闭」发出 session-closed，会话连卡片带记录一起被抹掉。
+      // 改走休眠：群聊成员身份与卡片都保留，等收尾完成再按原会话恢复。
+      const suspended = sessionManager.suspendSession(sessionId, { reason: 'restart' });
+      if (!suspended || !suspended.ok) {
+        return { ok: false, error: suspended?.error || 'restart-suspend-failed',
+          message: `会话重启失败：${suspended?.message || '无法停止旧进程'}` };
+      }
+      return waitForSessionGone(sessionManager, sessionId).then((gone) => {
+        if (!gone) return { ok: false, error: 'restart-exit-timeout', message: '会话重启失败：旧进程迟迟未退出，稍后可从休眠恢复' };
+        return Promise.resolve(resumeSession(resumeMeta)).then((fresh) => (
+          fresh || { ok: false, error: 'resume-failed', message: '原生会话恢复失败' }
+        ));
+      }).catch((error) => ({
         ok: false,
         error: 'resume-failed',
         message: `会话重启失败：${error && error.message ? error.message : String(error)}`,
@@ -555,5 +583,6 @@ function registerSessionIpc(ipcMain, deps) {
 
 module.exports = {
   isSafeNativeSessionId,
+  waitForSessionGone,
   registerSessionIpc,
 };

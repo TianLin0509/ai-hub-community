@@ -10,7 +10,7 @@
 // 注意 basename 不是原样使用，要先过 slugifyWorkDirName（见下）——中文/大写/空格/超长
 // 目录名都会得到和直觉不同的 slug。2026-07-28 用真实 kimi.exe 在隔离 KIMI_CODE_HOME
 // 里实测验证（与 kimi 二进制内嵌源码逐字节一致）：
-//   C:/Vibe/_scratch/hub-kimi-slug-test/AI-HUB路径重构排查-LongNameTest
+//   C:/Workspace/_scratch/hub-kimi-slug-test/AI-HUB路径重构排查-LongNameTest
 //     → wd_ai-hub--longnametest_c6a3d5e233e0
 //   …/Very-Long Project Name With Spaces And MANY Uppercase Letters 2026
 //     → wd_very-long-project-name-with-spaces-and-m_32b105079b26

@@ -49,7 +49,7 @@ const RESUME_META_FIELDS = [
   'branchAutoTitlePending',
   'purpose',
   'researchSessionId',
-  'chuxinTaskId',
+  'xresearchTaskId',
   'heroIds',
   'promptPolicyVersion',
   'hiddenFromSidebar',
@@ -59,6 +59,7 @@ const RESUME_META_FIELDS = [
   // 同一条历史断连；真正的新失败由 transcript occurrenceId 重新升起。
   '_connectionIssueAck',
 ];
+const PTY_CLEARED_FIELDS = new Set(['runtimeBackend', 'nativeRuntime', 'nativeConfig']);
 
 function withoutVolatileTimestamps(entity) {
   if (!entity || typeof entity !== 'object') return entity;
@@ -80,7 +81,11 @@ function mergeResumeMetaFields(list, previousSessions) {
     if (!newSession || !newSession.hubId) continue;
     const oldSession = oldByHubId.get(newSession.hubId);
     if (!oldSession) continue;
+    // PTY 会话故意把原生后端与快照置空（isCodexSession 靠它们区分）。原生时代的
+    // 会话在 PTY 里恢复后若继承旧值，落盘记录会仍是原生后端，重启后被当成原生会话。
+    const ptyOwned = newSession.agentRuntime === 'pty';
     for (const field of RESUME_META_FIELDS) {
+      if (ptyOwned && PTY_CLEARED_FIELDS.has(field)) continue;
       if (field === 'userRenamed' && oldSession.userRenamed === true) {
         newSession.userRenamed = true;
         continue;
@@ -139,7 +144,7 @@ function buildMeetingsForState(meetingList, meetingManager) {
       covenantText: (typeof rendererMeeting.covenantText === 'string' && rendererMeeting.covenantText)
         ? rendererMeeting.covenantText
         : (authoritative.covenantText || ''),
-      // 串行工作流配置（2026-06-17 道雪）：state.json 是 boot 恢复源，必须带上；
+      // 串行工作流配置（2026-06-17 maintainer）：state.json 是 boot 恢复源，必须带上；
       //   优先 renderer 值，兜底后端权威（update-meeting 已写入 authoritative）
       serialWorkflow: (rendererMeeting.serialWorkflow && typeof rendererMeeting.serialWorkflow === 'object')
         ? rendererMeeting.serialWorkflow

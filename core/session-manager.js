@@ -16,6 +16,7 @@ const {
 const {
   normalizeDeepSeekModel,
   normalizeCodexSessionModel,
+  isCodexConversationModelId,
   deepseekDisplayName,
   normalizeLegacyDeepSeekClaudeModel,
   legacyDeepSeekClaudeDisplayName,
@@ -28,8 +29,9 @@ const { ensureMemoryLink } = require('./claude-memory-link.js');
 const { isSyntheticUserEntry, textFromContent } = require('./synthetic-user-filter.js');
 const { TerminalSnapshot } = require('./terminal-snapshot.js');
 const { CodexXtermScrollbackRewriter } = require('./codex-xterm-scrollback-rewriter.js');
+const { PtyOutputDelivery } = require('./pty-output-delivery.js');
 const { compareLatestReplyDesc } = require('./session-recency.js');
-const { detectHostShellTakeover } = require('./host-shell-detector.js');
+const { detectHostShellTakeover, detectCodexThreadEnded } = require('./host-shell-detector.js');
 const {
   DEFAULT_CLAUDE_MCP_PROFILE,
   WIRELESS_MCP_NAMES,
@@ -56,10 +58,6 @@ const {
 // 取 1MB 是给带 ANSI 色彩的 TUI 输出留余量（同样内容字节数可达纯文本数倍）。
 // 代价很小：每会话一个字符串，远低于多留一个 xterm + WebGL 实例。
 const RING_BUFFER_BYTES = 1024 * 1024;
-// A synchronized ConPTY repaint normally completes in the same burst. If a
-// malformed/truncated frame does not, fail open quickly so preservation logic
-// can never make the CLI appear frozen.
-const TERMINAL_REWRITER_FLUSH_MS = 50;
 
 // 试过两种"起点对齐"，都已放弃，记在这里免得有人再走一遍：
 //   1) 对齐到最后一次 \x1b[2J 全屏清屏 —— 实测是**倒退**。Codex/Kimi 每次重绘都清屏，
@@ -121,7 +119,7 @@ function _loadConfigValues() {
     CODEX_API_KEY: config.codexApiKey,
     CODEX_API_BASE_URL: config.codexApiBaseUrl,
     CODEX_API_MODEL: config.codexApiModel,
-    CODEX_API_PROVIDER: config.codexApiProvider || 'packycode',
+    CODEX_API_PROVIDER: config.codexApiProvider || 'openai-api',
   };
 }
 // 惰性求值：首次使用时加载，之后缓存
@@ -139,6 +137,10 @@ function clearSessionManagerConfigCache() {
  * 必须清干净大小写两套——Hub 进程继承的可能是 Clash/Mihomo 设的 7890，
  * 走代理时长流式请求可能被 60s idle TCP 切断。
  */
+function windowsPowerShellPath() {
+  const candidate = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  return fs.existsSync(candidate) ? candidate : 'powershell.exe';
+}
 function clearProxyEnv(env) {
   delete env.HTTP_PROXY;
   delete env.HTTPS_PROXY;
@@ -157,6 +159,7 @@ function clearProxyEnv(env) {
  * 实际仍可能拾取父进程的另一个代理。
  */
 function applyProxyEnv(env, proxy) {
+  if (!String(proxy || '').trim()) return false;
   clearProxyEnv(env);
   const value = String(proxy || '').trim();
   if (!value) return false;
@@ -175,10 +178,20 @@ function applyProxyEnv(env, proxy) {
  * Codex 0.151 treats that contradictory value as an interactive startup gate,
  * so normalize the child environment to the terminal we actually provide.
  */
-function applyInteractiveTerminalEnv(env) {
+function applyInteractiveTerminalEnv(env, { truecolor = false } = {}) {
   if (!env || typeof env !== 'object') return null;
   const term = String(env.TERM || '').trim().toLowerCase();
   if (!term || term === 'dumb') env.TERM = 'xterm-256color';
+  if (!truecolor) return env.TERM;
+  // xterm.js renders 24-bit RGB. Without this, Codex's diff palette falls back
+  // to saturated indexed colors (or loses its backgrounds on newer versions).
+  env.COLORTERM = 'truecolor';
+  // supports-color on Windows classifies the console as ANSI-16 before it
+  // consults COLORTERM. FORCE_COLOR=3 is its explicit truecolor declaration.
+  // Preserve intentional user overrides, including monochrome output.
+  if (process.platform === 'win32' && env.FORCE_COLOR === undefined && env.NO_COLOR === undefined) {
+    env.FORCE_COLOR = '3';
+  }
   return env.TERM;
 }
 
@@ -247,6 +260,19 @@ function claudePermissionModeArg(opts = {}) {
   return CLAUDE_PERMISSION_MODES.has(requested) ? ` --permission-mode ${requested}` : '';
 }
 
+// Hub 的聊天记录目录始终作为附加目录：「引用会话」让 Claude 读别的会话的记录 md，
+// 它在工作目录之外，默认权限模式下每次都会弹 Read 审批（2026-09-26 真实 haiku 实测）。
+// --add-dir 只让读取免审批，写入仍按原权限模式；恢复时会带回已持久化的 addDirs，所以去重。
+// PTY（默认）、原生（回退）和 PTY 内重启三条启动路径都要带上。
+function claudeNativeAddDirs(requested) {
+  const dirs = Array.isArray(requested) ? requested.filter(Boolean).map(String) : [];
+  const transcriptDir = require('./data-dir').getHubTranscriptDir();
+  try { fs.mkdirSync(transcriptDir, { recursive: true }); } catch {}
+  const seen = new Set(dirs.map(dir => path.resolve(dir).toLowerCase()));
+  if (!seen.has(path.resolve(transcriptDir).toLowerCase())) dirs.push(transcriptDir);
+  return dirs;
+}
+
 function createNativeClaudeDriver(id, kind, opts, cwd, env, legacy) {
   const { ClaudeNativeSession } = require('./claude-native-session');
   const { NativeAgentJournal } = require('./native-agent-journal');
@@ -264,14 +290,14 @@ function createNativeClaudeDriver(id, kind, opts, cwd, env, legacy) {
   if (!legacy && shouldUseClaudeFastSettings(cv, opts)) settings.push(resolveAsarUnpacked('claude-subscription-fast-settings.json'));
   const settingsFile = prepareClaudeSettingsOverlay(settings, {
     directory: path.join(hubDataDir, 'native-agent-settings'), sessionId: id + '-' + require('crypto').randomUUID(),
-    overrides: { fastMode: !legacy && shouldUseClaudeFastSettings(cv, opts) },
+    overrides: { ...require('./agent-user-context').claudeSharedConfig(env,hubDataDir),fastMode: !legacy && shouldUseClaudeFastSettings(cv, opts) },
   });
   const launchArgs = buildClaudeNativeArgs({ model: legacy ? normalizeLegacyDeepSeekClaudeModel(opts.model) : opts.model,
     effort: legacy || process.env.CLAUDE_HUB_NO_EFFORT_MAX === '1' ? null
       : (opts.effort || 'max'),
-    permissionMode: opts.permissionMode || (opts.autonomous === true || legacy ? 'bypassPermissions' : undefined),
+    permissionMode: opts.permissionMode || 'bypassPermissions',
     appendSystemPromptFile: opts.appendSystemPromptFile, settingsFile,
-    addDirs: opts.addDirs, settingSources: opts.settingSources,
+    addDirs: claudeNativeAddDirs(opts.addDirs), settingSources: opts.settingSources,
     mcpConfigPaths: mcp.configPaths || [], strictMcpConfig: mcp.profile !== 'full' });
   const journal = new NativeAgentJournal({ directory: path.join(hubDataDir, 'native-agent-submissions'), sessionId: id });
   const fixture = process.env.CLAUDE_HUB_CLAUDE_STREAM_FIXTURE;
@@ -299,6 +325,67 @@ function createNativeClaudeDriver(id, kind, opts, cwd, env, legacy) {
       commandArgs: [fixture, '--fixture=' + (process.env.CLAUDE_HUB_CLAUDE_FIXTURE_MODE || 'normal')],
       env: { ...env, ELECTRON_RUN_AS_NODE: '1' } } : {}),
   });
+}
+
+// PTY 模式下 Claude 的启动命令。参数与原生驱动共用 buildClaudeNativeArgs，
+// 保证两条后端的模型、思考档、权限、MCP、fast、群聊隔离完全一致。
+//
+// 会话身份尽量在启动前就确定下来，而不是事后按 cwd + 时间去猜 transcript：
+//   新会话      → Hub 生成 uuid，--session-id
+//   fork        → --resume <源> --fork-session --session-id <新 uuid>
+//   已有历史    → --resume <id>
+//   id 已分配但从未开聊（原生时代的懒启动席位）→ --session-id <同一个 id>
+//   --continue / 选择器 → 身份未知，等第一个 hook 上报
+function buildClaudePtyLaunch(id, kind, opts, cwd, env, cv) {
+  const hubDataDir = getHubDataDir();
+  const mcp = buildClaudeMeetingMcpArgs({ cwd, hubDataDir, mcpConfigFile: opts.mcpConfigFile,
+    mcpProfile: opts.mcpProfile || 'full' });
+  const fast = shouldUseClaudeFastSettings(cv, opts);
+  const settings = [];
+  if (opts.meetingId || opts.autonomous === true) settings.push(ensureGroupChatSettings(hubDataDir));
+  if (fast) settings.push(resolveAsarUnpacked('claude-subscription-fast-settings.json'));
+  const { buildClaudeNativeArgs, prepareClaudeSettingsOverlay } = require('./claude-native-launch');
+  const settingsFile = prepareClaudeSettingsOverlay(settings, {
+    directory: path.join(hubDataDir, 'native-agent-settings'), sessionId: id + '-' + require('crypto').randomUUID(),
+    overrides: { fastMode: fast, skipDangerousModePermissionPrompt: true },
+  });
+  const args = buildClaudeNativeArgs({ model: opts.model,
+    effort: process.env.CLAUDE_HUB_NO_EFFORT_MAX === '1' ? null
+      : (CLAUDE_EFFORT_LEVELS.has(opts.effort) ? opts.effort : 'max'),
+    permissionMode: opts.permissionMode || 'bypassPermissions',
+    appendSystemPromptFile: opts.appendSystemPromptFile, settingsFile,
+    addDirs: claudeNativeAddDirs(opts.addDirs), settingSources: opts.settingSources,
+    mcpConfigPaths: mcp.configPaths || [], strictMcpConfig: mcp.profile !== 'full' });
+  const { findNativeClaudeHistory } = require('./claude-native-history');
+  const isUuid = value => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(value || ''));
+  let sessionId = null;
+  let identity;
+  if (opts.forkCCSessionId) {
+    sessionId = require('crypto').randomUUID();
+    // PTY Claude 启动前就预分配了 id，「一轮都没聊过」的源会话也带着 ccSessionId。没有可分支的
+    // 对话时 `--resume <源> --fork-session` 报 No conversation found 并退回 shell（2026-09-26 实测），
+    // Hub 却显示分支已建好。分支一个空对话就是新开一个。
+    identity = findNativeClaudeHistory(opts.forkCCSessionId, { cwd, env })
+      ? ['--resume', opts.forkCCSessionId, '--fork-session', '--session-id', sessionId]
+      : ['--session-id', sessionId];
+  } else if (opts.resumeCCSessionId && isUuid(opts.resumeCCSessionId)) {
+    sessionId = opts.resumeCCSessionId;
+    identity = findNativeClaudeHistory(sessionId, { cwd, env })
+      ? ['--resume', sessionId]
+      : ['--session-id', sessionId];
+  } else if (opts.resumeCCSessionId) {
+    identity = ['--resume', opts.resumeCCSessionId];
+  } else if (opts.useContinue) {
+    identity = ['--continue'];
+  } else if (kind === 'claude-resume' || opts.resumePicker) {
+    identity = ['--resume'];
+  } else {
+    sessionId = require('crypto').randomUUID();
+    identity = ['--session-id', sessionId];
+  }
+  const quote = value => /^[A-Za-z0-9_.:=\/\\-]+$/.test(String(value)) ? String(value) : quotePowerShellLiteral(value);
+  const cmd = ' claude ' + [...identity, ...args].map(quote).join(' ') + '\r\n';
+  return { cmd, sessionId, fast };
 }
 
 function applyClaudeSessionEnv(sessionEnv, cv) {
@@ -406,14 +493,14 @@ function ensureClaudeBypassAndTrust(claudeDir, projectDir) {
   }
 }
 
-// 群聊 CLI 隔离 — 软隔离方案 (2026-05-02 / v2 白名单优化 2026-05-04 道雪)
+// 群聊 CLI 隔离 — 软隔离方案 (2026-05-02 / v2 白名单优化 2026-05-04 maintainer)
 // 目的：群聊成员的 Claude/DeepSeek CLI 启动时,
 //   `--settings <path>`  merge 一份"全 plugin disabled"的 settings.json
 //   （只覆盖 enabledPlugins 字段，不动主目录的 hooks/permissions/statusLine 等）。
 // 不动 CLAUDE_CONFIG_DIR — auto-memory / CLAUDE.md / OAuth 凭证全部继续共享。
 // 仅当 opts.meetingId 存在（即群聊成员）时启用,主桌 Claude 会话不受影响。
 //
-// ⚠ settings 兜底盲区 (v2 修订 · 2026-05-04 道雪):
+// ⚠ settings 兜底盲区 (v2 修订 · 2026-05-04 maintainer):
 //   `enabledPlugins` 仅对 **plugin 内的 skill** 生效。
 //     ✅ 兜得住: superpowers 全家 (plan/brainstorming/TDD/debugging/SDD/post-refactor-verify/
 //        simplify/review/security-review)、code-review/security-guidance/codex/
@@ -499,6 +586,8 @@ function buildClaudeMeetingMcpArgs({
   // Full = 继承全部用户 MCP。research/群聊通信配置仍以额外 config 合并进去，
   // 但不加 strict，否则所谓 Full 实际会把全局 MCP 全部挡掉。
   if (profile === 'full') {
+    const webPlan = buildClaudeMcpProfileArgs({ mcpProfile:profile, cwd, hubDataDir, homeDir, ...(fsModule ? { fsModule } : {}) });
+    if (webPlan.configPath) mandatoryFiles.push(webPlan.configPath);
     return {
       args: mandatoryFiles.length ? ` --mcp-config ${mandatoryFiles.map(quoteConfig).join(' ')}` : '',
       profile,
@@ -567,7 +656,7 @@ function dismissCodexUpdatePrompt(homeDir = process.env.USERPROFILE || process.e
 // dismissCodexRateLimitDialog — 阻止 codex CLI 启动后弹 rate-limit / model-switch
 // dialog（"Press enter to confirm or esc to go back" / "never show again"）。
 //
-// 历史 bug（2026-05-05 道雪 实测确认）：codex 启动后某些条件（rate-limit 接近 / 模型
+// 历史 bug（2026-05-05 maintainer 实测确认）：codex 启动后某些条件（rate-limit 接近 / 模型
 //   配额计数）会弹一个 TUI dialog 拦住 alt-screen 输入。Hub 主路径 sendToPty 的字符
 //   写到 dialog 而不是输入框 → \r 被 dialog 当确认按钮 → prompt 留输入框未提交 →
 //   用户看到"输入框卡 prompt"现象，需手动点 [📤 发送]。
@@ -681,7 +770,7 @@ function getCodexApiHome() {
 
 function ensureCodexApiProfile(cv, projectDir) {
   const codexHome = getCodexApiHome();
-  const provider = cv.CODEX_API_PROVIDER || 'packycode';
+  const provider = cv.CODEX_API_PROVIDER || 'openai-api';
   const baseUrl = cv.CODEX_API_BASE_URL || 'https://api.openai.com/v1';
   const model = cv.CODEX_API_MODEL || DEFAULT_MODEL_BY_KIND.codex;
   const projectKey = path.resolve(projectDir || os.homedir());
@@ -777,8 +866,8 @@ function ensureCodexCwdTrusted(projectDir, configDir = null) {
 
 // These servers are room-scoped. Never leave a persistent copy in the user's
 // global Codex config: an ordinary Codex session must not discover room tools.
-// chuxin_knowledge is a legacy standalone registration removed during launch.
-const CODEX_MANAGED_MCP_NAMES = ['ai-team', 'arena_research', 'chuxin_knowledge'];
+// xresearch_knowledge is a legacy standalone registration removed during launch.
+const CODEX_MANAGED_MCP_NAMES = ['ai-team', 'arena_research', 'xresearch_knowledge'];
 
 function listCodexMcpServerNames(configDir) {
   try {
@@ -803,7 +892,7 @@ function normalizeCodexMcpProfile(value) {
 
 function resolveCodexMcpProfile(kind, value) {
   // 2026-08-29 起 deepseek 也跟着默认 none（原来是 lean）。用户要求新建会话一律
-  // 不加载 MCP —— lean 会让「无线工作区自动放行」把 superran 拉回来，等于没关。
+  // 不加载 MCP —— lean 会让「无线工作区自动放行」把 wireless-sim 拉回来，等于没关。
   const fallback = 'none';
   if (value === undefined || value === null || value === '') return fallback;
   const normalized = String(value).trim().toLowerCase();
@@ -843,7 +932,7 @@ function buildCodexMcpIsolationArgs(configDir, options = {}) {
   if (profile === 'browser') allowed.add('playwright');
   if (profile !== 'none' && (profile === 'wireless' || isWirelessWorkspace(options.cwd))) {
     // 只写 superwireless 是个空转 bug：用户 ~/.codex/config.toml 里这个 server
-    // 实际叫 superran，于是 wireless 档把唯一想留的那个也禁掉了。两个名字都放行。
+    // 实际叫 wireless-sim，于是 wireless 档把唯一想留的那个也禁掉了。两个名字都放行。
     WIRELESS_MCP_NAMES.forEach(name => allowed.add(name));
   }
   return names
@@ -952,15 +1041,16 @@ function ensureCodexMcpEntries(configDir, entries, managedNames = []) {
 function buildNativeCodexOptions(info, opts, env) {
   const home = env.CODEX_HOME || path.join(os.homedir(), '.codex');
   const profile = info.mcpProfile;
-  const configuredNames = listCodexMcpServerNames(home);
+  const sharedConfig = require('./agent-user-context').codexSharedConfig(env,getHubDataDir());
+  const configuredNames = [...new Set([...listCodexMcpServerNames(home),...Object.keys(sharedConfig.mcp_servers||{})])];
   const allowed = new Set(profile === 'full' ? configuredNames.filter(name=>!CODEX_MANAGED_MCP_NAMES.includes(name)) : []);
   if (profile === 'browser') allowed.add('playwright');
   if (profile !== 'none' && (profile === 'wireless' || isWirelessWorkspace(info.cwd))) {
     WIRELESS_MCP_NAMES.forEach(name => allowed.add(name));
   }
-  const entries = profile === 'none' ? [] : (opts.codexMcpEntries || []);
+  const entries = profile === 'none' ? [] : require('./web-roundtable/integration').entries(opts.codexMcpEntries, profile, getHubDataDir());
   entries.forEach(entry => allowed.add(entry.name));
-  const config = {};
+  const config = {...sharedConfig};
   if (require('./chatgpt-web-models').isChatgptWebModel(info.currentModel?.id)) {
     const web = require('./chatgpt-web-integration').requireWebTools(info.currentModel.id);
     config.model_provider = 'openai';
@@ -987,7 +1077,8 @@ function buildNativeCodexOptions(info, opts, env) {
     config['features.fast_mode'] = true;
     config.service_tier = tier === 'standard' ? 'default' : tier;
   }
-  const threadConfig = { model_reasoning_effort:normalizeCodexEffort(info.effort),
+  const threadConfig = { project_root_markers:['.git','.vibe-root'],
+    model_reasoning_effort:normalizeCodexEffort(info.effort),
     'windows.sandbox':'unelevated', 'notice.hide_full_access_warning':true };
   if (info.contextMax) threadConfig.model_context_window = info.contextMax;
   if (opts.codexInstructionFile) threadConfig.model_instructions_file = opts.codexInstructionFile;
@@ -995,11 +1086,12 @@ function buildNativeCodexOptions(info, opts, env) {
   const sandbox = opts.sandbox || 'danger-full-access';
   return {
     mcpProfile:profile,
-    processArgs:Object.entries(config).flatMap(([key,value]) => ['-c',key+'='+JSON.stringify(value)]),
+    processArgs:Object.entries(config).flatMap(([key,value]) => ['-c',key+'='+require('./agent-user-context').codexTomlValue(value)]),
     threadParams:{cwd:info.cwd,model:info.currentModel.id,approvalPolicy,sandbox,config:threadConfig},
     turnParams:{model:info.currentModel.id,effort:normalizeCodexEffort(info.effort),
       ...(tier && tier !== 'inherit' ? {serviceTier:tier === 'standard' ? 'default' : tier} : {})},
     resumeId:(opts.useResume || info.kind === 'codex-resume') ? opts.codexSid : null,
+    resumePath:opts.resumeTranscriptPath || null,
     forkId:opts.codexForkSid || null,
     picker:!opts.lazyStart && !opts.codexSid && (info.kind === 'codex-resume' || opts.codexResumePicker),
     resumeLatest:!opts.lazyStart && opts.useResume && !opts.codexSid,
@@ -1009,6 +1101,23 @@ function buildNativeCodexOptions(info, opts, env) {
 function sharedCodexRuntimeEnabled() { return false; }
 
 class SessionManager extends EventEmitter {
+  async _syncCodexAccount(driver,info) {
+    if (!driver.options.resolveAccount || driver.closed) return null;
+    if (driver.accountSyncRequest) return driver.accountSyncRequest;
+    driver.accountSyncRequest = driver.enqueueSend(intent=>driver.followGlobalAccount(intent));
+    try {
+      await driver.accountSyncRequest;
+      const target=driver.options.resolveAccount();
+      return {sessionId:info.id,profile:driver.options.accountId,pending:target.id!==driver.options.accountId};
+    } finally { driver.accountSyncRequest=null; }
+  }
+  async syncCodexAccounts() {
+    const entries=[...this.sessions.values()].filter(s=>s.pty?.options?.resolveAccount && !s.pty.closed);
+    return Promise.all(entries.map(async ({pty,info})=>{
+      try { return await this._syncCodexAccount(pty,info); }
+      catch(error){pty.emit('action-error','账号切换未完成：'+error.message);return {sessionId:info.id,error:error.message};}
+    }));
+  }
   sessions = new Map();
   focusedSessionId = null;
   claudeCounter = 0;
@@ -1104,8 +1213,8 @@ class SessionManager extends EventEmitter {
     } else this.reserveSessionOpen(id);
     const lease = this.openLeases?.get(id);
     try {
-      require('./community-provider').assertProviderAvailable(kind);
       if (lease) require('./session-store').resumeSessionWrites(id);
+      require('./community-provider').assertProviderAvailable(kind);
       return this._createSession(kind, {...opts, id});
     }
     catch (error) {
@@ -1121,6 +1230,7 @@ class SessionManager extends EventEmitter {
     }
     const id = opts.id || uuid();
     const isAcp = isAcpKind(kind);
+    const isProviderCli = ['qwen','glm'].includes(kind.replace(/-resume$/, '')) && require('./agent-runtime-mode').agentRuntimeMode() !== 'native';
     const isClaude = kind === 'claude' || kind === 'claude-resume';
     const isGemini = kind === 'gemini' || kind === 'gemini-resume';
     const isDeepSeek = kind === 'deepseek' || kind === 'deepseek-resume';
@@ -1129,14 +1239,27 @@ class SessionManager extends EventEmitter {
     // remains resumable instead of being silently discarded.
     const isDeepSeekLegacy = isDeepSeek && !!opts.deepseekLegacyClaude;
     const isCodex = kind === 'codex' || kind === 'codex-resume';
+    // Claude / Codex 默认跑 PTY 里的真实 CLI；原生后端只在回退开关打开时使用。
+    const nativeAgentRuntime = require('./agent-runtime-mode').usesNativeAgentRuntime(kind);
+    const isNativeCodex = isCodex && nativeAgentRuntime;
+    const isPtyAgent = isProviderCli || ((isClaude || isCodex) && !nativeAgentRuntime) || (isDeepSeek && !isDeepSeekLegacy);
     const webRoute = isCodex && require('./chatgpt-web-models').chatgptWebRoute(opts.model);
+    const followsGlobalAccount = isCodex && !webRoute && !isCodexApiBackend(getConfigValues());
+    let globalAccount = null;
+    if (followsGlobalAccount) {
+      const accounts=require('./codex-global-account');
+      const launch = accounts.prepareLaunch(opts,accounts.currentConfig());
+      clearSessionManagerConfigCache();
+      opts = launch.opts;
+      globalAccount = launch.account;
+    }
     if (webRoute) {
       require('./chatgpt-web-integration').requireWebTools(opts.model);
       if (opts.effort && opts.effort !== webRoute.effort) throw new Error('ChatGPT 模型与思考档不匹配');
       opts = { ...opts, effort: webRoute.effort, codexSpeedTier: 'inherit' };
     }
     if (isCodex) {
-      if (opts.model && normalizeCodexSessionModel(opts.model) !== String(opts.model).trim()) throw new Error('Codex 模型名称无效，未替换成默认模型');
+      if (opts.model && !isCodexConversationModelId(opts.model)) throw new Error('Codex 模型名称无效，未替换成默认模型');
       if (opts.effort && !CODEX_EFFORT_LEVELS.has(opts.effort)) throw new Error('Codex 思考档无效，未降低精度');
       if (opts.mcpProfile && !CODEX_MCP_PROFILES.has(opts.mcpProfile)) throw new Error('Codex MCP 配置档无效');
       if (opts.codexSpeedTier && !CODEX_SPEED_TIERS.has(opts.codexSpeedTier)) throw new Error('Codex 服务通道无效');
@@ -1173,7 +1296,7 @@ class SessionManager extends EventEmitter {
     else title = `PowerShell ${++this.psCounter}`;
 
     const sessionEnv = { ...process.env };
-    applyInteractiveTerminalEnv(sessionEnv);
+    applyInteractiveTerminalEnv(sessionEnv, { truecolor: isCodexRuntime });
     let codexProfile = null;
 
     if (isClaude) {
@@ -1211,7 +1334,7 @@ class SessionManager extends EventEmitter {
     } else if (isGemini || isCodex) {
       const cv = getConfigValues();
       if (isCodex && isCodexApiBackend(cv)) {
-        // Codex API 模式走 PackyAPI，必须直连，否则代理 60s idle 切长任务
+          // Codex API 模式必须直连，否则代理 60s idle 切长任务
         clearProxyEnv(sessionEnv);
         sessionEnv.CODEX_HOME = getCodexApiHome();
       } else {
@@ -1259,7 +1382,7 @@ class SessionManager extends EventEmitter {
     // cwd fallback order: opts.cwd (if exists) -> user home. We stat-check to
     // avoid node-pty failing if the stored cwd was later deleted/moved.
     //
-    // 2026-07-29 三方审查：workspace 迁到 C:\Vibe 之后，唤醒一个 cwd 已失效的休眠会话会
+    // 2026-07-29 三方审查：workspace 迁到 C:\Workspace 之后，唤醒一个 cwd 已失效的休眠会话会
     // 悄悄落回 Home 起 PTY——UI 零提示、session 记录还显示旧路径，于是「规则没注入 / 记忆
     // 是空的 / 产物写错地方」在 Home 这个聚合根上同时发生，而现场没有任何线索指向 cwd。
     // fallback 本身要保留（否则 node-pty 直接抛错更难用），但必须留痕：日志 + 会话上标记，
@@ -1314,13 +1437,8 @@ class SessionManager extends EventEmitter {
           console.warn('[memory] ensureMemoryLink failed:', memoryLinkWarning);
         }
       }
-      // Kimi 无 .git 时只读 cwd 自己的 AGENTS.md（2026-07-29 探针实测）——给工作区内
-      // 「无 git 且无 AGENTS.md」的目录补一份根规则副本；有 git 根的目录不插手。
-      if (isKimi && this.workspaceService) {
-        try { this.workspaceService.seedUngovernedAgentsFile(spawnCwd); } catch (error) {
-          console.warn('[kimi] seedUngovernedAgentsFile failed:', error && error.message);
-        }
-      }
+      // Missing workspace rules are supplied by the shared submission path;
+      // launching Kimi must not manufacture another AGENTS.md in its cwd.
     }
 
     if (isClaude) {
@@ -1329,6 +1447,7 @@ class SessionManager extends EventEmitter {
     }
 
     let codexSessionsRoot = null;
+    let codexPtySqliteHome = null;
     if (webRoute) {
       codexSessionsRoot = path.join(sessionEnv.CODEX_HOME, 'sessions');
     } else if (isDeepSeek && !isDeepSeekLegacy) {
@@ -1338,7 +1457,7 @@ class SessionManager extends EventEmitter {
       codexProfile = { id: 'deepseek-api', label: 'DeepSeek API · Codex' };
     } else if (isCodex) {
       const cv = getConfigValues();
-      const selectedSubscriptionProfile = codexProfile
+      const selectedSubscriptionProfile = globalAccount ? { ...globalAccount,home:globalAccount.home } : codexProfile
         || (!opts.meetingId ? resolveCodexSubscriptionProfile(cv, opts.codexProfile) : null);
       const isolatedDataDir = process.env.CLAUDE_HUB_DATA_DIR || '';
       const selectedProfileHome = selectedSubscriptionProfile && selectedSubscriptionProfile.home;
@@ -1387,26 +1506,79 @@ class SessionManager extends EventEmitter {
           ensureCodexCwdTrusted(spawnCwd);
         }
       }
+      // 换账号后恢复/分叉旧会话：凭据跟新账号，线程索引留在原历史所在的账号，
+      // 否则 `codex resume <sid>` 在新账号里报 "No saved session found"。
+      // 只作用于这一条 resume/fork 命令（-c sqlite_home），不写进 PTY 的 shell 环境：
+      // CLI 退出后在同一终端里新开的 codex 必须回到当前账号自己的索引。
+      const historyHome = opts.codexHistoryStorageHome;
+      const liveHome = sessionEnv.CODEX_HOME || path.join(os.homedir(),'.codex');
+      if (isPtyAgent && followsGlobalAccount && historyHome && (opts.codexForkSid || (opts.useResume && opts.codexSid))
+          && path.toNamespacedPath(path.resolve(historyHome)).toLowerCase() !== path.toNamespacedPath(path.resolve(liveHome)).toLowerCase()) {
+        codexPtySqliteHome = require('./codex-global-account')
+          .historySqliteHomeSync(historyHome, opts.nativeRuntime && opts.nativeRuntime.sqliteHome, sessionEnv);
+        // 以 PowerShell 双引号包 TOML 字面量字符串传参；这些字符无法无歧义地穿过两层引用。
+        if (/['"`$\r\n]/.test(codexPtySqliteHome)) throw new Error('旧 Codex 历史目录含引号或 $，无法安全传给 CLI，未恢复');
+      }
     }
 
-    const isNativeClaude = isClaude || isDeepSeekLegacy;
-    if (isCodex) {
+    const isNativeClaude = (isClaude && nativeAgentRuntime) || isDeepSeekLegacy;
+    // 个人规则同步与运行时无关：PTY 与原生的 Claude 都读同一个 CLAUDE_CONFIG_DIR。
+    const contextKind = isCodexRuntime ? 'codex' : (isClaude || isDeepSeekLegacy) ? 'claude' : isKimi ? 'kimi' : isGemini ? 'gemini' : null;
+    if (contextKind) {
+      const contextHome = contextKind === 'codex' ? sessionEnv.CODEX_HOME || path.join(os.homedir(),'.codex')
+        : contextKind === 'claude' ? sessionEnv.CLAUDE_CONFIG_DIR || path.join(os.homedir(),'.claude')
+        : contextKind === 'kimi' ? sessionEnv.KIMI_CODE_HOME || path.join(os.homedir(),'.kimi-code') : path.join(os.homedir(),'.gemini');
+      require('./agent-user-context').syncNativeUserContext({kind:contextKind,nativeHome:contextHome,env:sessionEnv,dataDir:getHubDataDir()});
+    }
+    if (followsGlobalAccount) codexSessionsRoot = opts.codexSessionsRoot;
+    if (isCodexRuntime) {
 
       for (const key of ['CODEX_THREAD_ID','CODEX_SESSION_ID','CLAUDE_HUB_SESSION_ID',
         'CLAUDE_HUB_PORT','CLAUDE_HUB_TOKEN','AI_TEAM_HUB_CALLBACK_URL']) delete sessionEnv[key];
+      if (!isNativeCodex) {
+        // PTY Codex 的状态与卡片绑定都靠 hook：session-hub-hook.py 只认这三个变量。
+        sessionEnv.CLAUDE_HUB_SESSION_ID = id;
+        if (this.hookPort) sessionEnv.CLAUDE_HUB_PORT = String(this.hookPort);
+        if (this.hookToken) sessionEnv.CLAUDE_HUB_TOKEN = this.hookToken;
+        if (process.env.CLAUDE_HUB_DATA_DIR) sessionEnv.CLAUDE_HUB_DATA_DIR = process.env.CLAUDE_HUB_DATA_DIR;
+      }
+    }
+    let claudePtyLaunch = null;
+    if (isClaude && isPtyAgent) {
+      // 与 PTY 时代（8c5c6928）相同：spawn 前预写 projects[cwd].hasTrustDialogAccepted，
+      // 信任框根本不出现；写在 CLI 起来之前，没有与运行中 CLI 的竞态。
+      require('./claude-project-trust.js').ensureClaudeProjectTrusted(spawnCwd,
+        { configDir: sessionEnv.CLAUDE_CONFIG_DIR || null });
+      claudePtyLaunch = buildClaudePtyLaunch(id, kind, opts, spawnCwd, sessionEnv, getConfigValues());
+      // 身份在启动前就定下来：独占声明和卡片都立即可用，不等第一个 hook。
+      if (claudePtyLaunch.sessionId && !opts.forkCCSessionId) opts = { ...opts, resumeCCSessionId: claudePtyLaunch.sessionId };
     }
     // Every native driver is owned directly by this Hub; no cross-Hub broker.
     const CodexSessionClass = require('./codex-native-session').CodexNativeSession;
     this._claimNativeOpenIdentity(id, kind, opts, sessionEnv);
-    const ptyProcess = isAcp
-      ? new (require('./acp-session').AcpSession)(buildAcpOptions(kind,
+    let codexEditorInput = null;
+    if (isCodexRuntime && !isNativeCodex && !isAcp) {
+      try {
+        codexEditorInput = require('./codex-editor-input').configureCodexEditorInput(sessionEnv,
+          { dataDir: getHubDataDir(), cwd: spawnCwd });
+      } catch (error) { console.warn('[codex-editor-input] unavailable, retaining PTY paste:', error.message); }
+    }
+    let ptyProcess;
+    try { ptyProcess = isAcp
+      ? new (isProviderCli ? (kind.replace(/-resume$/, '') === 'qwen' ? require('./qwen-cli-session').QwenCliSession : require('./martty-cli-session').MarttyCliSession) : require('./acp-session').AcpSession)(buildAcpOptions(kind,
         {...opts,id,cwd:spawnCwd},getConfig(),getHubDataDir(),sessionEnv))
-      : isCodex
+      : isNativeCodex
       ? new CodexSessionClass({id,cwd:spawnCwd,env:sessionEnv,exclusiveSession:true,restoredRuntime:opts.nativeRuntime,
+        ...(followsGlobalAccount ? {accountId:globalAccount.id,ownershipHome:opts.codexHistoryHome,
+          historyStorageHome:opts.codexHistoryStorageHome,
+          resolveAccount:()=>{
+            const accounts=require('./codex-global-account');
+            return accounts.resolveAccount(accounts.currentConfig());
+          }} : {}),
         hubDataDir:getHubDataDir(),hubPid:process.pid,hubVersion:require('../package.json').version,
         lazyStart:opts.lazyStart === true, resumeId:opts.useResume ? opts.codexSid : null, forkId:opts.codexForkSid})
       : isNativeClaude ? createNativeClaudeDriver(id, kind, opts, spawnCwd, sessionEnv, isDeepSeekLegacy)
-      : pty.spawn('powershell.exe', shellArgs, {
+      : pty.spawn(windowsPowerShellPath(), shellArgs, {
       name: 'xterm-256color',
       cols: 120,
       rows: 30,
@@ -1421,6 +1593,7 @@ class SessionManager extends EventEmitter {
       // cursor makes Windows ConPTY more prone to transient cursor ghosts.
       conptyInheritCursor: (isCodexRuntime || isKimi) ? false : !opts.noInheritCursor,
     });
+    } catch (error) { codexEditorInput?.dispose(); throw error; }
 
     let currentModel = null;
     if (isClaude) {
@@ -1465,6 +1638,9 @@ class SessionManager extends EventEmitter {
       : (typeof opts.contextMax === 'number' ? opts.contextMax : null);
 
     const now = Date.now();
+    // 分支的 resumeTranscriptPath 是「源会话」的记录，只给原生 thread/fork 当参数用；终端里的
+    // `codex fork` 会开新线程，不能预先挂上源路径（见下方 transcriptPath）。
+    const ptyCodexForkLaunch = !!opts.codexForkSid && !isNativeCodex;
     const info = {
       id,
       kind,
@@ -1474,9 +1650,10 @@ class SessionManager extends EventEmitter {
           permissionMode: opts.permissionMode || (opts.autonomous === true || isDeepSeekLegacy ? 'bypassPermissions' : undefined) }) } : {}),
       title,
       status: 'idle',
-      ...(isCodex ? {runtimeBackend:'codex-app-server',nativeRuntime:ptyProcess.runtime,
+      ...(isNativeCodex ? {runtimeBackend:'codex-app-server',nativeRuntime:ptyProcess.runtime,
         codexApprovalPolicy:opts.approvalPolicy || 'never',codexSandbox:opts.sandbox || 'danger-full-access'} : {}),
       ...(isAcp ? {runtimeBackend:'acp',nativeRuntime:ptyProcess.runtime,acpSid:opts.acpSid || null,
+        cliRuntime:isProviderCli?{...ptyProcess.runtime,source:'provider-cli',observedAt:Date.now()}:null,
         acpProfileId:ptyProcess.options.profileId,acpCapabilities:{},acpConfigOptions:[]} : {}),
       connectionIssue: null,
       lastMessageTime: opts.lastMessageTime || now,
@@ -1498,7 +1675,7 @@ class SessionManager extends EventEmitter {
       completionNotificationEnabled: opts.completionNotificationEnabled === true,
       ...(opts.purpose ? { purpose: String(opts.purpose) } : {}),
       ...(opts.researchSessionId ? { researchSessionId: String(opts.researchSessionId) } : {}),
-      ...(opts.chuxinTaskId ? { chuxinTaskId: String(opts.chuxinTaskId) } : {}),
+      ...(opts.xresearchTaskId ? { xresearchTaskId: String(opts.xresearchTaskId) } : {}),
       ...(Array.isArray(opts.heroIds) ? { heroIds: opts.heroIds.slice(0, 4).map(String) } : {}),
       ...(opts.promptPolicyVersion ? { promptPolicyVersion: String(opts.promptPolicyVersion) } : {}),
       ...(opts.hiddenFromSidebar ? { hiddenFromSidebar: true } : {}),
@@ -1564,7 +1741,15 @@ class SessionManager extends EventEmitter {
       // 普通新建（非 resume）opts.resumeCCSessionId 为 undefined，info.ccSessionId 也为 undefined，
       // _toPublic 的 `info.ccSessionId !== undefined` 检查会跳过该字段，行为不变。
       ...(opts.resumeCCSessionId ? { ccSessionId: opts.resumeCCSessionId } : {}),
-      ...(opts.resumeTranscriptPath ? { transcriptPath: opts.resumeTranscriptPath } : {}),
+      ...(claudePtyLaunch && claudePtyLaunch.sessionId ? { ccSessionId: claudePtyLaunch.sessionId } : {}),
+      // 分支的 resumeTranscriptPath 是「源会话」的记录，只给原生 thread/fork 当参数用。
+      // 终端里的 `codex fork` 会开一条新线程：预先写上源路径，CodexTap 就把分支绑到
+      // 源 rollout、登记源的线程 id，新线程的 hook 全被当成外来会话丢弃（2026-09-26 实测）。
+      ...(opts.resumeTranscriptPath && !ptyCodexForkLaunch ? { transcriptPath: opts.resumeTranscriptPath } : {}),
+      // 恢复时 renderer 会把旧会话元数据与新会话合并；原生时代留下的后端与
+      // 快照必须显式清空，否则 PTY 会话会被当成原生会话去读状态。
+      // 非 PTY 会话显式写空：agentRuntime 会落盘，原生回退模式下恢复时不能从休眠卡片上继承 'pty'。
+      ...(isPtyAgent ? { runtimeBackend: null, nativeRuntime: null, agentRuntime: 'pty' } : { agentRuntime: null }),
     };
 
     const pendingTimers = [];
@@ -1582,6 +1767,11 @@ class SessionManager extends EventEmitter {
     this.sessions.set(id, {
       info,
       pty: ptyProcess,
+      codexEditorInput,
+      nativeRuleCoverage: require('./native-rule-coverage').captureNativeRuleCoverage({
+        kind:isNativeClaude?'claude':isCodexRuntime?'codex':kind.replace(/-resume$/,''),cwd:spawnCwd,
+        env:isAcp?ptyProcess.options.launch.env:sessionEnv,
+        claudeSettingsFile:isNativeClaude?ptyProcess.options.settingsFile:null,settingSources:opts.settingSources}),
       codexMcpEntries: effectiveCodexMcpProfile !== 'none' && Array.isArray(opts.codexMcpEntries)
         ? opts.codexMcpEntries.map((entry) => ({ ...entry, env: { ...(entry.env || {}) } }))
         : [],
@@ -1595,7 +1785,7 @@ class SessionManager extends EventEmitter {
       // boundary so the renderer, terminal-ring fallback, and TerminalSnapshot all see
       // the same lossless terminal stream. Legacy DeepSeek runs Claude and is
       // deliberately excluded; new DeepSeek uses the Codex runtime.
-      terminalOutputRewriter: isCodexRuntime && !isCodex ? new CodexXtermScrollbackRewriter({
+      terminalOutputRewriter: isCodexRuntime && !isNativeCodex ? new CodexXtermScrollbackRewriter({
         cols: 120,
         rows: 30,
         // On Windows, ConPTY consumes Codex's original region-scroll command
@@ -1603,7 +1793,7 @@ class SessionManager extends EventEmitter {
         // The rewriter handles that serialized form as well as raw VT streams.
         conptySerialized: process.platform === 'win32',
       }) : null,
-      terminalOutputFlushTimer: null,
+      outputDelivery: null,
       lastOutputSeq: 0,
       groupChatReady: false,
       groupChatLastActivity: 0,
@@ -1639,25 +1829,15 @@ class SessionManager extends EventEmitter {
       this.emit('output', { sessionId: id, seq, data: terminalData });
     };
 
-    const scheduleTerminalOutputFlush = (entry) => {
-      if (!entry || !entry.terminalOutputRewriter || !entry.terminalOutputRewriter.hasPending()) return;
-      entry.terminalOutputFlushTimer = setTimeout(() => {
-        const current = this.sessions.get(id);
-        if (!current || current.pty !== ptyProcess || !current.terminalOutputRewriter) return;
-        current.terminalOutputFlushTimer = null;
-        try {
-          deliverTerminalData(current.terminalOutputRewriter.flush());
-        } catch (error) {
-          // Timed fail-open is best-effort; never let preservation affect PTY
-          // liveness even if a future rewriter implementation regresses.
-          console.warn('[codex-scrollback] pending output flush failed:', error && error.message);
-        }
-      }, TERMINAL_REWRITER_FLUSH_MS);
-    };
+    this.sessions.get(id).outputDelivery = new PtyOutputDelivery({
+      emit: deliverTerminalData,
+      rewriter: this.sessions.get(id).terminalOutputRewriter,
+      onError: error => console.warn('[pty-output] terminal adapter failed:', error.message),
+    });
 
     ptyProcess.onData((data) => {
       const entry = this.sessions.get(id);
-      if (isNativeClaude || isCodex) {
+      if (isNativeClaude || isNativeCodex) {
         // Display only, the same backstage contract Codex native sessions get.
         // Native items remain the single source of runtime state, so these
         // bytes must not feed activity counters, the CLI-ready detector or the
@@ -1668,62 +1848,57 @@ class SessionManager extends EventEmitter {
       // Match the exit-path id-reuse guard: late bytes from an old PTY must
       // never mutate the replacement session's rewriter or terminal state.
       if (!entry || entry.pty !== ptyProcess) return;
+      entry.codexEditorInput?.onOutput(data);
       entry.groupChatLastActivity = Date.now();
       entry.groupChatOutputBytes += Buffer.byteLength(String(data || ''), 'utf8');
       entry.lastOutputAt = entry.groupChatLastActivity;
-      if (entry.terminalOutputFlushTimer) {
-        clearTimeout(entry.terminalOutputFlushTimer);
-        entry.terminalOutputFlushTimer = null;
-      }
-      let terminalData = data;
-      if (entry.terminalOutputRewriter) {
-        try {
-          terminalData = entry.terminalOutputRewriter.write(data);
-        } catch (error) {
-          // Display preservation must never be allowed to interrupt the PTY.
-          console.warn('[codex-scrollback] rewrite failed, passing raw output:', error && error.message);
-          let pending = '';
-          try { pending = entry.terminalOutputRewriter.flush(); } catch {}
-          entry.terminalOutputRewriter = null;
-          terminalData = pending + data;
-        }
-      }
-      deliverTerminalData(terminalData);
-      scheduleTerminalOutputFlush(entry);
+      entry.outputDelivery.write(data);
     });
 
     ptyProcess.onExit((exitInfo) => {
+      codexEditorInput?.dispose();
       if (isNativeClaude && !ptyProcess.closed) {
         // Keep the managed session and its unknown receipt available for explicit recovery.
         return;
       }
       const entry = this.sessions.get(id);
-      if (entry && entry.pty === ptyProcess && entry.terminalOutputFlushTimer) {
-        clearTimeout(entry.terminalOutputFlushTimer);
-        entry.terminalOutputFlushTimer = null;
-      }
-      if (entry && entry.pty === ptyProcess && entry.terminalOutputRewriter) {
-        try { deliverTerminalData(entry.terminalOutputRewriter.flush()); } catch {}
-      }
+      if (entry && entry.pty === ptyProcess) entry.outputDelivery?.close();
       Promise.resolve(this._handlePtyExit(id, ptyProcess, exitInfo)).catch(error => {
         console.error('[session-release] history flush failed; ownership retained:', error);
         ptyProcess.emit?.('action-error', '历史保存失败，尚未释放会话：' + error.message);
       });
     });
 
-    if (isCodex || isAcp) {
-      if (isCodex) Object.assign(ptyProcess.options, buildNativeCodexOptions(info, opts, sessionEnv));
+    if (isNativeCodex || isAcp) {
+      if (isNativeCodex) Object.assign(ptyProcess.options, buildNativeCodexOptions(info, opts, sessionEnv));
+      if (followsGlobalAccount) ptyProcess.options.accountOptions = (_target,env) => {
+        require('./agent-user-context').syncNativeUserContext({kind:'codex',nativeHome:env.CODEX_HOME,env,dataDir:getHubDataDir()});
+        ensureCodexCwdTrusted(info.cwd,env.CODEX_HOME);
+        const next=buildNativeCodexOptions(info,opts,env);
+        return {processArgs:next.processArgs,threadParams:next.threadParams,turnParams:next.turnParams};
+      };
       const publish = () => {
         if (this.sessions.get(id)?.pty !== ptyProcess) return;
         this.emit('codex-session-updated', this._toPublic(info));
       };
       ptyProcess.on('state', (runtime) => {
-        info.nativeRuntime = runtime;
+        if (!isProviderCli) info.nativeRuntime = runtime;
+        else info.cliRuntime = { ...runtime, source:'provider-cli', observedAt:Date.now() };
         info.status = ['running','waiting'].includes(runtime.state) ? 'running' : 'idle';
         info.connectionIssue = null;
         const entry = this.sessions.get(id);
         if (entry) entry.groupChatReady = runtime.connection === 'connected';
         if (runtime.completedAt) info.lastCompletedAt = runtime.completedAt;
+        publish();
+        if (followsGlobalAccount && !ptyProcess.accountSwitch && (runtime.state === 'idle' || ['completed','failed','interrupted'].includes(runtime.state))) {
+          setImmediate(() => {
+            if (!ptyProcess.closed) this._syncCodexAccount(ptyProcess,info).catch(error=>ptyProcess.emit('action-error',error.message));
+          });
+        }
+      });
+      ptyProcess.on('account-changed', account => {
+        info.codexProfile=account.id;info.codexProfileLabel=account.label;info.nativeActionError=null;
+        if (!info.codexSid && !info.transcriptPath) info.codexSessionsRoot=path.join(account.home,'sessions');
         publish();
       });
       ptyProcess.on('bound', bound => {
@@ -1756,7 +1931,8 @@ class SessionManager extends EventEmitter {
         contentTimer=setTimeout(()=>{
           contentTimer=null;
           if(this.sessions.get(id)?.pty===ptyProcess)this.emit('codex-content-updated',
-            {sessionId:id,threadId:ptyProcess.threadId,turnId:ptyProcess.runtime.turnId,revision:ptyProcess.contentRevision});
+            {sessionId:id,threadId:ptyProcess.threadId,turnId:ptyProcess.runtime.turnId,
+              epoch:ptyProcess.runtime.epoch,revision:ptyProcess.contentRevision});
         },80);
         contentTimer.unref?.();
       });
@@ -1790,6 +1966,58 @@ class SessionManager extends EventEmitter {
     }
 
     if (isNativeClaude) require('./claude-native-binding').bindClaudeNativeSession(this, id, ptyProcess);
+
+    if (claudePtyLaunch) {
+      // 信任框兜底（照搬 8c5c6928）：预写没生效时（.claude.json 损坏 / 只读）才会出现。
+      // 绝不盲按回车——Claude Code 默认高亮 "No, exit"。detectClaudeTrustDialog 定位到
+      // 「Yes, I trust this folder」那一行给出按键；定位不出来就一个键都不发。
+      // 首帧时 ink 还没切 raw 模式，先等 1.2s 再用最新缓冲确认框还在。
+      const { detectClaudeTrustDialog } = require('./claude-trust-dialog.js');
+      let trustDone = false;
+      let trustBuf = '';
+      let trustTimer = null;
+      const trustSub = ptyProcess.onData((d) => {
+        if (trustDone) return;
+        trustBuf = (trustBuf + d).slice(-16000);
+        if (trustTimer || !detectClaudeTrustDialog(trustBuf)) return;
+        trustTimer = setTimeout(() => {
+          trustTimer = null;
+          const dialog = detectClaudeTrustDialog(trustBuf);
+          if (!dialog) return;
+          trustDone = true;
+          dialog.keys.forEach((key, index) => {
+            setTimeout(() => { try { ptyProcess.write(key); } catch {} }, index * 80);
+          });
+          try { trustSub.dispose(); } catch {}
+        }, 1200);
+      });
+      pendingTimers.push(setTimeout(() => {
+        if (trustDone) return;
+        if (trustTimer) { clearTimeout(trustTimer); trustTimer = null; }
+        try { trustSub.dispose(); } catch {}
+      }, 45000));
+
+      // 与 8c5c6928 之前的 PTY 时代同一套投递：PowerShell 首屏安静 200ms 后敲入命令，
+      // 3 秒安全兜底。所有参数都是启动前确定的，与原生后端同源。
+      const cmd = claudePtyLaunch.cmd;
+      let sent = false;
+      let debounceTimer = null;
+      const launch = () => {
+        if (sent) return;
+        sent = true;
+        watcher.dispose();
+        if (debounceTimer) clearTimeout(debounceTimer);
+        const s = this.sessions.get(id);
+        if (s && s.pty === ptyProcess) s.pty.write(cmd);
+      };
+      const watcher = ptyProcess.onData(() => {
+        if (sent) return;
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(launch, 200);
+      });
+      pendingTimers.push(setTimeout(launch, 3000));
+      if (claudePtyLaunch.sessionId) queueMicrotask(() => this._refreshOpenIdentity(id));
+    }
 
     if (isGemini) {
       let cmd = ' gemini --approval-mode yolo';
@@ -1870,6 +2098,7 @@ class SessionManager extends EventEmitter {
         // 注：曾尝试 --no-alt-screen 改善观感，实测无明显改善 + Enter 提交失效 → 撤回。
         // 渲染观感问题改由"持久化 AI 群聊面板"（直接展示干净回答预览）绕过。
       }
+      if (codexPtySqliteHome) cmd += ` -c "sqlite_home='${codexPtySqliteHome}'"`;
       if (codexInstructionFile) {
         cmd += ` -c "model_instructions_file=${codexInstructionFile.replace(/\\/g, '\\\\')}"`;
       }
@@ -1885,6 +2114,14 @@ class SessionManager extends EventEmitter {
         mcpProfile: effectiveCodexMcpProfile,
         allowedNames: allowedGroupMcpNames,
       });
+      if (isCodexRuntime) {
+        // hook 是 PTY Codex 的身份与状态来源；部署失败不拦启动，但要在会话上留痕。
+        const hookResult = require('./codex-hook-integration').ensureCodexHookIntegration({
+          codexHome: sessionEnv.CODEX_HOME || null,
+        });
+        info.hookIntegrationWarning = hookResult.errors.length ? hookResult.errors.join('；') : null;
+        cmd += ` -c features.hooks=true`;
+      }
       cmd += '\r\n';
       let sent = false;
       let debounceTimer = null;
@@ -2097,6 +2334,10 @@ class SessionManager extends EventEmitter {
     if (!session) {
       return { ok: false, error: 'session-not-found', message: '会话不存在或已经休眠' };
     }
+    if (session.info.agentRuntime === 'pty' && session.agentTurnActive
+        && (options.reason === 'meeting-room-complete' || Number(options.minIdleMs) > 0)) {
+      return { ok:false, error:'pty-turn-unfinished', message:'CLI 仍在执行或等待操作，已跳过自动休眠' };
+    }
     if (['codex-app-server','acp','claude-stream-json'].includes(session.info.runtimeBackend)) {
       const runtime = session.info.nativeRuntime;
       const sharedViewerDetach = options.allowSharedViewerDetach === true
@@ -2110,8 +2351,8 @@ class SessionManager extends EventEmitter {
     if (session.suspendRequestedAt) {
       return { ok: false, error: 'suspend-pending', message: '会话正在进入休眠' };
     }
-    if (session.info && session.info.purpose === 'chuxin-research') {
-      return { ok: false, error: 'protected-session', message: '初心投研任务不能从这里休眠' };
+    if (session.info && session.info.purpose === 'xresearch-research') {
+      return { ok: false, error: 'protected-session', message: '扩展投研任务不能从这里休眠' };
     }
     if (!getSessionResumeIdentity(session.info)) {
       return {
@@ -2429,7 +2670,7 @@ class SessionManager extends EventEmitter {
   }
 
   // 「恢复历史会话」picker 默认只列当前目录的会话。会话以前都在用户主目录下时
-  // 这没问题，改用 C:\Vibe\_scratch\* 之后就意味着 picker 里几乎什么都看不到。
+  // 这没问题，改用 C:\Workspace\_scratch\* 之后就意味着 picker 里几乎什么都看不到。
   // Codex 和 Kimi 的 picker 各自内置了"看全部"的开关，这里在 picker 画出来之后
   // 替用户按一下，恢复"凭记忆挑会话、不用先想路径"的用法。
   //   Codex：顶部 `Filter: [Cwd] All`，右方向键切到 All
@@ -2474,6 +2715,15 @@ class SessionManager extends EventEmitter {
     return s ? { ...s.info } : undefined;
   }
 
+  async tryLoadCodexEditorInput(sessionId, text, options = {}) {
+    const entry = this.sessions.get(sessionId);
+    if (!entry?.codexEditorInput) return false;
+    return entry.codexEditorInput.load(text, data => {
+      if (this.sessions.get(sessionId) !== entry) throw Object.assign(new Error('会话已变化，未提交'), {notSent:true});
+      this.writeToSession(sessionId, data);
+    }, options);
+  }
+
   getNativeCodex(sessionId) {
     const session = this.sessions.get(sessionId);
     return session && session.info.runtimeBackend === 'codex-app-server' ? session.pty : null;
@@ -2486,7 +2736,7 @@ class SessionManager extends EventEmitter {
 
   getNativeSession(sessionId) {
     const session = this.sessions.get(sessionId);
-    return session && ['codex-app-server','acp'].includes(session.info.runtimeBackend) ? session.pty : null;
+    return session && (session.pty?.isCliProvider || ['codex-app-server','acp'].includes(session.info.runtimeBackend)) ? session.pty : null;
   }
 
   // 群聊快路径缓存：首次 groupChatWatcher.waitCliReady 通过后置 true，后续 groupChatWatcher.sendToPty 跳过冷启动 sleep。
@@ -2523,6 +2773,48 @@ class SessionManager extends EventEmitter {
   // Claude UserPromptSubmit and Codex task_started both flow through here, so
   // group-chat delivery can use the same semantic truth as ordinary-session
   // runtime status instead of guessing from terminal bytes.
+  // CLI 已退出、终端回到宿主 PowerShell 提示符。用来判断 SessionStart(startup)
+  // 是用户重新拉起了 CLI，还是 CLI 里嵌套跑的另一个 codex 进程。
+  isHostShellActive(sessionId) {
+    const s = this.sessions.get(sessionId);
+    return !!(s && detectHostShellTakeover(s.ringBuffer));
+  }
+
+  // TUI 里的 /new 结束了这条已绑定的线程（屏幕上有带它 id 的「To continue this session」）。
+  // Codex 要等新线程第一次提问才报 SessionStart，那时这句可能早已滚远：Hub 自己提交的
+  // /new 在确认时就把结论记在会话上；用户直接在终端里敲的，扫最近一次改绑之后的输出。
+  noteCodexThreadEnded(sessionId, threadSid) {
+    const s = this.sessions.get(sessionId);
+    if (s && threadSid) s.codexEndedThreadSid = String(threadSid);
+  }
+  getSessionOutputMark(sessionId) {
+    const s = this.sessions.get(sessionId);
+    return s ? Number(s.outputChars) || 0 : 0;
+  }
+  // 标记之后产生、且仍在缓冲区里的输出（缓冲区已截断掉一部分时，取剩下的那段）。
+  getSessionOutputSince(sessionId, mark) {
+    const s = this.sessions.get(sessionId);
+    if (!s) return '';
+    const buffer = s.ringBuffer || '';
+    const fresh = Math.max(0, (Number(s.outputChars) || 0) - (Number(mark) || 0));
+    return fresh >= buffer.length ? buffer : buffer.slice(buffer.length - fresh);
+  }
+  // 改绑到新线程后旧证据作废：/resume 回到那条线程时，它已不再是「已结束」。
+  noteCodexThreadBound(sessionId) {
+    const s = this.sessions.get(sessionId);
+    if (!s) return;
+    s.codexEndedThreadSid = null;
+    s.codexBoundOutputMark = Number(s.outputChars) || 0;
+  }
+  isCodexThreadEnded(sessionId, boundSid) {
+    const s = this.sessions.get(sessionId);
+    if (!s || !boundSid) return false;
+    if (s.codexEndedThreadSid === String(boundSid)) return true;
+    // 用户直接在终端里敲的 /new：只看最近一次改绑之后的输出。
+    return detectCodexThreadEnded(this.getSessionOutputSince(sessionId, s.codexBoundOutputMark || 0), boundSid);
+  }
+
+
   noteAgentTurnStarted(sessionId, event = {}) {
     const s = this.sessions.get(sessionId);
     if (!s) return null;
@@ -2530,7 +2822,14 @@ class SessionManager extends EventEmitter {
     const observedAt = Number(event.observedAt || event.startedAt) || Date.now();
     s.agentTurnStartSeq = (s.agentTurnStartSeq || 0) + 1;
     s.agentTurnStartedAt = observedAt;
+    s.agentTurnActive = true;
+    s.agentTurnId = event.turnId || null;
     s.agentTurnStartSource = event.signalSource || event.source || 'provider_lifecycle';
+    const runtimeChanged = require('./codex-pty-runtime').observeCodexPtyRuntime(s, {
+      state: 'running', source: s.agentTurnStartSource, startedAt: observedAt,
+      turnId: s.agentTurnId,
+    });
+    if (runtimeChanged) this.emit('session-updated', this._toPublic(s.info));
     const payload = {
       sessionId,
       seq: s.agentTurnStartSeq,
@@ -2541,6 +2840,30 @@ class SessionManager extends EventEmitter {
     };
     this.emit('agent-turn-started', payload);
     return payload;
+  }
+
+  noteAgentTurnFinished(sessionId, event = {}) {
+    const s = this.sessions.get(sessionId);
+    if (!s || !s.agentTurnActive) return false;
+    if (s.agentTurnId && event.turnId && s.agentTurnId !== event.turnId) return false;
+    const at = Number(event.completedAt || event.abortedAt || event.failedAt) || Date.now();
+    if (at < s.agentTurnStartedAt) return false;
+    s.agentTurnActive = false;
+    const runtimeChanged = require('./codex-pty-runtime').observeCodexPtyRuntime(s, {
+      state: event.failedAt ? 'failed' : event.abortedAt ? 'interrupted' : 'completed',
+      source: event.failedAt ? 'codex-turn-failed' : event.abortedAt ? 'codex-turn-aborted' : 'codex-turn-complete',
+      completedAt: at, turnId: event.turnId || s.agentTurnId,
+      evidence: event.message || null,
+    });
+    if (runtimeChanged) this.emit('session-updated', this._toPublic(s.info));
+    return true;
+  }
+
+  noteCodexHookActivity(sessionId, event, parsed, observedAt = Date.now()) {
+    const entry = this.sessions.get(sessionId);
+    const changed = require('./codex-pty-runtime').observeCodexHookActivity(entry, event, parsed, observedAt);
+    if (changed) this.emit('session-updated', this._toPublic(entry.info));
+    return changed;
   }
 
   // FIX-F（2026-05-01）：在已存在的 PTY 上重新启动 CLI 进程（不重 spawn PTY）。
@@ -2634,7 +2957,8 @@ class SessionManager extends EventEmitter {
         });
       const mcpFlag = mcpPlan && mcpPlan.args ? mcpPlan.args : '';
       const relaunchPermissionFlag = claudePermissionModeArg({ autonomous });
-      cmd = ` claude --model ${modelId || DEFAULT_MODEL_BY_KIND.claude}${effortFlag}${relaunchPermissionFlag}${fastFlag}${mcpFlag}${isolation}\r\n`;
+      const addDirFlag = claudeNativeAddDirs([]).map(dir => ` --add-dir "${dir}"`).join('');
+      cmd = ` claude --model ${modelId || DEFAULT_MODEL_BY_KIND.claude}${effortFlag}${relaunchPermissionFlag}${fastFlag}${mcpFlag}${addDirFlag}${isolation}\r\n`;
     } else if (kind === 'deepseek' || kind === 'deepseek-resume') {
       const mcpPlan = meetingId ? buildClaudeMeetingMcpArgs({
         mcpConfigFile: s.claudeMcpConfigFile,
@@ -2667,7 +2991,8 @@ class SessionManager extends EventEmitter {
   // Returns the public shape used by renderer IPC and 'session-updated' events.
   _toPublic(info) {
     return {
-      ...(info.runtimeBackend === 'acp' ? {acpSid:info.acpSid,acpProfileId:info.acpProfileId,
+      ...(isAcpKind(info.kind) ? {cliRuntime:info.cliRuntime||null} : {}),
+      ...(isAcpKind(info.kind) ? {acpSid:info.acpSid,acpProfileId:info.acpProfileId,
         acpCapabilities:info.acpCapabilities,acpConfigOptions:info.acpConfigOptions} : {}),
       ...(info.runtimeBackend ? {runtimeBackend:info.runtimeBackend,nativeRuntime:info.nativeRuntime,
         nativeConfig:info.nativeConfig,
@@ -2676,6 +3001,10 @@ class SessionManager extends EventEmitter {
         nativeThreadChoices:info.nativeThreadChoices || [],nativeActionError:info.nativeActionError || null,
         ...(info.codexSharedControl ? {codexSharedControl:info.codexSharedControl} : {}),
         ...(info.nativeSharedControl ? {nativeSharedControl:info.nativeSharedControl} : {})} : {}),
+      // PTY 会话显式带空值：renderer 按 {...旧, ...新} 合并，缺字段会让原生时代的后端残留下来。
+      ...(info.agentRuntime === 'pty' ? {agentRuntime:'pty',runtimeBackend:null,nativeRuntime:null,
+        ...(info.runtimeTruth ? {runtimeTruth:info.runtimeTruth} : {}),
+        hookIntegrationWarning:info.hookIntegrationWarning || null} : {agentRuntime:null}),
       id: info.id,
       meetingId: info.meetingId || null,
       title: info.title,
@@ -2731,7 +3060,7 @@ class SessionManager extends EventEmitter {
       ...(info.nativeSession ? { nativeSession: info.nativeSession } : {}),
       ...(info.purpose ? { purpose: info.purpose } : {}),
       ...(info.researchSessionId ? { researchSessionId: info.researchSessionId } : {}),
-      ...(info.chuxinTaskId ? { chuxinTaskId: info.chuxinTaskId } : {}),
+      ...(info.xresearchTaskId ? { xresearchTaskId: info.xresearchTaskId } : {}),
       ...(Array.isArray(info.heroIds) ? { heroIds: info.heroIds } : {}),
       ...(info.promptPolicyVersion ? { promptPolicyVersion: info.promptPolicyVersion } : {}),
       ...(info.hiddenFromSidebar ? { hiddenFromSidebar: true } : {}),
@@ -2770,6 +3099,8 @@ class SessionManager extends EventEmitter {
   _appendToRingBuffer(id, data) {
     const s = this.sessions.get(id);
     if (!s) return;
+    // 累计输出字符数：缓冲区截断后长度不再增长，「某时刻之后的新输出」只能靠它来定位。
+    s.outputChars = (Number(s.outputChars) || 0) + String(data || '').length;
     let rb = (s.ringBuffer || '') + data;
     const ringLimit = Number(s.ringBufferLimit || RING_BUFFER_BYTES);
     if (rb.length > ringLimit) {
@@ -2822,7 +3153,7 @@ class SessionManager extends EventEmitter {
   dispose() {
     for (const s of this.sessions.values()) {
       for (const t of s.pendingTimers) clearTimeout(t);
-      if (s.terminalOutputFlushTimer) clearTimeout(s.terminalOutputFlushTimer);
+      s.outputDelivery?.close();
       if (s.terminalSnapshot) s.terminalSnapshot.dispose();
       if (s.pty) {
         s.pty.kill();
@@ -2861,10 +3192,7 @@ class SessionManager extends EventEmitter {
       // and waiter registration.
       for (const [sessionId, session] of entries) {
         for (const timer of session.pendingTimers || []) clearTimeout(timer);
-        if (session.terminalOutputFlushTimer) {
-          clearTimeout(session.terminalOutputFlushTimer);
-          session.terminalOutputFlushTimer = null;
-        }
+        session.outputDelivery?.flush();
         if (!session.pty) {
           if (session.terminalSnapshot) session.terminalSnapshot.dispose();
           this._releaseOpenSession(sessionId, session.info);
@@ -3085,8 +3413,10 @@ module.exports = {
     applyProxyEnv,
     applyInteractiveTerminalEnv,
     isClaudeApiBackend,
+    isCodexApiBackend,
     shouldUseClaudeFastSettings,
     claudePermissionModeArg,
+    buildClaudePtyLaunch,
     applyClaudeSessionEnv,
     resolveClaudeLaunchModel,
     quotePowerShellLiteral,

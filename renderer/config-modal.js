@@ -35,7 +35,7 @@ function createConfigModalController({
     },
     codex: {
       title: 'Codex 设置',
-      hint: '全 Hub 新建 Codex 会话统一生效。API 模式会使用隔离 CODEX_HOME，不污染本机订阅配置。',
+      hint: 'Codex 订阅账号对新建、恢复和重启统一生效，进行中的会话在本轮结束后切换。API 模式使用独立账号配置。',
     },
     kimi: {
       title: 'Kimi Code 设置',
@@ -54,7 +54,7 @@ function createConfigModalController({
   let activeConfigAi = 'codex';
   let codexSubscriptionProfiles = [
     { id: 'default', label: '主账号', home: '' },
-    { id: 'second', label: '新账号', home: require('path').join(require('os').homedir(), '.codex-profiles', 'second') },
+    { id: 'second', label: '新账号', home: 'C:\\Users\\you\\.codex-profiles\\second' },
   ];
   let codexSubscriptionProfile = 'default';
   let savedCardDisplay = normalizeCardDisplayConfig();

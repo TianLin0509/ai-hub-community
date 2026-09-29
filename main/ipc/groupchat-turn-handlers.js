@@ -17,7 +17,7 @@ function registerGroupchatTurnIpc(ipcMain, deps) {
     }
   });
 
-  // 运行中中断（2026-07-29 道雪）：「停止本轮」——把用户在单 session 里按 ESC 的动作
+  // 运行中中断（2026-07-29 maintainer）：「停止本轮」——把用户在单 session 里按 ESC 的动作
   //   批量下发给本轮所有在跑成员，并把状态收敛到 interrupted/idle。
   //   串行/循环工作流同时在跑时一并停掉，避免「本轮停了、下一步又自动开跑」。
   ipcMain.handle('groupchat:interrupt', async (_e, args = {}) => {

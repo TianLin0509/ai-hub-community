@@ -1,6 +1,6 @@
 // core/session-store.js
 //
-// 2026-05-07 道雪 — per-session JSON 备份。镜像 meeting-store 的设计：
+// 2026-05-07 maintainer — per-session JSON 备份。镜像 meeting-store 的设计：
 //   每个 session 独立写一份 sessions/<hubId>.json，作为 state.json 的双备份。
 //   重点保护 codexSid / geminiChatId / Kimi kimiSid 等原生会话关联字段
 //   这类 transcript 关联字段——历史上反复因 state.json 全量覆盖被吞回 null，
@@ -92,6 +92,9 @@ function _buildSessionPayload(hubId, data) {
     acpCapabilities: data.acpCapabilities || null,
     runtimeBackend: data.runtimeBackend || null,
     nativeRuntime: require('./native-agent-runtime.js').persistNativeRuntime(data),
+    // 重启后仍要知道这是 PTY 会话：isCodexSession 只看后端与快照，缺了这个标记，
+    // 残留的原生字段就会让休眠记录被当成原生会话。
+    agentRuntime: data.agentRuntime === 'pty' ? 'pty' : null,
     codexApprovalPolicy: data.codexApprovalPolicy || null,
     codexSandbox: data.codexSandbox || null,
     codexSessionsRoot: data.codexSessionsRoot || null,
@@ -133,7 +136,7 @@ function _buildSessionPayload(hubId, data) {
     branchAutoTitlePending: !!data.branchAutoTitlePending,
     purpose: data.purpose || null,
     researchSessionId: data.researchSessionId || null,
-    chuxinTaskId: data.chuxinTaskId || null,
+    xresearchTaskId: data.xresearchTaskId || null,
     heroIds: Array.isArray(data.heroIds) ? data.heroIds : null,
     promptPolicyVersion: data.promptPolicyVersion || null,
     hiddenFromSidebar: !!data.hiddenFromSidebar,

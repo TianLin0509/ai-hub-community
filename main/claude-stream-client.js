@@ -56,21 +56,13 @@ class ClaudeStreamClient extends EventEmitter {
 
   async _start() {
     if (this.closed) throw protocolError('Claude transport is closed', 'CLAUDE_CLOSED');
-    let commandArgs = this.options.commandArgs || [];
+    const args = [...(this.options.commandArgs || []), ...streamArgs(this.options.launchArgs)];
     // An explicit environment is complete. Re-merging process.env here would
     // restore credentials/callbacks deliberately removed by an isolated caller.
-    let env = { ...(this.options.env || process.env) };
-    let executable = this.options.executable;
-    if (!executable && require('../core/distribution').community) {
-      const resolved = require('../core/community-provider').resolveClaudeCommand(env);
-      executable = resolved.command;
-      commandArgs = [...resolved.args, ...commandArgs];
-      env = resolved.env;
-    }
+    const env = { ...(this.options.env || process.env) };
     // Nested interactive-session guards must not bind a child to its parent.
     delete env.CLAUDECODE;
-    executable ||= process.platform === 'win32' ? 'claude.exe' : 'claude';
-    const args = [...commandArgs, ...streamArgs(this.options.launchArgs)];
+    const executable = this.options.executable || (process.platform === 'win32' ? 'claude.exe' : 'claude');
     this.proc = spawn(executable, args, { cwd: this.options.cwd, env,
       windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
     this.proc.on('error', error => this.fail(protocolError('Claude process: ' + error.message, 'CLAUDE_PROCESS_ERROR')));

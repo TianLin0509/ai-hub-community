@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * 生成/刷新 node_modules/electron/dist/AIGroupChatHub.exe（electron.exe 的品牌化副本）。
+ * 生成/刷新 node_modules/electron/dist/AIHubCommunity.exe（electron.exe 的品牌化副本）。
  *
  * 为什么单独一个脚本：electron.exe 220MB+，读一遍 + 重写资源 + 写一遍，
  * 在 Electron 主进程里同步跑会把 UI 卡住好几秒。main.js 用 ELECTRON_RUN_AS_NODE
@@ -41,7 +41,7 @@ function main() {
   if (!productVersion) {
     try { productVersion = require(path.join(appRoot, 'package.json')).version || ''; } catch { productVersion = ''; }
   }
-  const productName = args.name || 'AI 群聊 Hub';
+  const productName = args.name || 'AI Hub Community';
 
   const before = inspectBrandedHubExe({ execPath, icoPath, productVersion });
   console.log(`[hub-brand] host=${before.hostExePath}`);

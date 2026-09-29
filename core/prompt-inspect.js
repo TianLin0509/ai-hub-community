@@ -203,7 +203,7 @@ function ruleBody(file) {
 // 同目录 CLAUDE.md 与 AGENTS.md 正文逐字相同 = 刻意的双写镜像（一份给 Claude、一份给
 // Codex/Kimi），Claude 读 CLAUDE.md 就已经拿到全部规则，什么都没漏。
 //
-// 2026-07-29 三方审查：原实现只比路径不比内容，把 C:\Vibe 这种镜像报成「AGENTS.md 读不到」，
+// 2026-07-29 三方审查：原实现只比路径不比内容，把 C:\Workspace 这种镜像报成「AGENTS.md 读不到」，
 // 且建议加 `@AGENTS.md`——照做会真的展开出第二份完全相同的正文（约 1.4KB/次会话），
 // 而 :306 的 redundant 检查抓不到它（那里只查 CLAUDE.md 链）。等于一边教人制造重复、
 // 一边看不见自己造的重复。现在镜像不再算 orphan。
@@ -239,7 +239,9 @@ function findOrphanAgentsMd(cwd, chain) {
 // ---------- Codex 侧 ----------
 function readCodexRootMarkers() {
   const cfg = readText(path.join(homeDir(), '.codex', 'config.toml'), 65536) || '';
-  const m = cfg.match(/^\s*project_root_markers\s*=\s*\[([^\]]*)\]/m);
+  // TOML allows the key bare or quoted; a rewrite of config.toml on 2026-09-25 switched it to
+  // "project_root_markers", and a bare-only match silently fell back to [".git"].
+  const m = cfg.match(/^\s*(?:project_root_markers|"project_root_markers"|'project_root_markers')\s*=\s*\[([^\]]*)\]/m);
   if (!m) return { markers: ['.git'], configured: false };
   const markers = m[1].split(',')
     .map(s => s.trim().replace(/^["']|["']$/g, ''))
@@ -424,7 +426,7 @@ function buildHealth(insp) {
     const km = insp.kimi || { entries: [] };
     if (!km.projectRoot) {
       push('warn', '没找到 .git，Kimi 只读 cwd 自己的 AGENTS.md',
-        '2026-07-29 探针实测：无 git 时父目录的 AGENTS.md 一份都不读。经 Hub 启动会在确实无 git 且无自有 AGENTS.md 的 cwd 托管一份哈希可刷新副本；不要为此在 C:\\Vibe 聚合根 git init。');
+        '2026-07-29 探针实测：无 git 时父目录的 AGENTS.md 一份都不读。经 Hub 启动会在确实无 git 且无自有 AGENTS.md 的 cwd 托管一份哈希可刷新副本；不要为此在 C:\\Workspace 聚合根 git init。');
     } else {
       push('ok', `project root = ${km.projectRoot}`, 'markers=[.git]，从这一层向下收集到 cwd（嵌套 git 仓库会挡住外层）。');
     }

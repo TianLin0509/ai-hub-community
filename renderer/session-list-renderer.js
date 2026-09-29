@@ -65,7 +65,7 @@ const SESSION_FAMILY_KEYS = SESSION_FAMILY_TABS.map(tab => tab.key);
 // 会把「最近」那一段挤没，侧栏就失去了可读性。
 //
 // 按 purpose 分组，加新的 Agent 系统时只在这张表里加一行，不改渲染逻辑。
-// 注意 chuxin-research 不在这里：它在下面的基础过滤里本来就被完全排除，
+// 注意 xresearch-research 不在这里：它在下面的基础过滤里本来就被完全排除，
 // 属于「永远不进侧栏」，而不是「可收可展」。
 const AGENT_SESSION_GROUPS = [
   { key: 'study', label: '学习', purposes: ['study-companion'] },
@@ -134,10 +134,11 @@ function partitionSidebarSessions(items, { now = Date.now(), sessionMap = new Ma
     const unread = sidebarItemHasUnread(s, sessionMap);
     states.set(s.id, error ? 'error' : meeting && working ? 'run' : waiting ? 'wait' : working ? 'run' : unread ? 'unread' : dormant ? 'dorm' : truth?.state === RUNTIME_UNKNOWN ? 'unknown' : 'idle');
     if (error) failed.push(s);
+    else if (s.pinned && (waiting || working)) (waiting ? respond : running).push(s);
     else if (unread) completed.push(s);
-    else if (s.pinned) pinned.push(s);
     else if (waiting) respond.push(s);
     else if (working) running.push(s);
+    else if (s.pinned) pinned.push(s);
     else if (dormant) archive.push(s);
     else if (fresh) today.push(s);
     else older.push(s);
@@ -246,7 +247,7 @@ function createSessionListRenderer(options = {}) {
 
 // --- Sidebar tree state: which meeting entries are expanded to show their sub-sessions ---
 // Persists across reloads. Default = collapsed (白名单未命中即折叠)；用户点 ▶ 后才进
-// _expandedMeetings 集合并落盘。2026-05-05 道雪改：新 AI 群聊不再默认展开，折叠态本来
+// _expandedMeetings 集合并落盘。2026-05-05 maintainer改：新 AI 群聊不再默认展开，折叠态本来
 // 就有 3 个迷你头像跳转按钮可用。
 const _expandedMeetings = (() => {
   try {
@@ -374,7 +375,18 @@ function _sessionWarningText(session) {
     ].join('\n');
 
     const routeClass = (route, warning) => !egress ? 'pending' : warning || !route?.ok ? 'warning' : 'ok';
-    const metric = (label, value) => `<span class="strip-resource${metricClass(value)}" title="${label} ${value == null ? '检测中' : value + '%'}">${label}<b>${value == null ? '—' : value + '%'}</b><span class="strip-mini-track"><i style="width:${value == null ? 0 : Math.max(0, Math.min(100, value))}%"></i></span></span>`;
+    const metric = (label, value) => `<span class="strip-resource${metricClass(value)}" tabindex="0" data-resource-kind="${label === 'CPU' ? 'cpu' : 'memory'}" aria-label="${label} ${value == null ? '检测中' : value + '%'}，悬停查看占用 Top 3" title="${label} ${value == null ? '检测中' : value + '%'}">${label}<b>${value == null ? '—' : value + '%'}</b><span class="strip-mini-track"><i style="width:${value == null ? 0 : Math.max(0, Math.min(100, value))}%"></i></span></span>`;
+    const network = usage.network;
+    const rate = value => {
+      if (network?.status !== 'ok' || !Number.isFinite(value)) return '—';
+      if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)}<small>G</small>`;
+      if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)}<small>M</small>`;
+      return `${Math.round(value / 1024)}<small>K</small>`;
+    };
+    const networkTitle = network?.status === 'ok'
+      ? `本机物理网卡合计：${(network.adapters || []).join('、')}\n下行 ${(network.downloadBps / 1024).toFixed(1)} KB/s · 上行 ${(network.uploadBps / 1024).toFixed(1)} KB/s\n最近 ${(network.windowMs / 1000).toFixed(1)} 秒均值；含所有应用，非 VPN 专属流量；K/M/G 表示 KB/s、MB/s、GB/s，按 1024 换算`
+      : network?.status === 'unavailable' ? '网速暂不可用' : network?.status === 'disconnected' ? '没有已连接的物理网卡' : '网速采样中';
+    const transfer = `<span class="strip-transfer" title="${escapeHtml(networkTitle)}" aria-label="${escapeHtml(networkTitle)}"><span class="strip-download"><span class="strip-transfer-label">↓</span><b>${rate(network?.downloadBps)}</b></span><span class="strip-upload"><span class="strip-transfer-label">↑</span><b>${rate(network?.uploadBps)}</b></span></span>`;
     const location = displayRoute?.ok
       ? [displayRoute.countryZh || displayRoute.country || '国家未知', displayRoute.cityZh || displayRoute.city || '城市未知'].join(' ')
       : '出口未知';
@@ -382,10 +394,24 @@ function _sessionWarningText(session) {
     const markup =
       '<div class="strip-resources">' + metric('CPU', cpuPct) + metric('内存', memoryPct) + '</div>' +
       `<div class="strip-network"><button type="button" class="strip-route-row strip-route-foreign strip-proxy" title="${escapeHtml(foreignTitle)}"${ackAttr}><span class="strip-route-dot ${routeClass(displayRoute, proxyShort ? alert : null)}"></span><span>${proxyShort ? 'VPN' : '直连'}</span><span class="strip-location">${escapeHtml(location)}</span></button>` +
-      `<span class="strip-route-row strip-route-domestic" title="${escapeHtml(domesticTitle)}"><span class="strip-route-dot ${routeClass(domestic)}"></span>${domesticLabel}</span></div>`;
+      transfer + `<span class="strip-route-row strip-route-domestic" title="${escapeHtml(domesticTitle)}"><span class="strip-route-dot ${routeClass(domestic)}"></span>${domesticLabel}</span></div>`;
     if (stripEl._resourceMarkup === markup) return;
     stripEl._resourceMarkup = markup;
-    stripEl.innerHTML = markup;
+    // Keep focused/hovered resource anchors alive during the telemetry heartbeat.
+    if (stripEl.querySelector('[data-resource-kind]')) {
+      const template = doc.createElement('template');
+      template.innerHTML = markup;
+      for (const kind of ['cpu', 'memory']) {
+        const current = stripEl.querySelector(`[data-resource-kind="${kind}"]`);
+        const next = template.content.querySelector(`[data-resource-kind="${kind}"]`);
+        current.className = next.className;
+        current.title = next.title;
+        current.setAttribute('aria-label', next.getAttribute('aria-label'));
+        current.querySelector('b').textContent = next.querySelector('b').textContent;
+        current.querySelector('i').style.width = next.querySelector('i').style.width;
+      }
+      stripEl.querySelector('.strip-network').innerHTML = template.content.querySelector('.strip-network').innerHTML;
+    } else stripEl.innerHTML = markup;
     stripEl.title = '';
     stripEl.style.display = 'flex';
 
@@ -561,7 +587,7 @@ sessionListEl.addEventListener('keydown', event => {
   function collectSidebarItems(sessionMap = getSessions()) {
     const memberIds = new Set(Object.values(getMeetings()).flatMap(m => m.subSessions || []));
     const regularSessions = Array.from(sessionMap.values())
-    .filter(s => !s.meetingId && !memberIds.has(s.id) && s.kind !== 'chuxin-run' && !s.hiddenFromSidebar && s.purpose !== 'chuxin-research');
+    .filter(s => !s.meetingId && !memberIds.has(s.id) && s.kind !== 'xresearch-run' && !s.hiddenFromSidebar && s.purpose !== 'xresearch-research');
 
   const meetingItems = Object.values(getMeetings()).map(m => ({
     id: m.id,
@@ -715,12 +741,12 @@ sessionListEl.addEventListener('keydown', event => {
         target.appendChild(groupContainer);
       }
       const div = doc.createElement('div');
-      // 2026-07-19 道雪 · 方案C：群聊两行卡（行1 状态+标题+时间，行2 成员 mini-jump），
+      // 2026-07-19 maintainer · 方案C：群聊两行卡（行1 状态+标题+时间，行2 成员 mini-jump），
       //   不再渲染 badge pill（等你/休眠进 sl-state，已选数进行2 末尾）。
       const isDormantMeeting = s.status === 'dormant';
       const unreadMembers = getMeetingUnreadMemberIds(s._meeting, sessionMap);
       const hasUnread = sidebarItemHasUnread(s, sessionMap);
-      // 2026-07-20 道雪：群聊运行中 = 任一成员 agent 在运行（成员 running 已语义化）
+      // 2026-07-20 maintainer：群聊运行中 = 任一成员 agent 在运行（成员 running 已语义化）
       const meetingRuntime = _meetingRuntimeAggregate(s._meeting, sessionMap);
       const anySubRunning = meetingRuntime.running;
       const anySubWaiting = meetingRuntime.waiting;
@@ -880,7 +906,7 @@ sessionListEl.addEventListener('keydown', event => {
       return;
     }
 
-    // 2026-07-19 道雪 · 方案C：普通 session 单行密排（状态点/标题/模型/ctx/时间）。
+    // 2026-07-19 maintainer · 方案C：普通 session 单行密排（状态点/标题/模型/ctx/时间）。
     //   badge pill（等你/模型/Ctx/burn）全部移除：等待与未读改行底色+状态点，
     //   burn 聚合到侧栏底部 strip，模型与 ctx 变等宽小字列。
     const isActive = s.id === getActiveSessionId();

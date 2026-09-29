@@ -3,7 +3,7 @@
 const { supportsRecoverableSession } = require('../core/session-capabilities.js');
 
 function supportsRecoverableSessionKind(session) {
-  return !!(session && session.purpose !== 'chuxin-research' && supportsRecoverableSession(session));
+  return !!(session && session.purpose !== 'xresearch-research' && supportsRecoverableSession(session));
 }
 
 function createSessionContextMenuController({
@@ -65,7 +65,7 @@ function createSessionContextMenuController({
     const session = sessions.get(sessionId);
     const meeting = meetings[sessionId];
     if (restartBtn) {
-      const restartAllowed = !!(session && session.purpose !== 'chuxin-research');
+      const restartAllowed = !!(session && session.purpose !== 'xresearch-research');
       restartBtn.style.display = restartAllowed ? '' : 'none';
       if (restartAllowed) {
         restartBtn.textContent = '重启';
@@ -101,7 +101,7 @@ function createSessionContextMenuController({
     // 最终判定（要有原生会话 ID），这里只做最粗的类型过滤，不在前端复制那套规则。
     const joinGroupBtn = contextMenuEl.querySelector('[data-action="join-group"]');
     if (joinGroupBtn) {
-      joinGroupBtn.style.display = session && !meeting && forkUi && session.purpose !== 'chuxin-research' ? '' : 'none';
+      joinGroupBtn.style.display = session && !meeting && forkUi && session.purpose !== 'xresearch-research' ? '' : 'none';
     }
     const forkMeetingBtn = contextMenuEl.querySelector('[data-action="fork-meeting"]');
     if (forkMeetingBtn) {

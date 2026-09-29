@@ -1,6 +1,6 @@
 'use strict';
 // core/group-chat-watcher.js
-// 群聊 PTY 通信工具集（2026-05-03 道雪 阶段丙）。
+// 群聊 PTY 通信工具集（2026-05-03 maintainer 阶段丙）。
 // 从 main.js 抽出 5 个 helper：waitCliReady / sendToPty / extractStreamingText /
 //   cleanBufLen / checkHostShellTakeover。
 //
@@ -14,7 +14,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { detectHostShellTakeover } = require('./host-shell-detector.js');
+const { detectHostShellTakeover, detectCodexThreadEnded } = require('./host-shell-detector.js');
 const { isClaudeFamily, isCodexCliKind } = require('./ai-kinds.js');
 const { stripAnsi } = require('./ansi-utils.js');
 const {
@@ -26,7 +26,8 @@ const {
 // xterm bracketed paste mode markers（标准协议，claude code TUI 完整识别）。
 //   marker 之间的内容被 CLI 视作"一次粘贴"整体处理，无需 paste-detect timing 探测，
 //   BP_END 之后的 \r 直接作为提交信号被识别。
-//   Claude family 与当前 Codex 都支持；DeepSeek 迁移到 Codex 后也走 Codex 分支。
+//   Windows Codex 还会经过按键粘贴缓冲，正文后用非文本键结束缓冲，再提交。
+//   DeepSeek 迁移到 Codex 后也走 Codex 分支。
 //   marker 常量与分块/settle 原语都在 core/pty-prompt-submit.js，普通会话走同一套。
 //   本文件不再直接拼 BP 帧（writeBracketedPaste 负责），所以只引原语不引常量。
 const {
@@ -193,17 +194,13 @@ function createLivePtyRuntimeObserver(sessionManager, sid, kind) {
       } : {}),
     });
   } catch { return null; }
-  let queue = Promise.resolve();
   let disposed = false;
-  let writeErrorLogged = false;
+  const queue = new (require('./terminal-write-queue').TerminalWriteQueue)(terminal, error => {
+    console.warn('[group-chat] live PTY runtime probe write failed:', error && error.message);
+  });
   const enqueue = (data) => {
     if (disposed || !data) return;
-    queue = queue.then(() => new Promise(resolve => terminal.write(String(data), resolve))).catch(error => {
-      if (!writeErrorLogged) {
-        writeErrorLogged = true;
-        console.warn('[group-chat] live PTY runtime probe write failed:', error && error.message);
-      }
-    });
+    queue.enqueue(data);
   };
   const listener = (event = {}) => {
     if (event.sessionId === sid) enqueue(event.data);
@@ -213,7 +210,8 @@ function createLivePtyRuntimeObserver(sessionManager, sid, kind) {
   return {
     async probe(probeState) {
       if (disposed) return null;
-      await queue;
+      try { await queue.drain(); } catch { return null; }
+      if (disposed) return null;
       const buffer = terminal.buffer && terminal.buffer.active;
       if (!buffer) return null;
       const lines = [];
@@ -225,6 +223,7 @@ function createLivePtyRuntimeObserver(sessionManager, sid, kind) {
       const runtime = classifyTerminalRuntime(kind, lines);
       probeState.lastLiveRuntime = runtime;
       probeState.lastLiveLines = lines.slice(-12);
+      probeState.lastLiveScreen = lines;
       const advanced = advanceRunningAnimationCandidate(probeState.liveCandidate, runtime, Date.now());
       probeState.liveCandidate = advanced.candidate;
       if (!advanced.confirmed || runtime.state !== RUNTIME_RUNNING) return null;
@@ -239,6 +238,7 @@ function createLivePtyRuntimeObserver(sessionManager, sid, kind) {
       if (disposed) return;
       disposed = true;
       sessionManager.removeListener('output', listener);
+      queue.dispose();
       try { terminal.dispose(); } catch {}
     },
   };
@@ -267,6 +267,61 @@ async function waitForAgentWorkStart(observer, sessionManager, sid, kind, timeou
     || probeStrongPtyWorkStart(sessionManager, sid, kind, probeState);
   if (observer && (observer.started || observer.resolved)) return observer.acknowledgement;
   return observer?.clientSubmissionId ? null : pty;
+}
+
+// Codex 的「任务进行中，命令被禁用」提示。TUI 重绘会把旧提示再画一遍，所以不看输出流，
+// 只数可见屏幕上的条数：提交后比提交前多了，才是这一次被拒。
+const CODEX_BUSY_REJECTION_RE = /is disabled while a task is in progress/i;
+async function visibleBusyRejections(livePtyObserver) {
+  if (!livePtyObserver) return 0;
+  const state = { liveCandidate: null, ringCandidate: null };
+  await livePtyObserver.probe(state);
+  return (state.lastLiveScreen || []).filter(line => CODEX_BUSY_REJECTION_RE.test(line)).length;
+}
+async function codexRejectedBusyCommand(livePtyObserver, baseline, waitMs = 1200) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    if (await visibleBusyRejections(livePtyObserver) > baseline) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+}
+
+// /new、/clear（可带参数）在 Codex 里都是结束当前线程、开一条新线程。
+const CODEX_THREAD_SWITCH_COMMAND_RE = /^\s*\/(?:new|clear)(?:\s|$)/i;
+// Codex 在 /new 时不报任何 hook（新线程要到第一次提问才发 SessionStart），CLI 自己的执行
+// 证据是它打印的「To continue this session … (<刚结束的线程 id>)」。确认时把结论记在会话上，
+// 等新线程的 SessionStart 迟到时，改绑判定不必再从已经滚远的缓冲区里找这句话。
+async function waitCodexThreadSwitch(sessionManager, sid, sidBefore, livePtyObserver, busyBaseline, fromMark, timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const now = sessionManager.getSession?.(sid)?.codexSid || null;
+    if (now && now !== sidBefore) return 'switched';
+    // 缓冲区写满 1MB 后长度不再增长，按长度截取永远是空串：用累计输出标记取新输出。
+    const fresh = typeof sessionManager.getSessionOutputSince === 'function'
+      ? sessionManager.getSessionOutputSince(sid, fromMark)
+      : String(sessionManager.getSessionBuffer?.(sid) || '');
+    if (sidBefore && detectCodexThreadEnded(fresh, sidBefore)) {
+      sessionManager.noteCodexThreadEnded?.(sid, sidBefore);
+      return 'switched';
+    }
+    if (await visibleBusyRejections(livePtyObserver) > busyBaseline) return 'rejected';
+    if (Date.now() >= deadline) return 'timeout';
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+}
+
+// 画面上不再有带动画的工作行持续一小段时间，才算收尾结束；最多等 20 秒。
+async function waitCodexSettled(livePtyObserver, { quietMs = 1500, maxMs = 20000 } = {}) {
+  if (!livePtyObserver) { await new Promise(resolve => setTimeout(resolve, quietMs)); return; }
+  const start = Date.now();
+  let lastBusyAt = Date.now();
+  const state = { liveCandidate: null, ringCandidate: null };
+  while (Date.now() - start < maxMs) {
+    if (await livePtyObserver.probe(state)) lastBusyAt = Date.now();
+    if (Date.now() - lastBusyAt >= quietMs) return;
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
 }
 
 async function clearCodexInputLine(sessionManager, sid, kind) {
@@ -338,19 +393,38 @@ async function waitCliReady(sid, kind, maxMs = 60000) {
 // options.requireReady=false：跳过冷启动 waitCliReady（2026-09-03）。
 //   普通会话的输入框就摆在用户面前，CLI 显然已经在跑；再等一次 60s 的 ready 轮询
 //   只会把"打完字立刻发出去"变成有时要等几十秒。群聊派发默认仍为 true。
+const promptSubmissionQueues = new Map();
 async function sendToPty(sid, prompt, kind, options = {}) {
+  // Serialize submission, not the model's answer. Workflow dispatch and user
+  // interjections share this boundary so their paste chunks cannot interleave.
+  const previous=promptSubmissionQueues.get(sid);
+  // Enter the first submission synchronously so native cancellation registers
+  // its intent before a caller can close the session in this same tick.
+  const task=previous ? previous.catch(()=>{}).then(()=>sendToPtyImpl(sid,prompt,kind,options))
+    : sendToPtyImpl(sid,prompt,kind,options);
+  promptSubmissionQueues.set(sid,task);
+  try{return await task;}
+  finally{if(promptSubmissionQueues.get(sid)===task)promptSubmissionQueues.delete(sid);}
+}
+async function sendToPtyImpl(sid, prompt, kind, options = {}) {
+  if(options.shouldSubmit && !options.shouldSubmit())return {ok:false,notSent:true,reason:'派工已暂停或取消，本条未发送'};
   if (require('./session-speed').pendingSpeedSwitches.has(sid) && !options.localCommandObserver) {
     throw new Error('正在确认当前会话的速度设置，请完成后再发送');
   }
   const { sessionManager } = _deps;
   if (sessionManager.restartPending) throw Object.assign(new Error('Hub 正在重启，未发送新任务'), {notSent:true});
+  if (!options.workspaceRulesPrepared && sessionManager.memoryService?.withWorkspaceRules) {
+    return sessionManager.memoryService.withWorkspaceRules(sid,prompt,kind,options,
+      text=>sendToPtyImpl(sid,text,kind,{...options,workspaceRulesPrepared:true}));
+  }
   const native = (sessionManager.getNativeSession?.(sid) || sessionManager.getNativeCodex?.(sid));
   if (native) return native.send(prompt, {
     ...options, clientSubmissionId:options.clientSubmissionId || options.submissionReceipt?.clientSubmissionId,
   });
   const session = sessionManager.getSession?.(sid);
-  if (session && (session.kind === 'codex' || session.kind === 'codex-resume')) {
-    throw new Error('旧 Codex 会话尚未接管，未发送新消息');
+  // 原生 Codex 断了连接时不能退回 PTY 粘贴；PTY Codex 正常走下面的提交闭环。
+  if (session && session.runtimeBackend === 'codex-app-server') {
+    throw new Error('Codex 原生连接不可用，消息未发送');
   }
   const nativeClaude = sessionManager.getNativeClaude?.(sid);
   if (nativeClaude) {
@@ -377,7 +451,7 @@ async function sendToPty(sid, prompt, kind, options = {}) {
   const ENTER_RETRY_TRIES = 3;          // legacy 非协议路径的有界提交兜底
   const ENTER_RETRY_GAP_MS = 150;       // 兜底 \r 之间间隔
   const POST_ENTER_VERIFY_MS = 500;     // 提交后再观察一次活性，确认没卡
-  // bug A 修复（2026-05-03 道雪）：turn 间 race condition
+  // bug A 修复（2026-05-03 maintainer）：turn 间 race condition
   //   stop_hook / stop_reason 触发时 Claude 逻辑层已结束本轮，但 PTY 终端
   //   仍在异步喷收尾字符（清 spinner / 重画 prompt /TUI 装饰）。Hub 立刻 type
   //   下一轮 prompt 会撞上 PTY 余响，prompt 被 throbbing 状态吃掉、单个 \r
@@ -385,6 +459,26 @@ async function sendToPty(sid, prompt, kind, options = {}) {
   //   才标 absent。修：写 prompt 前等 PTY 真正静默 N ms。
   const PRE_PROMPT_QUIET_MS = 1500;     // 至少 1.5s PTY 无新字符
   const PRE_PROMPT_MAX_WAIT_MS = 8000;  // 上限：避免持续 spinner 死等
+
+  // 普通会话的第一条（2026-09-25 真机实测）：CLI 刚画出提示符、输入还没真正就绪时粘贴，
+  //   Codex 只收到最后一个字，Claude 整条丢失。requireReady=false 的调用方也要在
+  //   **第一次**发送前等一次就绪；最多 20s，超时照旧发送并留痕（闭环会把没提交如实报 stuck）。
+  //   只对刚启动一分钟内的会话生效：早已在跑的会话，输入框就摆在用户面前，不能再让人干等。
+  const createdAt = Number(sessionManager.getSession?.(sid)?.createdAt) || 0;
+  const freshlySpawned = createdAt > 0 && Date.now() - createdAt < 60000;
+  if (!requireReady && freshlySpawned && !sessionManager.getGroupChatReady(sid)
+      && (isClaudeFamily(kind) || isCodexCliKind(kind)) && _deps.cliReadyDetector) {
+    if (await waitCliReady(sid, kind, Number(_deps.firstPromptReadyMs) || 20000)) sessionManager.setGroupChatReady(sid, true);
+    else {
+      const readyKind = isCodexCliKind(kind) ? 'codex' : 'claude';
+      // 选择框还挂着时粘贴会被吞掉，回车还会替用户选默认项：宁可不发，也不能替人做选择。
+      if (_deps.cliReadyDetector.isChoiceDialogVisible?.(readyKind, sessionManager.getSessionBuffer(sid) || '')) {
+        throw Object.assign(new Error('CLI 正在等你在终端里做选择（例如启动提示），消息未发送；处理完后再发送'),
+          { notSent: true, code: 'cli-choice-pending' });
+      }
+      console.warn(`[group-chat] ${kind}(${sid.slice(0, 8)}) first prompt: CLI ready markers not seen in 20s; sending anyway`);
+    }
+  }
 
   // 冷启动：仅首次或 ready 被重置后（requireReady=false 的调用方整段跳过）
   if (requireReady && !sessionManager.getGroupChatReady(sid)) {
@@ -396,6 +490,15 @@ async function sendToPty(sid, prompt, kind, options = {}) {
       return false;
     }
     sessionManager.setGroupChatReady(sid, true);
+  }
+
+  // The TUI can exit after readiness was cached (for example a failed resume).
+  // A normal card prompt must never become a PowerShell command.
+  if (require('./ai-kinds').isAiKind(String(kind).replace(/-resume$/, ''))
+      && detectHostShellTakeover(sessionManager.getSessionBuffer(sid) || '')) {
+    sessionManager.setGroupChatReady(sid, false);
+    throw Object.assign(new Error('CLI 已退出到系统终端，消息未发送；请先重启会话'),
+      { notSent:true, code:'cli-exited' });
   }
 
   if ((options.restartContinuation || sessionManager.restartContinuationSessions?.has(sid)) && ['kimi','kimi-resume','gemini','gemini-resume','deepseek','deepseek-resume'].includes(kind)) {
@@ -416,6 +519,7 @@ async function sendToPty(sid, prompt, kind, options = {}) {
         sessionManager.writeToSession(sid,text.slice(offset,offset+2048));
         await new Promise(resolve=>setTimeout(resolve,12));
       }
+      require('./codex-pty-input').flushCodexPasteInput(sessionManager,sid,kind,text);
       await waitForPasteSettled({sessionManager,sid,settleMs:computeSettleMs(text.length),baselineMarker});
       writeSubmitSignal(sessionManager,sid,kind,0);
       const first=await receipt.wait(7000);
@@ -433,7 +537,7 @@ async function sendToPty(sid, prompt, kind, options = {}) {
   //   信号失真，timing 经常上限超时硬冲、\r 被吃掉、prompt 留输入框没提交。
   //   bracketed paste markers 是显式协议，CLI 一看到 BP_END 就明确"粘贴结束"，
   //   无需任何 timing 探测。claude family 实测稳定通过。
-  //   2026-06-18 道雪 实测：codex 0.137 也已支持 BP 协议（BP 包裹中文立即提交、不进
+  //   2026-06-18 maintainer 实测：codex 0.137 也已支持 BP 协议（BP 包裹中文立即提交、不进
   //     [Pasted Content] 粘贴态、不卡输入框）→ codex 改走此 fast-path，一并解决"卡输入框
   //     未提交"(Bug B) + "中文走 .md 文件中转嵌入"(Bug C：BP 直接发中文，不再经 writePromptToSession)。
   //   gemini 协议仍不识别（marker 被吃但 \r 不提交），保留旧主路径。
@@ -444,7 +548,17 @@ async function sendToPty(sid, prompt, kind, options = {}) {
     const turnStart = options.submissionReceipt || observeAgentTurnStart(sessionManager, sid, kind);
     const livePtyObserver = createLivePtyRuntimeObserver(sessionManager, sid, kind);
     try {
-    await clearCodexInputLine(sessionManager, sid, kind); // codex 清输入框残留，防与上次未提交内容拼接（claude no-op）
+    const codexBusyBaseline = isCodexCliKind(kind) && /^\s*\//.test(String(prompt || ''))
+      ? await visibleBusyRejections(livePtyObserver) : 0;
+    const codexThreadSwitch = isCodexCliKind(kind) && CODEX_THREAD_SWITCH_COMMAND_RE.test(String(prompt || ''));
+    const codexSidBefore = codexThreadSwitch ? (sessionManager.getSession?.(sid)?.codexSid || null) : null;
+    const outputMarkBefore = typeof sessionManager.getSessionOutputMark === 'function' ? sessionManager.getSessionOutputMark(sid) : 0;
+    if (options.submissionReceipt?.resolved) return alreadySubmitted();
+    // The native editor replaces the entire draft and preserves multi-line
+    // content. Do not clear first: a failed editor handoff must keep the draft.
+    const usedCodexEditorInput = isCodexCliKind(kind)
+      && await sessionManager.tryLoadCodexEditorInput?.(sid, prompt, { attachments: options.attachments || [] });
+    if (!usedCodexEditorInput) await clearCodexInputLine(sessionManager, sid, kind);
     if (options.submissionReceipt?.resolved) return alreadySubmitted();
     const beforeBufferLength = String(sessionManager.getSessionBuffer(sid) || '').length;
     const beforeWrite = sessionManager.getGroupChatLastActivity(sid);
@@ -452,10 +566,11 @@ async function sendToPty(sid, prompt, kind, options = {}) {
     //   随后那个 \r 被追加进同一条队列，很可能与 BP_END 落进 CLI 的同一个 stdin chunk
     //   被当粘贴尾巴吃掉。分片写让队列在最后一片写完时接近空，\r 才可能独立成块。
     const baselineMarker = snapshotPasteMarker(sessionManager, sid);
-    await writeBracketedPaste(sessionManager, sid, prompt, {
+    if (!usedCodexEditorInput) await writeBracketedPaste(sessionManager, sid, prompt, {
       chunkSize: Number(_deps && _deps.bracketedPasteChunkSize) || undefined,
       gapMs: Number(_deps && _deps.bracketedPasteChunkGapMs) || undefined,
     });
+    const codexPasteFlushed = usedCodexEditorInput || require('./codex-pty-input').flushCodexPasteInput(sessionManager,sid,kind,prompt);
     noteSubmittedPrompt(sid, kind, prompt); // codex 记录原始 prompt 供 transcript 提交校验（claude no-op）
     // BP_END 紧贴 \r 时 Ink 把 \r 当 paste 尾巴忽略，所以必须隔开再发。
     //   隔多久以前写死 500ms —— 短 prompt 够用，长 prompt 必然还在消化窗口内，
@@ -466,11 +581,15 @@ async function sendToPty(sid, prompt, kind, options = {}) {
     const configuredSettleMs = Number(_deps && _deps.bracketedPasteSettleMs);
     const pasteSettleMs = Number.isFinite(configuredSettleMs) && configuredSettleMs > 0
       ? configuredSettleMs
-      : computeSettleMs(String(prompt || '').length, {
+      // On Windows Codex, End flushes the native paste state before the Enter
+      // queued behind it. The ordered key boundary replaces a guessed delay;
+      // the task-start acknowledgement and bounded recovery below still apply.
+      : codexPasteFlushed ? 0 : computeSettleMs(String(prompt || '').length, {
         minMs: Number(_deps && _deps.bracketedPasteSettleMinMs) || undefined,
         maxMs: Number(_deps && _deps.bracketedPasteSettleMaxMs) || undefined,
       });
     await waitForPasteSettled({ sessionManager, sid, settleMs: pasteSettleMs, baselineMarker });
+    if (options.shouldSubmit && !options.shouldSubmit()) return {ok:false,notSent:true,reason:'派工已暂停或取消，本条未提交'};
     if (options.submissionReceipt?.resolved) return alreadySubmitted();
     // One Enter first.  Extra Enters are conditional on the absence of a
     // semantic work-start acknowledgement, rather than being fired blindly.
@@ -478,12 +597,56 @@ async function sendToPty(sid, prompt, kind, options = {}) {
     // empty submissions after a prompt already started.
     sessionManager.writeToSession(sid, '\r');
     let enterAttempts = 1;
+    const modelCommand = require('./cli-model-command').modelCommandType(kind, String(prompt || ''));
+    if (modelCommand) {
+      const deadline = Date.now() + 12000;
+      const probe = {};
+      while (Date.now() < deadline) {
+        await livePtyObserver?.probe(probe);
+        const fresh = stripAnsi(sessionManager.getSessionOutputSince?.(sid, outputMarkBefore) || '');
+        if (require('./cli-model-command').modelCommandAcknowledged(modelCommand, (probe.lastLiveScreen || []).join('\n'), fresh)) {
+          return { ok: true, sendStatus: 'ok', enterAttempts, acknowledgementSource: 'cli-model-command' };
+        }
+        if (require('./host-shell-detector').detectHostShellTakeover(sessionManager.getSessionBuffer(sid))) {
+          return { ok: false, notSent: true, sendStatus: 'rejected', enterAttempts, message: 'CLI 已退出，请重启会话后再切换模型' };
+        }
+        if (modelCommand === 'codex-picker' && await codexRejectedBusyCommand(livePtyObserver, codexBusyBaseline)) {
+          return { ok: false, notSent: true, sendStatus: 'rejected', enterAttempts, message: 'Codex 仍在处理上一轮，模型命令未执行' };
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      // A local menu never starts a model turn. An extra Enter could select
+      // its highlighted model, so uncertainty cannot trigger Enter recovery.
+      return { ok: true, sendStatus: 'stuck', enterAttempts, acknowledgementSource: null,
+        message: '模型命令尚未确认，请查看终端；未自动补发回车' };
+    }
     // Local settings commands do not start an agent turn. Their own explicit
     // acknowledgement must decide success; a TUI repaint is not confirmation.
     if (options.localCommandObserver) {
       const confirmation = await options.localCommandObserver.wait();
       return {ok:confirmation.ok,sendStatus:confirmation.ok ? 'ok' : 'stuck',
         message:confirmation.message,enterAttempts,acknowledgementSource:'local-command'};
+    }
+    // Codex 的 /new、/clear 不触发提交 hook，也不开工；它的确认就是「Hub 跟上了新线程」
+    // （新线程的 SessionStart 改绑了 codexSid）。不等开工信号、不补回车，否则既白等十几秒，
+    // 又会亮出「补发」——一点就再开一条线程。明确被拒则等空闲后只再提交一次。
+    if (codexThreadSwitch) {
+      const outcome = await waitCodexThreadSwitch(sessionManager, sid, codexSidBefore, livePtyObserver, codexBusyBaseline, outputMarkBefore);
+      if (outcome === 'switched') {
+        return { ok: true, sendStatus: 'ok', enterAttempts, acknowledgementSource: 'codex-thread-switch',
+          acknowledgementObservedAt: Date.now(), acknowledgementTurnId: null };
+      }
+      if (outcome === 'rejected') {
+        if (!options.retriedAfterBusyReject) {
+          console.warn(`[group-chat] codex(${sid.slice(0, 8)}) rejected ${String(prompt).trim()} while its previous task was still finishing; submitting once more after it settles`);
+          await waitCodexSettled(livePtyObserver);
+          return await sendToPtyImpl(sid, prompt, kind, { ...options, retriedAfterBusyReject: true, workspaceRulesPrepared: true });
+        }
+        return { ok: false, notSent: true, sendStatus: 'rejected', error: 'cli-busy-rejected', enterAttempts, acknowledgementSource: null,
+          message: 'Codex 仍在处理上一轮，命令被拒绝、没有执行；请稍后再发' };
+      }
+      console.warn(`[group-chat] codex(${sid.slice(0, 8)}) ${String(prompt).trim()} not confirmed by a thread switch`);
+      return { ok: true, sendStatus: 'stuck', enterAttempts, acknowledgementSource: null };
     }
 
     // 2026-05-05 fix（虚警 bug）：单点 500ms 后查一次 lastActivity 变化，对 claude
@@ -531,7 +694,11 @@ async function sendToPty(sid, prompt, kind, options = {}) {
       // 记下「看到屏幕在跑、且输入框里没有未提交的折叠粘贴」这个观察，
       //   循环结束后用它把"确认迟到"和"真的卡住"分开。
       let observedRunningWithClearInput = false;
+      let cliExitedDuringAck = false;
       for (let attempt = 0; !acknowledgement && attempt < retryMax;) {
+        // A slash command or CLI crash can return to PowerShell during the
+        // acknowledgement wait. Recovery Enter must never reach that shell.
+        if (require('./host-shell-detector').detectHostShellTakeover(sessionManager.getSessionBuffer(sid))) { cliExitedDuringAck = true; break; }
         if (turnStart.started || turnStart.resolved) {
           acknowledgement = turnStart.acknowledgement;
           break;
@@ -567,6 +734,11 @@ async function sendToPty(sid, prompt, kind, options = {}) {
         console.warn(`[group-chat] ${kind} prompt has no lifecycle acknowledgement for ${sid.slice(0, 8)}, but the screen ran with a clear input box; treating it as submitted`);
         acknowledgement = { source: 'pty-running-input-clear', observedAt: Date.now(), turnId: null };
       }
+      // 等确认期间 CLI 退回了命令行：明确报失败（不是 notSent，退出前正文可能已写进 CLI）。
+      if (!acknowledgement && cliExitedDuringAck) {
+        return { ok: false, sendStatus: 'cli-exited', error: 'cli-exited', enterAttempts, acknowledgementSource: null,
+          message: 'CLI 已退出到命令行，消息可能没有被接收，未补回车' };
+      }
       if (!acknowledgement) {
         console.warn(`[group-chat] ${kind} prompt submission not acknowledged for ${sid.slice(0, 8)} after late Enter recovery`);
         sendStatus = 'stuck';
@@ -581,9 +753,23 @@ async function sendToPty(sid, prompt, kind, options = {}) {
       if (sessionManager.getGroupChatLastActivity(sid) === beforeWrite) sendStatus = 'stuck';
     }
     if (options.submissionReceipt?.status === 'content-mismatch') sendStatus = 'content-mismatch';
+    // Codex 写完 task_complete 后还要收尾（Stop hook 等），这段时间 TUI 仍算「任务进行中」：
+    // 普通提问会被排队，斜杠命令却被直接拒绝（'/new' is disabled while a task is in progress），
+    // 而收尾中的工作行又会被上面当成「已开工」。明确被拒 = 没有执行，等空闲后只再提交一次。
+    if (isCodexCliKind(kind) && /^\s*\//.test(String(prompt || ''))
+        && await codexRejectedBusyCommand(livePtyObserver, codexBusyBaseline)) {
+      if (!options.retriedAfterBusyReject) {
+        console.warn(`[group-chat] codex(${sid.slice(0, 8)}) rejected a slash command while its previous task was still finishing; submitting once more after it settles`);
+        await waitCodexSettled(livePtyObserver);
+        return await sendToPtyImpl(sid, prompt, kind, { ...options, retriedAfterBusyReject: true, workspaceRulesPrepared: true });
+      }
+      return { ok: false, notSent: true, sendStatus: 'rejected', error: 'cli-busy-rejected', enterAttempts, acknowledgementSource: null,
+        message: 'Codex 仍在处理上一轮，命令被拒绝、没有执行；请稍后再发' };
+    }
     return {
       ok: sendStatus !== 'content-mismatch',
       sendStatus,
+      ...(usedCodexEditorInput ? { mode: 'codex-editor' } : {}),
       acknowledgementSource: acknowledgement && acknowledgement.source || null,
       acknowledgementObservedAt: acknowledgement && acknowledgement.observedAt || null,
       acknowledgementTurnId: acknowledgement && acknowledgement.turnId || null,
@@ -716,7 +902,7 @@ function extractStreamingText(sid, _kind) {
   const native = (_deps.sessionManager.getNativeSession?.(sid) || _deps.sessionManager.getNativeCodex?.(sid));
   if (native) {
     const blocks = native.blocks();
-    return {source:native.options?.kind && require('./acp-profiles').isAcpKind(native.options.kind) ? 'acp' : 'codex-app-server',blocks,text:blocks.map(b=>b.text).join('').slice(-500)};
+    return {source:native.isCliProvider ? 'provider-cli' : native.options?.kind && require('./acp-profiles').isAcpKind(native.options.kind) ? 'acp' : 'codex-app-server',blocks,text:blocks.map(b=>b.text).join('').slice(-500)};
   }
   const { transcriptTap } = _deps;
   const nativeClaude = _deps.sessionManager?.getNativeClaude?.(sid);
@@ -879,6 +1065,7 @@ async function resendCurrentPrompt({ sid, kind, prompt, promptHeader, timing, al
       //   它自己再踩一次同一个坑就毫无意义，所以改走与主路径同一套分块 + 自适应 settle。
       const baselineMarker = snapshotPasteMarker(sessionManager, sid);
       await writeBracketedPaste(sessionManager, sid, prompt);
+      require('./codex-pty-input').flushCodexPasteInput(sessionManager,sid,kind,prompt);
       noteSubmittedPrompt(sid, kind, prompt);
       await waitForPasteSettled({
         sessionManager,

@@ -21,8 +21,8 @@ function defaultHomeDir() {
   return process.env.USERPROFILE || process.env.HOME || os.homedir();
 }
 
-// 规范库 = home 目录自身的 project 桶，也就是用户在迁移到 C:\Vibe 之前
-// 一直在用的那个（~/.claude/projects/HOME-PROJECT/memory）。
+// 规范库 = home 目录自身的 project 桶，也就是用户在迁移到 C:\Workspace 之前
+// 一直在用的那个（~/.claude/projects/C--Users-you/memory）。
 function canonicalMemoryDir(homeDir = defaultHomeDir()) {
   return path.join(homeDir, '.claude', 'projects', projectSlug(homeDir), 'memory');
 }
@@ -140,7 +140,6 @@ function mergeIntoCanonical(memoryPath, canonical, slug, logger) {
 }
 
 function ensureMemoryLink(cwd, opts = {}) {
-  if (require('./distribution').community) return { errors: [], merged: [], conflicts: [], skipped: 'community-preserves-project-memory' };
   const result = { linked: [], skipped: [], errors: [], merged: [], conflicts: [], deduplicated: [] };
   if (!cwd) return result;
   const homeDir = opts.homeDir || defaultHomeDir();

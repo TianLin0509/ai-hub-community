@@ -23,7 +23,7 @@
  *
  * ## 做法
  *
- * 把 electron.exe 复制成同目录下的 AIGroupChatHub.exe，用 resedit 把图标资源和
+ * 把 electron.exe 复制成同目录下的 AIHubCommunity.exe，用 resedit 把图标资源和
  * 版本信息换成 Hub 自己的，快捷方式改指这个副本。于是三层全是橙色 logo，
  * Explorer 怎么重建都不会再摸到原子。
  *
@@ -39,7 +39,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const BRANDED_EXE_NAME = 'AIGroupChatHub.exe';
+const BRANDED_EXE_NAME = 'AIHubCommunity.exe';
 const BRAND_STAMP_NAME = '.hub-brand-stamp.json';
 const STALE_SUFFIX_PREFIX = '.stale-';
 const STAMP_VERSION = 2;
@@ -251,7 +251,7 @@ function samePathIgnoringCase(left, right, platform = process.platform) {
  * 所以这里必须有闸门：有实例在跑就跳过，留着 stamp 失配，下次冷启动再补。
  *
  * 判据用「能不能以写方式打开」：Windows 对正在执行的映像禁止写打开（EBUSY），
- * 这条在本机实测过（跑着的 AIGroupChatHub.exe → EBUSY；没人跑的副本 → 可写）。
+ * 这条在本机实测过（跑着的 AIHubCommunity.exe → EBUSY；没人跑的副本 → 可写）。
  * 误判只会偏向「跳过重建」，不会偏向「打断实例」。
  */
 function brandedExeInUse({
@@ -299,7 +299,7 @@ function cleanupStaleBrandedExes({ hostExePath, fsModule = fs, logger = console 
 function ensureBrandedHubExe({
   execPath,
   icoPath,
-  productName = 'AI 群聊 Hub',
+  productName = 'AI Hub Community',
   productVersion = '',
   platform = process.platform,
   fsModule = fs,

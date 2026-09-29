@@ -42,7 +42,13 @@ function createTurnCardRenderer(options = {}) {
 
   function prepareTurnForRender(sessionId, turn, opts = {}) {
     const session = opts.session || getSessionContext(sessionId) || null;
-    if (turn?.role === 'user') return { ...turn, attachmentCwd: session?.cwd || opts.cwd || turn.attachmentCwd };
+    if (turn?.role === 'user') {
+      const feedback = require('../core/native-feedback');
+      const receiptAuthoritative = feedback.hasNativeReceipt(turn);
+      return { ...turn, attachmentCwd: session?.cwd || opts.cwd || turn.attachmentCwd,
+        receiptAuthoritative, promptReceipt: feedback.promptReceipt(session, turn.clientSubmissionId,
+          {authoritative: receiptAuthoritative, deliveryStatus: turn.deliveryStatus}) };
+    }
     if (!turn || turn.role !== 'assistant') return turn;
     let toolCalls = Array.isArray(turn.toolCalls) ? turn.toolCalls : [];
     const live = session && Array.isArray(session.liveToolActivities) ? session.liveToolActivities : [];
@@ -177,10 +183,12 @@ function renderToolCluster(turnId, toolCalls, total = toolCalls?.length || 0) {
     counts.declined ? `${counts.declined} 已拒绝` : '',
   ].filter(Boolean).join(' · ');
   const items = activities.map(_renderToolRow).join('');
+  const activeOutput = [...activities].reverse().find(a => a.status === 'running' && a.name === 'commandExecution' && a.result);
+  const outputTail = activeOutput ? String(activeOutput.result).slice(-600).trim().split(/\r?\n/).slice(-2).join('\n') : '';
   return `<details class="tc-cluster turn-activity-rail${activities.length === 1 ? ' tc-cluster-single' : ''}" data-turn="${escapeHtml(turnId)}" data-activity-count="${total}">
     <summary class="tc-cluster-head"><span class="turn-activity-title">活动 ${total}</span><span class="turn-activity-breakdown">${total > activities.length ? `最近 ${activities.length} 项：` : ''}${escapeHtml(breakdown)}</span></summary>
     <div class="tc-cluster-list">${items}${total > activities.length ? '<button type="button" data-action="tc-show-all">查看全部活动</button>' : ''}</div>
-  </details>`;
+  </details>${outputTail ? `<div class="turn-active-output"><span>最近命令输出</span><pre>${escapeHtml(outputTail)}</pre></div>` : ''}`;
 }
 
 const renderDeliverySummary = delivery => require('./delivery-summary').renderDeliverySummary(delivery, escapeHtml);
@@ -455,7 +463,7 @@ function renderCardActions(turn) {
   const multi = '<button class="ta-btn ta-multi" data-action="multi-select">多选</button>';
   const secondary = user
     ? '<button class="ta-btn" data-action="resend">重发这条消息</button><button class="ta-btn" data-action="edit-resend">编辑重发</button><button class="ta-btn" data-action="prompt-inspect">查看完整 Prompt</button>'
-    : (activity ? '' : '<button class="ta-btn ta-company" data-action="sync-chatgpt">同步这条消息到公司</button>')
+      : ''
       + (!activity && turn.phase !== 'commentary' ? '<button class="ta-btn" data-action="regen" title="先查看待重发正文">重新生成…</button>' : '');
   return copy + '<details class="card-actions-menu"><summary class="card-actions-more" aria-label="更多消息操作">更多</summary>'
     + '<div class="card-actions-popover">' + multi + secondary + '</div></details>';
@@ -533,7 +541,7 @@ function renderTurnCard(turn) {
       </details>`;
   }
 
-  return `<div class="${cls}" data-turn-id="${escapeHtml(turn.id || '')}" data-response-id="${escapeHtml(turn.logicalTurnId || '')}" data-response-agent="${escapeHtml(turn.kind || '')}" data-phase="${escapeHtml(turn.phase || 'message')}" data-presentation-source="${escapeHtml(presentation.source || 'deterministic')}"${turn.inherited ? ' data-inherited="1"' : ''}>
+  return `<div class="${cls}"${isUser && turn.promptReceipt ? ` data-submission-id="${escapeHtml(turn.clientSubmissionId)}" data-receipt-authoritative="${turn.receiptAuthoritative === true}" data-delivery-status="${escapeHtml(turn.deliveryStatus || '')}"` : ''} data-turn-id="${escapeHtml(turn.id || '')}" data-response-id="${escapeHtml(turn.logicalTurnId || '')}" data-response-agent="${escapeHtml(turn.kind || '')}" data-phase="${escapeHtml(turn.phase || 'message')}" data-presentation-source="${escapeHtml(presentation.source || 'deterministic')}"${turn.inherited ? ' data-inherited="1"' : ''}>
     ${avatarHtml}
     <div class="turn-content">
       <div class="turn-head">
@@ -549,12 +557,13 @@ function renderTurnCard(turn) {
       ${thinkingHtml}
       <div class="turn-body${isProgress ? ' conversation-progress-row' : ''}${turn.text || emptyNative ? '' : ' turn-body-empty'}">${body}</div>
       ${attachments}
+      ${isUser && turn.promptReceipt ? `<div class="turn-prompt-receipt" role="status">${escapeHtml(turn.promptReceipt)}</div>` : ''}
       ${deliveryHtml}
       ${toolHtml}
       ${_renderMetaPills(turn)}
     </div>
   </div>`;
-  // 2026-06-28 道雪 · 深空灰气泡皮肤：气泡背景挂在 .turn-body 上，故把工具簇与 meta-pills
+  // 2026-06-28 maintainer · 深空灰气泡皮肤：气泡背景挂在 .turn-body 上，故把工具簇与 meta-pills
   //   移到 .turn-body 之后（气泡下方）——气泡只含对话正文，工具/徽章作为附属信息独立成行，
   //   同时让长文本折叠只作用于正文（不再连带折叠工具簇）。所有渲染路径都走整卡重渲染，无冲突。
 }
@@ -818,7 +827,7 @@ if (!options.root) win._mountTurnCard = mountTurnCard;
 //     Map contract. The `element` is recoverable via
 //     `doc.querySelector('.turn-card[data-turn-id="…"]')` (used by
 //     rerenderTurn already).
-// 2026-05-06 道雪 重做 b54a3b6（原 fix 在 fix/card-overlay-scroll-lock 分支没合上 master）+
+// 2026-05-06 maintainer 重做 b54a3b6（原 fix 在 fix/card-overlay-scroll-lock 分支没合上 master）+
 // Codex 多方审查补漏：chat UI 标准 scroll-respect-user 模式 — 仅当用户在底部 50px
 // 容差内才自动跟随,否则尊重用户向上翻历史的意图。此 helper 守护三处:
 //   (1) mountSessionTurnCard 的 opts.autoScroll(turn-complete-event 路径会传 true)
@@ -847,7 +856,8 @@ function mountOptimisticUserCard(sessionId, text, kind, options = {}) {
   if (placeholder) placeholder.style.display = 'none';
 
   const optimisticId = 'pending-user-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-  const turn = { id: optimisticId, role: 'user', text, ts: Date.now(), kind };
+  const turn = prepareTurnForRender(sessionId, { id: optimisticId, role: 'user', text, ts: Date.now(), kind,
+    clientSubmissionId: options.clientSubmissionId });
   let cardEl;
   try {
     const tmp = doc.createElement('div');
@@ -921,6 +931,7 @@ function turnRenderSignature(turn) {
     tsEnd: turn.tsEnd || null,
     toolCalls: Array.isArray(turn.toolCalls) ? turn.toolCalls : [],
     usage: turn.usage || null,
+    promptReceipt: turn.promptReceipt || '',
   });
   let hash = 2166136261;
   for (let i = 0; i < raw.length; i++) {
@@ -1052,7 +1063,7 @@ function mountSessionTurnCard(sessionId, turn, opts = {}) {
 
   // 5. insert into container — Spec 3 W16：streaming indicator 必须在末尾，
   // 所以新卡插在 indicator 之前（如果存在）
-  // 2026-05-06 道雪 scroll-respect-user：append 前先记录用户是否在底部,给 step 9 用
+  // 2026-05-06 maintainer scroll-respect-user：append 前先记录用户是否在底部,给 step 9 用
   // 2026-05-24：必须用 `:scope > .streaming-indicator` 限定为 container 直接子。
   // W15 v2 (_updateStreamingIndicator) 把 indicator 迁进 turn-card.turn-head 后，
   // 普通 querySelector 会递归命中嵌套节点 → insertBefore 撞 ref 非直接子抛
@@ -1075,7 +1086,7 @@ function mountSessionTurnCard(sessionId, turn, opts = {}) {
   _turnRenderSigs.set(turn.id, turnRenderSignature(turnForRender));
   publishTurnPresentation(sessionId, turnForRender);
 
-  // 9. autoScroll — 2026-05-06 道雪 scroll-respect-user:仅当用户原本在底部时才滚
+  // 9. autoScroll — 2026-05-06 maintainer scroll-respect-user:仅当用户原本在底部时才滚
   //   (向上翻历史时不打断,避免被新 turn 拍回底部)
   if (opts.autoScroll && _wasAtBottom) {
     if (container._cardFollowController) container._cardFollowController.request();

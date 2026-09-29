@@ -7,7 +7,7 @@
  * buildCodexMcpIsolationArgs），普通 Codex 会话现在默认 none。
  * Claude 这边一直是**全量继承** —— 每开一个 Claude 会话，~/.claude.json 里
  * 那七个 MCP server（playwright / gemini-cli / codex-cli / deepseek / qwen /
- * glm / superran）全部拉起来，每个都是一个常驻子进程。开三四个会话就很可观。
+ * glm / wireless-sim）全部拉起来，每个都是一个常驻子进程。开三四个会话就很可观。
  *
  * Claude CLI 没有"逐个禁用"的开关，但有 `--mcp-config <file> --strict-mcp-config`：
  * strict 表示"只认这个文件，忽略所有其它来源"。所以做法是把用户现有的 server 定义
@@ -24,19 +24,19 @@ const path = require('path');
 
 // 2026-08-29 改默认：full → none。
 // 起因是用户报「内存怎么这么高」。实测：Claude 默认 full 意味着每开一个会话都把
-// ~/.claude.json 里 7 个 MCP server 全拉起来，其中 superran 一个就恒定提交 2.66 GB
+// ~/.claude.json 里 7 个 MCP server 全拉起来，其中 wireless-sim 一个就恒定提交 2.66 GB
 // （实占只有 20–30 MB，全是启动时一次性提交、之后从没碰过）。当时机器上有 13 个
-// Claude 会话 → 单是 superran 就吃掉 34.6 GB 提交内存，占系统总额度的三分之一。
-// 用户明确要求：「只有我提到的时候才加载 superRAN，否则不应该加载」。
+// Claude 会话 → 单是 wireless-sim 就吃掉 34.6 GB 提交内存，占系统总额度的三分之一。
+// 用户明确要求：「只有我提到的时候才加载 wireless-sim，否则不应该加载」。
 //
 // none 与 Codex 端语义对齐：硬关，连「工作区在无线目录下自动放行」都不走。
 const CLAUDE_MCP_PROFILES = new Set(['none', 'full', 'lean', 'browser', 'wireless']);
 const DEFAULT_CLAUDE_MCP_PROFILE = 'none';
 
-// 同一个能力在 Claude 和 Codex 的配置里叫法不一样（claude 是 superran，
+// 同一个能力在 Claude 和 Codex 的配置里叫法不一样（claude 是 wireless-sim，
 // codex 历史上写的是 superwireless），两边都列上，谁在就放行谁。
-const BROWSER_MCP_NAMES = ['playwright', 'claude-in-chrome', 'chrome-devtools', 'puppeteer'];
-const WIRELESS_MCP_NAMES = ['superran', 'superwireless'];
+const BROWSER_MCP_NAMES = ['playwright', 'claude-in-chrome', 'chrome-devtools', 'puppeteer', 'web_roundtable'];
+const WIRELESS_MCP_NAMES = ['wireless-sim', 'superwireless'];
 
 function normalizeClaudeMcpProfile(value) {
   const normalized = String(value || DEFAULT_CLAUDE_MCP_PROFILE).trim().toLowerCase();
@@ -96,7 +96,7 @@ function isWirelessWorkspace(cwd) {
 function resolveAllowedMcpNames(profile, { cwd, extraAllowed = [] } = {}) {
   const normalized = normalizeClaudeMcpProfile(profile);
   // none 是硬关：extraAllowed 和「无线工作区自动放行」都不生效，与 Codex 端一致。
-  // 否则默认档一落到无线目录下就又把 superran 拉起来，等于默认没关。
+  // 否则默认档一落到无线目录下就又把 wireless-sim 拉起来，等于默认没关。
   if (normalized === 'none') return new Set();
   const allowed = new Set(extraAllowed.filter(Boolean));
   if (normalized === 'browser') BROWSER_MCP_NAMES.forEach(name => allowed.add(name));
@@ -146,7 +146,6 @@ function buildClaudeMcpProfileArgs({
 } = {}) {
   const profile = normalizeClaudeMcpProfile(mcpProfile);
   const empty = { args: '', profile, keptServers: [], configPath: null };
-  if (profile === 'full') return empty;
   if (!hubDataDir) return empty;
 
   try {
@@ -154,12 +153,16 @@ function buildClaudeMcpProfileArgs({
     // 会抛异常的地方 —— 而 none 是默认档，它的失败回退方向是「全量加载」，代价最大。
     const servers = profile === 'none' ? {} : listClaudeMcpServers({ homeDir, cwd, fsModule });
     const allowed = resolveAllowedMcpNames(profile, { cwd, extraAllowed });
-    const kept = filterMcpServers(servers, allowed);
+    const kept = profile === 'full' ? {} : filterMcpServers(servers, allowed);
+    if (require('./web-roundtable/integration').enabled(profile)) {
+      const { name, ...server } = require('./web-roundtable/integration').entry(hubDataDir);
+      kept[name] = server;
+    }
     const configPath = writeClaudeMcpProfileConfig({ hubDataDir, profile, servers: kept, fsModule });
     return {
       // --strict-mcp-config 是关键：只给 --mcp-config 而不加 strict 的话，
       // CLI 会把这个文件和用户全局配置**合并**，等于什么都没省。
-      args: ` --mcp-config "${configPath.replace(/\\/g, '\\\\')}" --strict-mcp-config`,
+      args: ` --mcp-config "${configPath.replace(/\\/g, '\\\\')}"${profile === 'full' ? '' : ' --strict-mcp-config'}`,
       profile,
       keptServers: Object.keys(kept).sort(),
       configPath,

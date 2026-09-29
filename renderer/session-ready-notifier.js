@@ -11,7 +11,7 @@ const {
 
 function isDesktopNotificationReady(session) {
   if (!session || typeof session !== 'object' || !session.id) return false;
-  if (session.meetingId || session.hiddenFromSidebar || session.purpose === 'chuxin-research') return false;
+  if (session.meetingId || session.hiddenFromSidebar || session.purpose === 'xresearch-research') return false;
   if (String(session.status || '').toLowerCase() === 'dormant') return false;
   if (attentionStateOf(session) !== ATTENTION_REPLY_READY) return false;
   if (Math.max(0, Number(session.unreadCount) || 0) < 1) return false;

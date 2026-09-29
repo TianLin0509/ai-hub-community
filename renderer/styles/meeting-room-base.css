@@ -33,7 +33,7 @@
   min-width: 0;
   background: var(--bg-primary, var(--surface-canvas));
   color: var(--text-primary, var(--fg-default));
-  /* Phase 7(2026-05-05 道雪): G 方案 — 地平线光晕。卡片底部 ~80px 高度有微蓝径向光晕,
+  /* Phase 7(2026-05-05 maintainer): G 方案 — 地平线光晕。卡片底部 ~80px 高度有微蓝径向光晕,
      暗示"AI 群聊中心"。pointer-events:none 防止挡 click;伪元素层 z-index 低于 footer。 */
   position: relative;
 }

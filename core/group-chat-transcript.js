@@ -103,7 +103,7 @@ function renderTranscriptMarkdown(state, opts = {}) {
     `- 消息数：${kept.length}${first && last ? `（#${first.seq} – #${last.seq}）` : ''}`,
     `- 生成时间：${formatTime(Date.now())}`,
     '',
-    '> 本文件由 AI 群聊 Hub 自动生成，每次群聊状态保存后刷新；手工修改会被覆盖。',
+    '> 本文件由 AI Hub Community 自动生成，每次群聊状态保存后刷新；手工修改会被覆盖。',
     '> 引用历史发言请用 `#序号`。过程汇报（UPDATE）不收录，只留正式发言。',
     '',
   ];

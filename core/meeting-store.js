@@ -16,7 +16,7 @@ function _isMeetingRemoved(meetingId) {
   return !!(ss && typeof ss.isMarkedRemovedMeeting === 'function' && ss.isMarkedRemovedMeeting(meetingId));
 }
 
-// 2026-05-07 道雪 — schemaVersion 1→2：补全 title/scene/createdAt/subSessions/...
+// 2026-05-07 maintainer — schemaVersion 1→2：补全 title/scene/createdAt/subSessions/...
 //   字段，让 per-meeting JSON 成为完整权威备份。即使 state.json 损坏或被外部 Hub
 //   覆盖，下次 boot 也能从 meetings/<id>.json 单独恢复整间 AI 群聊。
 //   loadMeetingFile 同时支持 v1（部分字段）与 v2（完整字段），调用方按 schemaVersion
@@ -69,7 +69,7 @@ function _buildMeetingPayload(id, data) {
     lastCompletedAt: typeof data.lastCompletedAt === 'number' ? data.lastCompletedAt : null,
     covenantText: typeof data.covenantText === 'string' ? data.covenantText : '',
     immersive: !!data.immersive,
-    // 串行工作流配置（2026-06-17 道雪）：群聊可反复用，需重启恢复
+    // 串行工作流配置（2026-06-17 maintainer）：群聊可反复用，需重启恢复
     serialWorkflow: (data.serialWorkflow && typeof data.serialWorkflow === 'object') ? data.serialWorkflow : null,
     // 时间戳
     updatedAt: typeof data.updatedAt === 'number' ? data.updatedAt : now,

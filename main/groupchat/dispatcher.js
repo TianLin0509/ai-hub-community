@@ -97,11 +97,11 @@ function createGroupChatDispatcher(deps) {
   const activeWatchers = new Map();
   const activeWatchersByAttempt = new Map();
   const pasteTrappedMonitors = new Map();
-  // 抢占式连发（2026-06-24 道雪）：每个 meeting 的派发序号，单调递增。runGroupChatTurn
+  // 抢占式连发（2026-06-24 maintainer）：每个 meeting 的派发序号，单调递增。runGroupChatTurn
   //   完成时比对，若已有更新的轮号 → 自己是被抢占的旧轮，给前端的 turn-complete 带 superseded。
   const meetingDispatchSeq = new Map();
   const meetingHandoffSeq = new Map();
-  // 运行中中断（2026-07-29 道雪）：每个 meeting 的中断代际，单调递增。
+  // 运行中中断（2026-07-29 maintainer）：每个 meeting 的中断代际，单调递增。
   //   用于关掉「用户在 sendToPty 还没跑完时就点了停止」的竞态窗口——此刻 activeWatchers
   //   里还没有 watcher 可以结算，如果不记代际，这一轮会在中断之后才开始等待，卡片
   //   永久停在"思考中"（正是 ae64983 修过的那类卡死）。
@@ -704,7 +704,7 @@ function createGroupChatDispatcher(deps) {
           if (watcher.isSettled() || codexPromptSubmitted) return;
           // File workflows are continued by the user. Missing output never
           // authorizes another prompt submission or a timed recovery action.
-          if (DevFile.enabled(meetingManager.getMeeting(meetingId))) return;
+          if (DevFile.enabled(meetingManager.getMeeting(meetingId)) || require('../../core/delivery-workflow').enabled(meetingManager.getMeeting(meetingId))) return;
           const currentWaitSession = sessionManager.getSession(sid) || waitSession;
           const boundNow = hasBoundCodexTranscript(currentWaitSession);
           if (!boundNow) {
@@ -935,6 +935,12 @@ function createGroupChatDispatcher(deps) {
     });
   }
 
+  // 与梦境索引/工作区规则的压缩检测同源：session 上由 statusline / rollout 维护的已用上下文。
+  function memberContextUsed(sid) {
+    const s = sessionManager.getSession(sid);
+    return s && typeof s.contextUsed === 'number' ? s.contextUsed : null;
+  }
+
   function groupMembersForMeeting(meeting, { includeDormant = false } = {}) {
     const subSids = Array.isArray(meeting && meeting.subSessions) ? meeting.subSessions : [];
     const specs = Array.isArray(meeting && meeting.slotSpecs) ? meeting.slotSpecs : [];
@@ -1006,7 +1012,11 @@ function createGroupChatDispatcher(deps) {
         runId,
         // 点2：首次带 systemPrompt(整套规则)、之后只发增量。[全量注入] includeCommitteeMid:true —— 把
         //   上一幕委员发言全文注入本幕，每个 AI 看到队友调研全文（点评看建库、辩论看点评），不再瞎猜。
-        prompt: _orch.buildFirstDelta(member.sid, userInput || '', systemPromptText, { currentUserMessageAppended: false, includeCommitteeMid: true }),
+        prompt: _orch.buildFirstDelta(member.sid, userInput || '', systemPromptText, {
+          currentUserMessageAppended: false,
+          includeCommitteeMid: true,
+          contextUsed: memberContextUsed(member.sid),
+        }),
       };
     });
     for (const target of targets) {
@@ -1049,6 +1059,7 @@ function createGroupChatDispatcher(deps) {
             sid: t.sid, label: t.label, status: 'errored', text: '',
             reason: failure.code, failure, runId, attemptId: t.attemptId,
             deliveredIdx: t.deliveredIdx, deliveredSeq: t.deliveredSeq,
+            promptDelivered: false,
           }, t);
           if (t.attemptId) _orch.settleAttempt(t.attemptId, result);
           sendFailures.push(result);
@@ -1059,6 +1070,7 @@ function createGroupChatDispatcher(deps) {
           sid: t.sid, label: t.label, status: 'errored', text: '',
           reason: failure.code, failure, runId, attemptId: t.attemptId,
           deliveredIdx: t.deliveredIdx, deliveredSeq: t.deliveredSeq,
+          promptDelivered: false,
         }, t);
         if (t.attemptId) _orch.settleAttempt(t.attemptId, result);
         sendFailures.push(result);
@@ -1104,7 +1116,7 @@ function createGroupChatDispatcher(deps) {
     return { status: 'completed', turnNum: null, results, meta: { dispatchMode: 'internal' } };
   }
 
-  // 抢占式结算（2026-06-24 道雪）：用户点发送即放行的核心。新一轮进来时，把这个
+  // 抢占式结算（2026-06-24 maintainer）：用户点发送即放行的核心。新一轮进来时，把这个
   //   meeting 当前所有还在等待回答的 AI（上一轮没答完的）立即结算为 superseded，让它们的
   //   waitTurnComplete Promise 立刻 resolve → 上一轮 runGroupChatTurn 的 Promise.allSettled
   //   立即完成 → 串行队列放行新轮，不再被卡死的 AI 无限期挂起。
@@ -1133,7 +1145,16 @@ function createGroupChatDispatcher(deps) {
     return count;
   }
 
-  // 运行中中断（2026-07-29 道雪）：把「用户在单 session 里按 ESC」这件事批量下发给
+  function handoffMeetingTurn(meetingId) {
+    const key=String(meetingId || ''),seq=(meetingDispatchSeq.get(key) || 0)+1;
+    meetingDispatchSeq.set(key,seq);
+    meetingHandoffSeq.set(key,seq);
+    // Files can arrive while sendToPty is still awaiting acceptance. Advancing
+    // the generation also hands off watchers registered after this call.
+    return supersedeActiveWatchersForMeeting(meetingId,true);
+  }
+
+  // 运行中中断（2026-07-29 maintainer）：把「用户在单 session 里按 ESC」这件事批量下发给
   //   本轮所有在跑的成员。顺序刻意是「先结算、再发 ESC」：
   //     ① 先 watcher.interrupt(partialText) —— 状态机立刻收敛到确定态（interrupted），
   //        不依赖 CLI 是否回吐 stop 信号。CLI 挂了 / 不认 ESC 也不会留下永久"思考中"。
@@ -1266,7 +1287,7 @@ function createGroupChatDispatcher(deps) {
     if (!args.silent) {
       dispatchSeq = (meetingDispatchSeq.get(key) || 0) + 1;
       meetingDispatchSeq.set(key, dispatchSeq);
-      const fileHandoff=args.fileHandoff === true && DevFile.enabled(meetingManager.getMeeting(meetingId));
+      const fileHandoff=args.fileHandoff === true && (DevFile.enabled(meetingManager.getMeeting(meetingId)) || require('../../core/delivery-workflow').enabled(meetingManager.getMeeting(meetingId)));
       if(fileHandoff)meetingHandoffSeq.set(key,dispatchSeq);else meetingHandoffSeq.delete(key);
       try { supersedeActiveWatchersForMeeting(meetingId, fileHandoff); }
       catch (e) { warn('[groupchat] preempt supersede threw:', e && e.message); }
@@ -1284,20 +1305,23 @@ function createGroupChatDispatcher(deps) {
     userInput,
     turnTimeoutMs,
     targetMemberIds,
+    recipientSids,
     heroIdBySid,
     silent,
     allowActiveExtend,
     appendUserMessage,
     reuseTurnNum,
     dispatchMode,
+    dispatchPresentation,
     workflowRun,
     clientMessageId,
     _dispatchSeq,
     shouldDispatch,
+    onSubmission,
   } = {}) {
     if (shouldDispatch && !shouldDispatch()) return { status: 'error', reason: '文件进度已变化或用户已停止', turnNum: null };
     const turnStartedAt = Date.now();
-    // 在飞派发计数（2026-07-29 道雪）：给 interruptMeetingTurn 区分「真没人在跑」
+    // 在飞派发计数（2026-07-29 maintainer）：给 interruptMeetingTurn 区分「真没人在跑」
     //   和「有轮正卡在 sendToPty」。silent 内部编排不计入（不属于用户可见轮）。
     const inFlightKey = String(meetingId || '');
     if (!silent) meetingInFlightTurns.set(inFlightKey, (meetingInFlightTurns.get(inFlightKey) || 0) + 1);
@@ -1306,7 +1330,7 @@ function createGroupChatDispatcher(deps) {
       if (!meeting || !meeting.groupChat) {
         return { status: 'error', reason: 'not group chat meeting', turnNum: null };
       }
-      // 运行中中断的竞态门（2026-07-29 道雪）：记下本轮开跑时的中断代际。
+      // 运行中中断的竞态门（2026-07-29 maintainer）：记下本轮开跑时的中断代际。
       //   sendToPty 可能要跑几秒，用户在这段窗口点「停止」时 activeWatchers 里还没有
       //   本轮 watcher，中断会落空 → 本轮随后开始等待、永远等不到 → 永久"思考中"。
       const interruptKey = String(meetingId || '');
@@ -1321,6 +1345,7 @@ function createGroupChatDispatcher(deps) {
         members.map(member => member.sid)
       );
 
+      if(recipientSids!==undefined)targetMemberIds=require('../../core/groupchat-recipients').memberIds(meeting,recipientSids);
       const explicitTargetIds = Array.isArray(targetMemberIds)
         ? targetMemberIds.map(x => String(x || '').toLowerCase()).filter(Boolean)
         : [];
@@ -1331,7 +1356,7 @@ function createGroupChatDispatcher(deps) {
           }
         : parseGroupTargets(userInput || '', members, meeting.participants);
       const targetMembers = routed.targets || [];
-      if (DevFile.enabled(meeting)) {
+      if (DevFile.enabled(meeting) || require('../../core/delivery-workflow').enabled(meeting)) {
         const historyOrch=groupchat.getOrchestrator(getHubDataDir(),meetingId);
         const waiting=()=>{
           const receipts=Object.values(historyOrch.state.devChatHistory?.receipts || {});
@@ -1378,7 +1403,7 @@ function createGroupChatDispatcher(deps) {
         if(interruptedSinceStart() || (shouldDispatch && !shouldDispatch()))
           return {status:'error',reason:'文件进度已变化或用户已停止',turnNum:null};
       }
-      // 2026-07-20 道雪 [修#3d]：被勾选但 dormant/不可达的成员以 absent 合入本轮，
+      // 2026-07-20 maintainer [修#3d]：被勾选但 dormant/不可达的成员以 absent 合入本轮，
       //   不再静默消失（此前卡片全程"思考中"、轮末查无此人）。仅整组发送时统计；
       //   @ 点名/显式 targetMemberIds 时，未被点到的不算缺席。
       const isRoutedSubset = explicitTargetIds.length > 0 || (routed.mentions && routed.mentions.length > 0);
@@ -1390,7 +1415,7 @@ function createGroupChatDispatcher(deps) {
           .filter(({ sid, idx }) => checkedIdx.has(idx) && !targetSidSet.has(sid))
           .map(({ sid, idx }) => {
             const s = sessionManager.getSession(sid);
-            return { sid, label: (s && (s.title || s.kind)) || `AI ${idx + 1}`, status: 'absent', text: '', reason: 'session_not_ready', deliveredIdx: null };
+            return { sid, label: (s && (s.title || s.kind)) || `AI ${idx + 1}`, status: 'absent', text: '', reason: 'session_not_ready', deliveredIdx: null, promptDelivered: false };
           });
       }
       if (targetMembers.length === 0 && absentMembers.length === 0) {
@@ -1423,6 +1448,9 @@ function createGroupChatDispatcher(deps) {
             runId: workflowRun.runId || null,
             toMemberIds: targetMembers.map(m => m.memberId).filter(Boolean),
             toLabels: targetMembers.map(m => m.displayName).filter(Boolean),
+            ...(workflowRun.kind==='delivery' && dispatchPresentation ? {
+              goal:dispatchPresentation.goal,stageName:dispatchPresentation.stageName,
+            } : {}),
           }
         : null;
       const begin = orch.beginTurn(userInput || '', {
@@ -1447,6 +1475,10 @@ function createGroupChatDispatcher(deps) {
       const deliveredSeq = deliveredMessage && Number.isInteger(deliveredMessage.seq) ? deliveredMessage.seq : 0;
       const fileMembers = DevFile.enabled(meeting) ? groupMembersForMeeting(meeting, { includeDormant: true }) : [];
       const fileProtocolKey = DevFile.enabled(meeting) ? DevFile.protocolKey(meeting, fileMembers) : null;
+      // 群成员名单按群聊成员身份算（含暂时 dormant 的），只给名字 + CLI/模型。
+      // 用「本轮是否在线」算会让成员一休眠就被报成「已离开」。
+      const roster = groupMembersForMeeting(meeting, { includeDormant: true })
+        .map(m => ({ sid: m.sid, name: m.displayName, kind: m.kind, model: m.model }));
       const targets = targetMembers.map(member => {
         const systemPromptText = groupchat.buildSystemPromptText(member.displayName, meeting.scene, {
           kind: member.kind,
@@ -1460,6 +1492,8 @@ function createGroupChatDispatcher(deps) {
         const basePrompt = DevDiscuss.appendDiscussBlock(
           orch.buildFirstDelta(member.sid, userInput || '', systemPromptText, {
             currentUserMessageAppended: begin.didAppendUserMessage,
+            roster,
+            contextUsed: memberContextUsed(member.sid),
           }),
           DevFile.enabled(meeting)
             ? (needsFileProtocol ? DevFile.common(meeting, DevFile.directory(getHubDataDir(), meeting.id), fileMembers) : '')
@@ -1502,7 +1536,7 @@ function createGroupChatDispatcher(deps) {
             dispatchAt: turnStartedAt,
           });
           t.attemptId = receipt && receipt.attemptId;
-          if (DevFile.enabled(meeting)) require('../../core/dev-chat-history').rememberPrompt(orch,t.sid,receipt);
+          if (DevFile.enabled(meeting) || require('../../core/delivery-workflow').enabled(meeting)) require('../../core/dev-chat-history').rememberPrompt(orch,t.sid,receipt);
           t.attempt = t.attemptId ? orch.getAttempt(t.attemptId) : null;
           if (t.attempt && !silent) publishAttempt(meetingId, orch, t.attempt);
         }
@@ -1524,9 +1558,11 @@ function createGroupChatDispatcher(deps) {
           }
           const sendResult = await groupChatWatcher.sendToPty(t.sid, t.prompt, t.kind, {
             clientSubmissionId: t.attemptId, metadata: { attemptId: t.attemptId, runId, meetingId, turnNum },
+            shouldSubmit:()=>!interruptedSinceStart() && (!shouldDispatch || shouldDispatch()),
           });
           const ok = sendResult && sendResult.ok;
           const sendStatus = sendResult && sendResult.sendStatus;
+          if (onSubmission) onSubmission({memberId:t.member.memberId,sid:t.sid,attemptId:t.attemptId,ok:!!ok && sendStatus!=='stuck',sendStatus,reason:sendResult?.reason,at:Date.now()});
           try {
             orch.setSendStatus(turnNum, t.sid, sendStatus || (ok ? 'submitted' : 'send_failed'), {
               acknowledgementSource: sendResult && sendResult.acknowledgementSource,
@@ -1575,7 +1611,7 @@ function createGroupChatDispatcher(deps) {
             }
             // 送达确认了才记「这位收到过这几条插话」。发送失败走 else 分支，账本原样留着。
             if (t.supplementSeqs && t.supplementSeqs.length) {
-              try { orch.markUserSupplementsDelivered(t.sid, t.supplementSeqs); }
+              try { orch.markUserSupplementsDelivered(t.sid, t.supplementSeqs, {queued:sendStatus==='queued'}); }
               catch (e) { warn('[groupchat] mark user supplement delivered failed:', e && e.message); }
             }
             t.promptSubmitSinceTs = Math.max(0, sendStartedAt - 1000);
@@ -1603,6 +1639,8 @@ function createGroupChatDispatcher(deps) {
               reason: sendResult && sendResult.reason || 'cli_not_ready',
               deliveredIdx: t.deliveredIdx,
               deliveredSeq: t.deliveredSeq,
+              // 没送进 CLI：completeTurn 不得推进它的已读游标（下一轮要补上这段）。
+              promptDelivered: false,
               runId,
               attemptId: t.attemptId,
               failure: classifyProviderFailure({
@@ -1628,6 +1666,7 @@ function createGroupChatDispatcher(deps) {
             reason: e && e.message || 'send_exception',
             deliveredIdx: t.deliveredIdx,
             deliveredSeq: t.deliveredSeq,
+            promptDelivered: false,
             runId,
             attemptId: t.attemptId,
             failure: classifyProviderFailure({ code:e?.code, uncertain:e?.uncertain, reason: e && e.message || 'send_exception', force: true }),
@@ -1644,7 +1683,7 @@ function createGroupChatDispatcher(deps) {
       }));
 
       if (sentTargets.length === 0) {
-        // 2026-07-20 道雪 [修#3d 边界]：全部被勾选成员都 dormant/不可达时，仍以 absent
+        // 2026-07-20 maintainer [修#3d 边界]：全部被勾选成员都 dormant/不可达时，仍以 absent
         //   落轮——让用户看到"缺席"占位，而不是问题发出后整轮凭空回滚消失。
         const immediateFailures = absentMembers.concat(sendFailures);
         if (immediateFailures.length > 0 && !silent) {
@@ -1674,7 +1713,7 @@ function createGroupChatDispatcher(deps) {
         return { status: 'no_sent', turnNum };
       }
 
-      // 2026-07-21 道雪 [修思考中口径]：把本轮真正发出 prompt 的 sid 列表告诉 renderer——
+      // 2026-07-21 maintainer [修思考中口径]：把本轮真正发出 prompt 的 sid 列表告诉 renderer——
       //   此前 renderer 用"勾选成员"乐观猜测（triggerGroupChat 的 _gcActiveSids），
       //   @ 点名/部分勾选时没收到提问的 AI 也显示"思考中"。
       if (!silent) {
@@ -1740,7 +1779,7 @@ function createGroupChatDispatcher(deps) {
         try { interruptMeetingTurn(meetingId, { reason: 'user_interrupt_during_send' }); }
         catch (e) { warn('[groupchat] late interrupt settle threw:', e && e.message); }
       } else if (!silent && _dispatchSeq != null && meetingDispatchSeq.get(interruptKey) !== _dispatchSeq) {
-        // send 期间被下一问抢占（2026-07-29 道雪）：dispatchGroupChatTurn 里的抢占发生在
+        // send 期间被下一问抢占（2026-07-29 maintainer）：dispatchGroupChatTurn 里的抢占发生在
         //   「本轮还在 sendToPty、activeWatchers 还是空」的窗口时会落空，新一问就要被串行
         //   队列扣到本轮成员自然结算为止（CLI 卡死时可能是几分钟——用户感知就是"追问石沉大海"）。
         //   watcher 刚同步注册完，这里补一次抢占，让追加的提问立刻开跑。
@@ -1822,6 +1861,7 @@ function createGroupChatDispatcher(deps) {
       runId: attempt.runId,
       providerTurnId: attempt.providerTurnId || null,
       completedAt: attempt.completedAt || Date.now(),
+      ...(attempt.promptDelivered === false ? { promptDelivered: false } : {}),
     };
   }
 
@@ -2036,6 +2076,7 @@ function createGroupChatDispatcher(deps) {
 
   return {
     dispatchGroupChatTurn,
+    handoffMeetingTurn,
     interruptMeetingTurn,
     groupMembersForMeeting,
     getActiveWatchers: () => activeWatchers,

@@ -74,7 +74,8 @@ function extractGroupChatUserInput(text) {
   while ((m = marker.exec(t)) !== null) last = m;
   if (!last) return null;
   // 只在确认是群聊脚手架时才动手，避免误伤正文里恰好写了 "## 用户" 的普通提问
-  if (!/(^|\n)##[ \t]*规则/.test(t) && !/(^|\n)##[ \t]*新增发言/.test(t)) return null;
+  // 「## 群成员」：首轮群规则之后的成员名单；老成员补发名单时它可能是唯一的外壳标记。
+  if (!/(^|\n)##[ \t]*(?:规则|新增发言|群成员)/.test(t)) return null;
   let body = t.slice(last.index + last[0].length);
   body = body.replace(/\r?\n+[ \t]*请发言。[ \t]*\r?\n*$/, '');
   return body.trim();
@@ -109,6 +110,7 @@ const INJECTED_BLOCKS = [
   /<skills_instructions>[\s\S]*?<\/skills_instructions>/gi,
   /<plugins_instructions>[\s\S]*?<\/plugins_instructions>/gi,
   /<permissions instructions>[\s\S]*?<\/permissions instructions>/gi,
+  /<ai-hub-workspace-rules\b[^>]*>[\s\S]*?<\/ai-hub-workspace-rules>/gi,
   // Hub 附加的梦境索引：搜索和造梦素材都不收，否则下一轮造梦会读回自己的索引。
   /<ai-hub-dream-index\b[^>]*>[\s\S]*?<\/ai-hub-dream-index>/gi,
 ];
@@ -134,7 +136,7 @@ function searchableUserText(text) {
   // 剪完注入块之后，**剩下的残渣可能本身又是一条注入标记**。
   // 2026-08-28 在真实 Codex rollout 上抓到的形态（原文 1687 字）：
   //     <recommended_plugins> …一大段… </recommended_plugins>
-  //     # AGENTS.md instructions for C:\Users\example-user\chuxin-research
+  //     # AGENTS.md instructions for C:\Users\you\xresearch-research
   // 剪掉前一块后剩下后一行，第一版就这么原样入库了，搜索里照样能命中。
   // 所以剪一轮就重新判一次，直到稳定。
   for (let round = 0; round < 3; round += 1) {

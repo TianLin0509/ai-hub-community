@@ -28,15 +28,14 @@ const SCENES = [
 ];
 
 let _modalEl = null;
-const DEFAULT_SCENE = require('../core/distribution').community ? 'general' : 'dev';
-let _currentMode = DEFAULT_SCENE;
+let _currentMode = 'dev';
 let _isGroupChat = true;
 let _groupSlots = DEFAULT_GROUP_MEMBERS.map(x => ({ ...x }));
 let _escListener = null;
 let _meetingWorkspace = null;
 // 群聊与单会话同一个默认档：工作根（2026-08-31 平铺决策）。
 // 群聊尤其需要——180 场会议 100% 共用 cwd，本来就是「多个 AI 同一个目录」的场景。
-let _meetingWorkspaceMode = DEFAULT_SCENE === 'general' ? 'default' : 'existing';
+let _meetingWorkspaceMode = 'existing';
 // 项目库：已被 project-prep 整理过的项目（中文名 → 路径，按活跃时间排序）。
 // 建群那一刻从主进程取快照；「选择已有路径」的下拉和开发场景的 prompt 都用它。
 let _projectLibrary = [];
@@ -325,7 +324,7 @@ function _slotHtml(i, spec, isGroup) {
       </div>
       <div class="mcm-slot-fields">
         <label><span class="mcm-slot-field-name">AI</span><select class="mcm-ai-select">${aiOptions}</select></label>
-        ${['deepseek','deepseek-acp'].includes(def.kind) ? `<label><span class="mcm-slot-field-name">DeepSeek 接入</span><select class="mcm-deepseek-route"><option value="deepseek-acp"${def.kind === 'deepseek-acp' ? ' selected' : ''}>Token Plan</option><option value="deepseek"${def.kind === 'deepseek' ? ' selected' : ''}>API</option></select></label>` : ''}
+        ${['deepseek','deepseek-acp'].includes(def.kind) ? `<label><span class="mcm-slot-field-name">DeepSeek 接入</span><select class="mcm-deepseek-route"><option value="deepseek"${def.kind === 'deepseek' ? ' selected' : ''}>Codex CLI · DeepSeek API</option><option value="deepseek-acp"${def.kind === 'deepseek-acp' ? ' selected' : ''}>Token Plan · 旧 Harness</option></select></label>` : ''}
         <label><span class="mcm-slot-field-name">模型</span><select class="mcm-model-select">${_modelOptions(def.kind, def.model)}</select></label>
         ${effortField}
         ${mcpField}
@@ -344,7 +343,7 @@ function _readSlotSpec(el, i, { strict = true } = {}) {
     return _groupSlots[i] ? _normalizeSlotSpec(_groupSlots[i]) : null;
   }
   const spec = {
-    kind: aiSelect.value === 'deepseek' ? (el.querySelector('.mcm-deepseek-route')?.value || 'deepseek-acp') : aiSelect.value,
+    kind: aiSelect.value === 'deepseek' ? (el.querySelector('.mcm-deepseek-route')?.value || 'deepseek') : aiSelect.value,
     model: modelSelect ? modelSelect.value : '',
   };
   const effort = el.querySelector('.mcm-effort-select');
@@ -384,7 +383,7 @@ function _renderSlots() {
     slotEl.querySelector('.mcm-ai-select').addEventListener('change', () => {
       const i = Number(slotEl.getAttribute('data-slot'));
       const selected = slotEl.querySelector('.mcm-ai-select').value;
-      const kind = selected === 'deepseek' ? 'deepseek-acp' : selected;
+      const kind = selected;
       _groupSlots[i] = _normalizeSlotSpec({ kind, model: DEFAULT_MODEL_BY_KIND[kind] });
       _renderSlots();
     });
@@ -450,7 +449,7 @@ function _ensureModal() {
         </div>
         <div class="mcm-scene" id="mcm-scene-row">
           <span class="mcm-scene-caption">场景</span>
-          ${_renderSceneChoices(DEFAULT_SCENE)}
+          ${_renderSceneChoices('dev')}
         </div>
         <div class="mcm-scene-hint" id="mcm-scene-hint" style="display:none; font-size:12px; color:#888; margin:-6px 0 12px; line-height:1.6;"></div>
         <div class="mcm-member-caption">
@@ -694,7 +693,7 @@ function openMeetingCreateModal(mode = 'general', options = {}) {
     _isGroupChat = true;
   }
   // 每次进入默认开发场景，并让用户选择已有项目路径。
-  _currentMode = DEFAULT_SCENE;
+  _currentMode = 'dev';
   _ensureModal();
   const embeddedHost = options.embedded === true && options.host && typeof options.host.appendChild === 'function'
     ? options.host
@@ -712,8 +711,8 @@ function openMeetingCreateModal(mode = 'general', options = {}) {
     onCreated: typeof options.onCreated === 'function' ? options.onCreated : null,
   };
   _clearError();
-  _applyScene(DEFAULT_SCENE, { clearTitle: true, resetSlots: true });
-  _meetingWorkspaceMode = DEFAULT_SCENE === 'general' ? 'default' : 'existing';
+  _applyScene('dev', { clearTitle: true, resetSlots: true });
+  _meetingWorkspaceMode = 'existing';
   _meetingWorkspace = null;
   _projectLibraryOpen = false;
   _paintWorkspace();

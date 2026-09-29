@@ -1,7 +1,5 @@
 const { app, BrowserWindow, ipcMain, clipboard, dialog, nativeImage, screen, shell, Menu } = require('electron');
 const path = require('path');
-const { community, personalModules } = require('./core/distribution');
-if (community) ipcMain.handle('community:setup', () => require('./core/community-setup').inspectSetup({packaged:app.isPackaged}));
 const { fileURLToPath } = require('url');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -11,7 +9,7 @@ const os = require('os');
 // files on disk, even if its first native session is opened much later.
 require('./core/runtime-build-info').runtimeBuildInfo();
 
-// 2026-05-16 道雪：防卡死后门 — 默认开 Chromium CDP 端口（OS 自动分配）。
+// 2026-05-16 maintainer：防卡死后门 — 默认开 Chromium CDP 端口（OS 自动分配）。
 //   实际分配的端口在启动后写入 <dataDir>/control/<pid>.json 的 cdpPort 字段，
 //   救援脚本 tools/hub-escape.ps1 + Playwright/DevTools 可 attach 进 Hub。
 //   设环境变量 CLAUDE_HUB_NO_CDP=1 可关闭。
@@ -48,6 +46,7 @@ const {
   ensureClaudeHookIntegration,
   startClaudeHookIntegrationWatchdog,
 } = require('./core/claude-hook-integration.js');
+const { cleanupFileClaimsTmp } = require('./core/file-claims-tmp-cleanup.js');
 const hubControl = require('./core/hub-control.js');
 const { MeetingRoomManager } = require('./core/meeting-room.js');
 const meetingStore = require('./core/meeting-store.js');
@@ -60,7 +59,6 @@ const { createUsageFilter } = require('./core/usage-filter.js');
 const scenes = require('./core/group-chat-scenes.js');
 const groupchat = require('./core/group-chat-orchestrator.js');
 const cliReadyDetector = require('./core/group-chat-cli-ready-detector.js');
-const lindangBridge = require('./core/lindang-bridge.js');
 const { getConfig: getHubConfig } = require('./core/hub-config.js');
 const {
   createFixtureProbe: createNetworkEgressFixtureProbe,
@@ -76,9 +74,9 @@ const { registerConfigIpc } = require('./main/ipc/config-handlers.js');
 const { registerWorkbenchOperationsIpc } = require('./main/ipc/workbench-operations-handlers.js');
 const { createWorkbenchOperationsService } = require('./core/workbench-operations.js');
 const { registerPathIpc } = require('./main/ipc/path-handlers.js');
-const { registerChatgptBridgeIpc } = require('./main/ipc/chatgpt-bridge-handlers.js');
 const { registerSessionIpc } = require('./main/ipc/session-handlers.js');
 const { registerPromptSubmitIpc } = require('./main/ipc/prompt-submit-handlers.js');
+const { createClaudeQuotaResume, registerClaudeQuotaIpc } = require('./main/claude-quota-resume.js');
 const { registerWorkspaceIpc } = require('./main/ipc/workspace-handlers.js');
 const { getTerminalBatchDelay, isBackgroundMember } = require('./main/terminal-output-policy.js');
 const { TerminalOutputBatcher } = require('./main/terminal-output-batcher.js');
@@ -98,15 +96,12 @@ const { registerGroupchatQueryIpc } = require('./main/ipc/groupchat-query-handle
 const { registerGroupchatRecoveryIpc } = require('./main/ipc/groupchat-recovery-handlers.js');
 const { registerGroupchatSupplementIpc } = require('./main/ipc/groupchat-supplement-handlers.js');
 const { registerGroupchatTurnIpc } = require('./main/ipc/groupchat-turn-handlers.js');
-const { registerCommitteeIpc } = require('./main/ipc/committee-handlers.js');
 const { createResumeSessionHandler, registerResumeSessionIpc } = require('./main/ipc/resume-session-handlers.js');
 const { createGroupChatDispatcher } = require('./main/groupchat/dispatcher.js');
-const { createCommitteeConductor } = require('./main/groupchat/committee-conductor.js');
 const {
   collectProtectedSessionIds,
   createSessionAutoSuspendScheduler,
 } = require('./main/session-auto-suspend.js');
-const committeeHistory = require('./core/committee-history.js');
 const { createAutoTitleManager } = require('./main/auto-title-manager.js');
 const {
   parseCodexUsage,
@@ -163,6 +158,7 @@ const {
   readCodexRolloutMeta,
 } = require('./core/codex-transcript-parser.js');
 const { registerArchiveIpc } = require('./main/ipc/archive-handlers.js');
+const { registerSessionReferenceIpc } = require('./main/ipc/session-reference-handlers.js');
 const { SessionSearchService } = require('./core/session-search-service.js');
 const transcriptParserService = new TranscriptParserService();
 const codexJsonlUsageService = new CodexJsonlUsageService();
@@ -183,7 +179,7 @@ const sessionSearchService = new SessionSearchService({
   geminiRoots: sessionSearchRoots('HUB_SESSION_SEARCH_GEMINI_ROOTS', [path.join(os.homedir(), '.gemini', 'tmp')]),
   meetingDir: path.join(getHubDataDir(), 'meetings'),
   // 每个会话一份只含对话的 md 聊天记录，供分享路径与造梦阅读；由索引派生，可重建。
-  transcriptDir: path.join(getHubDataDir(), 'transcripts'),
+  transcriptDir: require('./core/data-dir').getHubTranscriptDir(),
   refreshTtlMs: Number(process.env.HUB_SESSION_SEARCH_REFRESH_TTL_MS) || 60_000,
   // Production warms the persistent index after the latency-sensitive boot
   // path. Isolated Hubs stay opt-in so an unrelated E2E can never scan the
@@ -192,7 +188,9 @@ const sessionSearchService = new SessionSearchService({
     || (process.env.HUB_SESSION_SEARCH_PREWARM !== '0' && !isIsolatedHub()),
 });
 const transcriptTap = new TranscriptTap({ parserService: transcriptParserService });
-// AIGroupChatHub.exe is a branded copy of Electron's default-app host. Electron
+// PTY Claude 在 /clear、/resume、重启后跟随新的原生身份；判据见 core/claude-identity-switch.js。
+const claudeIdentitySwitch = require('./core/claude-identity-switch').createClaudeIdentitySwitch();
+// AIHubCommunity.exe is a branded copy of Electron's default-app host. Electron
 // 41 reports app.isPackaged=true solely because the exe was renamed, while
 // process.defaultApp remains true and argv still contains this source tree.
 // Using app.isPackaged directly strips the app-root from Jump List launches and
@@ -236,6 +234,28 @@ const HIDDEN_E2E_DATA_DIR_SAFE = isIsolatedHub()
     !== path.resolve(path.join(os.homedir(), '.ai-hub-community')).toLowerCase();
 if (HIDDEN_E2E_WINDOW_REQUESTED && !HIDDEN_E2E_DATA_DIR_SAFE) {
   throw new Error('hidden E2E window mode requires a non-production CLAUDE_HUB_DATA_DIR');
+}
+// Background E2E: the window renders like a visible one but sits off-screen,
+// never activates and stays out of the taskbar, so a test run cannot steal the
+// keyboard from someone typing in the production Hub.
+const BACKGROUND_E2E_WINDOW_REQUESTED = process.env.CLAUDE_HUB_E2E_WINDOW_MODE === 'background';
+if (BACKGROUND_E2E_WINDOW_REQUESTED && !HIDDEN_E2E_DATA_DIR_SAFE) {
+  throw new Error('background E2E window mode requires a non-production CLAUDE_HUB_DATA_DIR');
+}
+const e2eDesktopSandbox = require('./core/e2e-desktop-sandbox.js');
+if (BACKGROUND_E2E_WINDOW_REQUESTED) {
+  e2eDesktopSandbox.prepareBackgroundChromium(app);
+  app.on('browser-window-created', (_event, win) => e2eDesktopSandbox.keepWindowInBackground(win));
+}
+// Isolated E2E runs (background or hidden) keep their own in-memory clipboard;
+// a test that must check the real one opts in with CLAUDE_HUB_E2E_REAL_CLIPBOARD=1.
+if (HIDDEN_E2E_DATA_DIR_SAFE
+    && ['background', 'hidden'].includes(process.env.CLAUDE_HUB_E2E_WINDOW_MODE)
+    && process.env.CLAUDE_HUB_E2E_REAL_CLIPBOARD !== '1') {
+  e2eDesktopSandbox.installFakeClipboard({ clipboard, nativeImage, ipcMain });
+  process.env.CLAUDE_HUB_E2E_FAKE_CLIPBOARD_ACTIVE = '1';
+  console.log('[e2e] in-memory clipboard active. Native copies (Ctrl+C in pages, webContents.copy) still reach the system '
+    + 'clipboard and are not visible here; a test that checks them sets CLAUDE_HUB_E2E_REAL_CLIPBOARD=1.');
 }
 
 // Auto-deploy hook scripts + settings.json config on first launch.
@@ -282,7 +302,6 @@ function ensureHooksDeployed(claudeDirPath) {
 // Ensure Codex CLI status bar includes context-remaining so the scanner can
 // parse context usage. Idempotent — only patches if the key is absent.
 function ensureCodexContextConfig() {
-  if (community) return; // Native App Server does not need to rewrite global TUI config.
   const home = process.env.USERPROFILE || process.env.HOME || os.homedir();
   const configPath = path.join(home, '.codex', 'config.toml');
   try {
@@ -298,47 +317,7 @@ function ensureCodexContextConfig() {
   }
 }
 
-// Ensure Gemini CLI has arena-research MCP server registered. Gemini reads
-// ~/.gemini/settings.json and auto-launches mcpServers entries on startup.
-// We register the server with stdio transport, NO env field — the server
-// inherits ARENA_* env from the gemini parent process. When gemini is started
-// without ARENA_* env (user's standalone gemini, or non-research group chat),
-// the server enters STUB mode and exposes no tools.
-function ensureGeminiMcpInstalled() {
-  if (community) return;
-  // Isolated GUI/E2E instances must never rewrite the user's real ~/.gemini.
-  // Their fake Gemini process does not need the persistent arena registration.
-  if (isIsolatedHub()) return;
-  const home = process.env.USERPROFILE || process.env.HOME || os.homedir();
-  const geminiDir = path.join(home, '.gemini');
-  if (!fs.existsSync(geminiDir)) return;
-  const settingsPath = path.join(geminiDir, 'settings.json');
-  let settings = {};
-  try {
-    settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-  } catch { settings = {}; }
-  if (!settings.mcpServers || typeof settings.mcpServers !== 'object') {
-    settings.mcpServers = {};
-  }
-  const researchMcpPath = path.resolve(__dirname, 'core', 'research-mcp-server.js');
-  const desiredResearch = {
-    command: process.execPath,
-    args: [researchMcpPath],
-    env: { ELECTRON_RUN_AS_NODE: '1' },
-  };
-  let dirty = false;
-  if (JSON.stringify(settings.mcpServers['arena-research']) !== JSON.stringify(desiredResearch)) {
-    settings.mcpServers['arena-research'] = desiredResearch;
-    dirty = true;
-  }
-  if (!dirty) return;
-  try {
-    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
-    console.log('[群聊] arena-research MCP installed into Gemini settings.json');
-  } catch (e) {
-    console.warn('[群聊] gemini mcp install failed:', e.message);
-  }
-}
+function ensureGeminiMcpInstalled() {}
 
 // Read the last user message text from a Claude Code transcript JSONL file.
 // Reads the trailing chunk(s) only (not the whole file) — long sessions can be
@@ -502,16 +481,30 @@ const completionNotifier = new CompletionNotifier({
 sessionManager.workspaceService = workspaceService;
 const workspaceMigrationSessionIds = new Set();
 
+// 原生 Claude 撞到额度上限后的等待与续跑。CLI 的 REPL 以前自己干这件事，
+//   stream-json 传输下没有输入框可敲，于是等待和发送都搬到 Hub 这边来。
+//   判据全在 core/claude-quota-watchdog.js，这里只负责副作用。
+const claudeQuotaResume = createClaudeQuotaResume({
+  sessionManager,
+  statePath: path.join(getHubDataDir(), 'claude-quota-waits.json'),
+  isEnabled: () => getHubConfig().claudeQuotaAutoResume !== false,
+  logger: console,
+});
+
 sessionManager.on('session-updated', session => {
+  if (session.agentRuntime === 'pty' && isCodexCliKind(session.kind) && session.runtimeTruth) {
+    sendToRenderer('session-updated', { session });
+    return;
+  }
   if (session.runtimeBackend !== 'claude-stream-json') return;
   sessionUsageService.bind(session);
   if(!isSessionViewer(session))sessionStore.markDirty(session.id, sessionManager.getSession(session.id));
   sendToRenderer('session-updated', { session });
 });
 sessionManager.on('native-agent-item', event => {
-  const {sessionId,source,userMessageId,clientSubmissionId}=event;
+  const {sessionId,source,userMessageId,clientSubmissionId,epoch,providerSessionId}=event;
   nativeItemNotifications.schedule(sessionId,userMessageId || clientSubmissionId || '',()=>
-    sendToRenderer('native-agent-item',{sessionId,source,userMessageId,clientSubmissionId}));
+    sendToRenderer('native-agent-item',{sessionId,source,userMessageId,clientSubmissionId,epoch,providerSessionId}));
 });
 sessionManager.on('native-agent-lifecycle', event => {
   nativeItemNotifications.flush(event.sessionId);
@@ -530,6 +523,9 @@ sessionManager.on('native-agent-lifecycle', event => {
     if (event.status === 'completed') transcriptTap.emit('turn-complete', payload);
     else if (event.status === 'interrupted') transcriptTap.emit('turn-aborted', payload);
     else transcriptTap.emit('turn-error', { ...payload, message: native.runtime.reason });
+    // 只有失败的一轮会武装等待，而且要在失败之后重读一次账号额度才作数。
+    void Promise.resolve(claudeQuotaResume.onTurnComplete(event))
+      .catch(error => console.warn('[claude-quota] arm failed:', error && error.message));
   }
 });
 
@@ -541,6 +537,7 @@ sessionManager.on('native-agent-lifecycle', event => {
 // meeting's timeline (if the sub-session belongs to a meeting).
 transcriptTap.on('turn-complete', (ev) => {
   const { hubSessionId, text, completedAt } = ev || {};
+  sessionManager.noteAgentTurnFinished(hubSessionId, ev || {});
   const completionAt = normalizeEventTime(completedAt, Date.now());
   let session = sessionManager.getSession(hubSessionId);
   // Persist reply recency in main as well as renderer. This closes the gap where
@@ -639,6 +636,7 @@ transcriptTap.on('turn-started', (ev) => {
 
 transcriptTap.on('turn-aborted', (ev) => {
   if (!ev || !ev.hubSessionId) return;
+  sessionManager.noteAgentTurnFinished(ev.hubSessionId, ev);
   completionNotifier.noteTurnAborted(ev);
   const session = sessionManager.getSession(ev.hubSessionId);
   try {
@@ -661,13 +659,17 @@ transcriptTap.on('turn-aborted', (ev) => {
 // full-screen TUI can redraw an old error line during every later turn.
 transcriptTap.on('turn-error', (ev) => {
   if (!ev || !ev.hubSessionId) return;
+  // Rollout errors carry completedAt. Label the terminal event before main
+  // retains it, so renderer reload cannot turn a failed request into success.
+  const failedAt = ev.failedAt != null ? ev.failedAt : ev.completedAt != null ? ev.completedAt : Date.now();
+  sessionManager.noteAgentTurnFinished(ev.hubSessionId, { ...ev, failedAt });
   completionNotifier.noteTurnFailed(ev);
   const session = sessionManager.getSession(ev.hubSessionId);
   try {
     sendToRenderer('turn-failed-event', {
       hubSessionId: ev.hubSessionId,
       transcriptPath: ev.transcriptPath || (session ? session.transcriptPath : null),
-      failedAt: ev.completedAt != null ? ev.completedAt : Date.now(),
+      failedAt,
       meetingId: session ? session.meetingId : null,
       kind: session ? session.kind : null,
       signalSource: ev.signalSource || 'task_complete_error',
@@ -779,6 +781,7 @@ transcriptTap.on('session-bound', (ev) => {
       if (ev.geminiChatId) patch.geminiChatId = ev.geminiChatId;
       if (ev.geminiProjectHash) patch.geminiProjectHash = ev.geminiProjectHash;
       if (ev.geminiProjectRoot) patch.geminiProjectRoot = ev.geminiProjectRoot;
+      if (ev.sessionPath) patch.transcriptPath = ev.sessionPath;
       sessionManager.updateSessionMeta(ev.hubSessionId, patch);
     } else if (isKimiCliKind(ev.kind) && (ev.kimiSid || ev.wirePath || ev.sessionDir)) {
       const patch = {};
@@ -869,7 +872,7 @@ transcriptTap.on('session-bound', (ev) => {
       meetings: meetingManager.getAllMeetings(),
       immersiveByMeeting: _immersiveByMeeting,
     });
-    // 2026-05-07 道雪：sid 类字段一旦确定就立刻 sync 写 per-session JSON。
+    // 2026-05-07 maintainer：sid 类字段一旦确定就立刻 sync 写 per-session JSON。
     //   不靠 200ms debounce，不靠 state.json 防抖 500ms——任何一个 race / crash
     //   都不会再让 Codex/Gemini 的 transcript 关联丢失。
     try { void sessionStore.markDirtyImmediate(ev.hubSessionId, cur); }
@@ -1039,9 +1042,11 @@ function createWindow() {
   const _pkgVersion = (() => {
     try { return require('./package.json').version || ''; } catch { return ''; }
   })();
-  // 2026-05-03 道雪：标题带 PID，方便桌面同时存在多个 Hub 窗口（生产+测试）时
+  // 2026-05-03 maintainer：标题带 PID，方便桌面同时存在多个 Hub 窗口（生产+测试）时
   //   一眼区分哪个对应哪个 PID — 调试时不再需要 Get-Process 反查。
-  const _hubTitle = `AI 群聊 Hub：PID ${process.pid}${_pkgVersion ? ` v${_pkgVersion}` : ''}`;
+  // 社区版标题同时写出社区版本与所基于的上游版本，用户报问题时一眼可见。
+  const _upstreamVersion = require('./core/distribution').upstreamVersion;
+  const _hubTitle = `AI Hub Community v${_pkgVersion}${_upstreamVersion ? `（上游 ${_upstreamVersion}）` : ''}：PID ${process.pid}`;
   // T6 冷杉 v2：隐藏原生标题栏，让渲染层那条 44px 工具栏直接顶到窗口顶边。
   // 三个系统窗口按钮仍由 Windows 自己画（titleBarOverlay），所以最大化 / 还原 /
   // 关闭的行为、Snap Layouts、右键系统菜单全部保持原生，不需要 Hub 自己复刻一套。
@@ -1102,7 +1107,7 @@ function createWindow() {
       logger: console,
     });
   }
-  // index.html 的 <title>AI 群聊 Hub</title> 在页面加载完成后会触发 page-title-updated 覆盖
+  // index.html 的 <title>AI Hub Community</title> 在页面加载完成后会触发 page-title-updated 覆盖
   // BrowserWindow.title — preventDefault 阻止覆盖，保留带 PID 的标题
   mainWindow.on('page-title-updated', (e) => { e.preventDefault(); });
 
@@ -1166,7 +1171,7 @@ function createWindow() {
   });
   setTimeout(showMainWindow, 4000);
 
-  // 主 webContents 导航防护（2026-05-17 道雪，2026-07-31 收紧）：renderer 若误把链接
+  // 主 webContents 导航防护（2026-05-17 maintainer，2026-07-31 收紧）：renderer 若误把链接
   //   交给浏览器默认导航，会让主 webContents 整个跳走、Hub shell 和操作按钮一起消失。
   //   旧逻辑放行了所有 file://，所以本地 HTML 正好能绕过保护。主窗口现在只允许加载
   //   自己的 renderer/index.html；其他本地文件重新投递给 Hub preview webview。
@@ -1282,6 +1287,9 @@ sessionManager.onSessionClosed = (sessionId, meetingId, exitInfo) => {
   sessionManager.emit('session-exited', { sessionId, meetingId, exitInfo: exitInfo || null });
 
   try { transcriptTap.unregisterSession(sessionId); } catch {}
+  // 会话真的关掉了，等待不该留在盘上等一个再也不会回来的席位。
+  // 休眠走 onSessionSuspended，不经过这里，所以休眠会话的等待会保留。
+  if (!isWorkspaceMigration) { try { claudeQuotaResume.forget(sessionId); } catch {} }
   // 群聊 cli-ready monotonic guard 清理（独立模块，详见 core/group-chat-cli-ready-detector.js）
   try { cliReadyDetector.cleanup(sessionId); } catch {}
   // 渲染层要靠 requested 分辨“用户删/重启/迁移”和“CLI 自己崩了”；
@@ -1343,10 +1351,23 @@ function registerSessionForTap(session) {
     }
   }
   catch (e) {
-    // silent-failure-hunter L2（2026-05-04 道雪）：注册失败 → watcher 收不到 turn-complete L1
+    // silent-failure-hunter L2（2026-05-04 maintainer）：注册失败 → watcher 收不到 turn-complete L1
     //   信号 → 群聊等到 180s 软提醒才感知该家"卡住"。日志方便定位根因。
     console.warn('[tap] registerSession failed for', session.id.slice(0, 8), session.kind, ':', e && e.message);
   }
+}
+
+const { isPtyCodexSession, createCodexPtyHookHandler } = require('./main/codex-pty-hook.js');
+// 函数声明会提升；handler 在第一次 hook 到达时才创建，届时依赖都已就绪。
+let _codexPtyHookHandler = null;
+function handleCodexPtyHook(session, event, parsed) {
+  if (!_codexPtyHookHandler) {
+    _codexPtyHookHandler = createCodexPtyHookHandler({
+      sessionManager, transcriptTap, sendToRenderer, maybeAutoTitleSessionFromPrompt, readCodexRolloutMeta,
+      isCodexTopLevelRolloutMeta: require('./core/codex-transcript-parser.js').isCodexTopLevelRolloutMeta,
+    });
+  }
+  return _codexPtyHookHandler(session, event, parsed);
 }
 
 function updateSessionTranscriptBinding(hubSessionId, fields = {}) {
@@ -1458,7 +1479,7 @@ registerGroupchatTurnIpc(ipcMain, {
   interruptGroupChatTurn: (meetingId, options) => groupChatDispatcher.interruptMeetingTurn(meetingId, {
     ...options, targetSids: global.__devFileEngine?.interruptSids(meetingId) || [],
   }),
-  stopLoop: (meetingId, options) => global.__devFileEngine?.stop(meetingId)
+  stopLoop: (meetingId, options) => global.__deliveryEngine?.stop(meetingId) || global.__devFileEngine?.stop(meetingId)
     || (global.__loopEngine ? global.__loopEngine.stopLoop(meetingId, options) : false),
 });
 
@@ -1500,13 +1521,32 @@ try {
     },
     logger: console,
   });
-  require('./main/ipc/loop-handlers.js').registerLoopIpc(ipcMain, { loopEngine: global.__loopEngine });
+  require('./main/ipc/loop-handlers.js').registerLoopIpc(ipcMain, { loopEngine: global.__loopEngine, deliveryEngine:()=>global.__deliveryEngine });
 } catch (e) { console.warn('[loop] engine init failed:', e && e.message); }
+
+try {
+  global.__deliveryEngine = require('./main/groupchat/delivery-engine').createDeliveryEngine({
+    meetingManager, sessionManager, getHubDataDir,
+    getDispatcher: () => (__testHooks ? __testHooks.dispatcher : groupChatDispatcher),
+    ensureMemberReady: (meeting, memberId) => global.__loopEngine.ensureMemberReady(meeting, memberId),
+    getMembers: meeting => groupChatDispatcher.groupMembersForMeeting(meeting, { includeDormant: true }),
+    getAttemptEvidence: (id,attemptId,expected) => {
+      const orch=groupchat.getOrchestrator(getHubDataDir(),id);
+      const matches=attemptId ? [orch.getAttempt(attemptId)].filter(Boolean) : Object.values(orch.state.attempts || {}).filter(a=>
+        a.memberId===expected.memberId && a.workflowRun?.runId===expected.runId && a.workflowRun?.stepIndex===expected.stepIndex && a.workflowRun?.attempt===expected.attempt);
+      if(matches.length!==1)return null;
+      const attempt=matches[0];return {attempt,sourceCompletedAt:orch.state.devChatHistory?.receipts?.[attempt.attemptId]?.sourceCompletedAt};
+    },
+    sendToRenderer,
+  });
+  global.__deliveryEngine.registerIpc(ipcMain);
+  global.__deliveryEngine.startWatching();
+} catch (error) { console.error('[delivery] initialization failed:', error); }
 
 try {
   global.__devFileEngine = require('./main/groupchat/dev-file-engine').createDevFileEngine({
     meetingManager, sessionManager, getHubDataDir, getDispatcher: () => (__testHooks ? __testHooks.dispatcher : groupChatDispatcher),
-    isWorkflowRunning: id => !!global.__loopEngine?.isRunning(id),
+    isWorkflowRunning: id => !!global.__loopEngine?.isRunning(id), deliveryEngine: global.__deliveryEngine,
     getMembers: meeting => groupChatDispatcher.groupMembersForMeeting(meeting, { includeDormant: true }),
     ensureMemberReady: (meeting, memberId) => global.__loopEngine.ensureMemberReady(meeting, memberId),
     sendToRenderer, onChanged: (id) => devWorkbench?.changed?.(id), logger: console,
@@ -1516,7 +1556,7 @@ try {
 
 try {
   devWorkbench = require('./main/groupchat/dev-workbench.js').createDevWorkbench({
-    meetingManager, sessionManager, loopEngine: global.__loopEngine, fileEngine: global.__devFileEngine, getHubDataDir, sendToRenderer, logger: console,
+    meetingManager, sessionManager, loopEngine: global.__loopEngine, fileEngine: global.__devFileEngine, deliveryEngine: global.__deliveryEngine, getHubDataDir, sendToRenderer, logger: console,
   });
   devWorkbench.registerIpc(ipcMain);
 } catch (error) { console.error('[dev-workbench] initialization failed:', error.message); }
@@ -1528,7 +1568,7 @@ const devChatHistory = require('./core/dev-chat-history').createHistoryService({
 function watchDevChatHistory(session, sourcePath) {
   if (['codex-app-server','acp','claude-stream-json'].includes(session?.runtimeBackend)) return;
   const meeting=session?.meetingId && meetingManager.getMeeting(session.meetingId);
-  if(!require('./core/dev-file-workflow').enabled(meeting))return;
+  if(!require('./core/dev-file-workflow').enabled(meeting) && !require('./core/delivery-workflow').enabled(meeting))return;
   const orch=groupchat.getOrchestrator(getHubDataDir(),meeting.id);
   const paths=new Set([sourcePath || session.transcriptPath || transcriptTap.getCodexRolloutPath(session.id),
     ...Object.values(orch.state.devChatHistory?.receipts || {})
@@ -1621,86 +1661,7 @@ registerAutoSuspendIpc(ipcMain, {
   logger: console,
 });
 
-// 投委会五幕编排（task#5）：叠加在 research 群聊之上，复用 dispatcher 的并行发言 + 委员解析。
-const committeeConductor = createCommitteeConductor({
-  dispatchTurn: groupChatDispatcher.dispatchGroupChatTurn,
-  getGroupMembers: (meetingId) => {
-    const meeting = meetingManager.getMeeting(meetingId);
-    return meeting ? groupChatDispatcher.groupMembersForMeeting(meeting) : [];
-  },
-  emitProgress: (meetingId, payload) => sendToRenderer('committee:progress', { meetingId, ...payload }),
-  log: (m) => console.log(m),
-  // 点6：闭庭后把末轮 + 主席发言喂回该 meeting 的群聊 orchestrator（写 messages 供 buildDelta 传递）。
-  // 阶段二：投委会每幕发言写进群聊 messages（带幕次 meta）→ 群聊气泡渲染 + 末轮/主席喂回 AI（点6）。
-  appendSpeeches: (meetingId, items, actMeta) => {
-    try {
-      const orch = groupchat.getOrchestrator(getHubDataDir(), meetingId);
-      return orch && typeof orch.appendCommitteeSpeeches === 'function' ? orch.appendCommitteeSpeeches(items, actMeta) : 0;
-    } catch (e) { console.log('[committee] appendSpeeches threw: ' + (e && e.message)); return 0; }
-  },
-  // 点3a「过往投委会」：闭庭后持久化整场 record（标的/每幕发言/双榜/主席报告）供历史回看。
-  persistHistory: (record) => { try { return committeeHistory.saveRecord(getHubDataDir(), record); } catch (e) { console.log('[committee] persistHistory threw: ' + (e && e.message)); return null; } },
-});
-if (personalModules) registerCommitteeIpc(ipcMain, { committeeConductor, history: committeeHistory, getHubDataDir });
-
-// 初心投研（chuxin-research）服务桥 — 2026-07-23 Kimi 移植：独立功能，仅注册 IPC，不改主流程
-const chuxinBridge = personalModules && require('./main/ipc/chuxin-handlers.js').registerChuxinIpc(ipcMain, {
-  getHookPort: () => hookPort,
-  getHubDataDir,
-  hookToken: HOOK_TOKEN,
-  registerSessionForTap,
-  sendToRenderer,
-  sessionManager,
-  transcriptTap,
-});
-
-// 初心 Agent 投资联赛：每个参赛者绑定一个可见的普通 Hub Session，
-// 账户/交易/进化状态全部落在各自 Markdown 文件夹中。
-agentLeagueBridge = personalModules && require('./main/ipc/agent-league-handlers.js').registerAgentLeagueIpc(ipcMain, {
-  getHookPort: () => hookPort,
-  getHubDataDir,
-  hookToken: HOOK_TOKEN,
-  registerSessionForTap,
-  sendToRenderer,
-  sessionManager,
-  transcriptTap,
-});
-if (process.env.CLAUDE_HUB_E2E === '1') {
-  ipcMain.handle('debug:agent-league-background-state', () => ({
-    ok: true,
-    pid: process.pid,
-    windowVisible: !!(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()),
-    trayActive: false,
-    scheduler: agentLeagueBridge && agentLeagueBridge.schedulerSafety,
-    runtimeAvailable: !!(agentLeagueBridge && agentLeagueBridge.runtimeStore),
-  }));
-  ipcMain.handle('debug:agent-league-close-window', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
-    return {
-      ok: true,
-      windowVisible: !!(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()),
-      trayActive: false,
-    };
-  });
-  ipcMain.handle('debug:agent-league-explicit-quit', () => {
-    setImmediate(() => { void beginGracefulHubShutdown('e2e-explicit-quit'); });
-    return { ok: true };
-  });
-}
-
-// 学习 Tab：Claude（主笔）与 Codex（审阅兼插画）两个常驻实体 Session，
-// 由主进程按三棒串行工作流驱动。Claude 不去调用 Codex——两者都是普通 Hub Session。
-try {
-  studyBridge = personalModules && require('./main/ipc/study-handlers.js').registerStudyIpc(ipcMain, {
-    getHubDataDir,
-    registerSessionForTap,
-    sendToRenderer,
-    sessionManager,
-    transcriptTap,
-  });
-} catch (e) {
-  console.warn('[study] 学习 Tab 初始化失败：', e && e.message);
-}
+const xresearchBridge = null;
 
 registerGroupchatQueryIpc(ipcMain, {
   getHubDataDir,
@@ -1728,6 +1689,7 @@ registerGroupchatSupplementIpc(ipcMain, {
   meetingManager,
   sendToRenderer,
   sessionManager,
+  transcriptTap,
 });
 registerCliStatusIpc(ipcMain, {
   cliReadyDetector,
@@ -1748,6 +1710,7 @@ registerTranscriptIpc(ipcMain, {
   isCodexCliKind,
   isUsableCodexRolloutPath,
   parseClaudeTranscriptToTurns,
+  parseClaudeTranscriptToNativeTurns: require('./core/claude-disk-transcript.js').parseClaudeTranscriptToNativeTurns,
   parseCodexRolloutToTurns,
   sessionManager,
   transcriptTap,
@@ -1811,6 +1774,9 @@ registerSessionIpc(ipcMain, {
 // 普通会话输入框的闭环发送。必须排在 registerSessionIpc 之后：它复用
 //   group-chat-watcher 的 sendToPty，而那份 _deps 由群聊 dispatcher 的 init 注入。
 registerPromptSubmitIpc(ipcMain, { sessionManager, transcriptTap, sendToRenderer });
+// 原生 Claude 额度看门狗。同样依赖 sendToPty 的 _deps，所以排在这之后。
+claudeQuotaResume.start();
+registerClaudeQuotaIpc(ipcMain, claudeQuotaResume);
 require('./main/ipc/acp-handlers').registerAcpIpc(ipcMain, {sessionManager});
 
 ipcMain.handle('debug:get-managed-launch-audit', (_event, request = {}) => {
@@ -1847,7 +1813,7 @@ registerWorkspaceIpc(ipcMain, {
 // with no live PTY). User clicks dormant session → resume-session IPC spawns
 // PTY with `claude --resume <ccSessionId>`.
 //
-// 2026-05-07 道雪：boot 走 loadAndSelfHeal，扫 sessions/ + meetings/ 目录把孤儿
+// 2026-05-07 maintainer：boot 走 loadAndSelfHeal，扫 sessions/ + meetings/ 目录把孤儿
 // 条目（state.json 已丢但 per-id JSON 仍在）合并回来。多 Hub 并发覆盖、
 // state.json 损坏、外部清理工具误删这三类灾难都能自我修复。
 // Hold the same short transaction as opening a session while boot repairs write.
@@ -1862,7 +1828,7 @@ const bootState = bootOwners.editSessions([], () => stateStore.loadAndSelfHeal({
 const bootWasClean = !!bootState.bootWasCleanShutdown;
 let lastPersistedSessions = Array.isArray(bootState.sessions) ? bootState.sessions : [];
 // 2026-07-29 三方审查（Kimi 发现）：healPersistedCwds 自 2026-05 引入以来只被 import、
-// 从未调用——药一直在手边没吃。workspace 从 ~/Workspaces 迁到 C:\Vibe 之后，state.json
+// 从未调用——药一直在手边没吃。workspace 从 ~/Workspaces 迁到 C:\Workspace 之后，state.json
 // 里存的还是旧路径，唤醒这类休眠会话会静默回落 Home（见 session-manager 的 cwdFellBack）。
 // transcript 的 jsonl 头里存着 CLI 当时真正用过的 cwd；只有该目录现在仍真实存在时
 // 才能用于自愈（归档复制不会改写 jsonl，里面也可能是已经失效的旧 scratch）。
@@ -1953,6 +1919,11 @@ registerArchiveIpc(ipcMain, {
   searchService: sessionSearchService,
   getSearchSnapshot: buildSessionSearchSnapshot,
 });
+registerSessionReferenceIpc(ipcMain, {
+  searchService: sessionSearchService,
+  getSearchSnapshot: buildSessionSearchSnapshot,
+  getMeeting: meetingId => meetingManager.getMeeting(meetingId),
+});
 // Let the renderer and hook server finish their latency-sensitive boot path
 // before the worker starts walking transcript directories. Querying search
 // earlier still starts the same worker on demand and reports visible progress.
@@ -2009,7 +1980,7 @@ sessionSearchPrewarmTimer.unref?.();
 // Persistent source watchers cover external CLI saves too. Semantic events
 // coalesce into the same background queue; the engine owns the shared writer lease.
 for (const event of ['turn-complete', 'prompt-submitted', 'turn-aborted', 'turn-error', 'session-bound']) {
-  transcriptTap.on(event, payload => sessionSearchService.queueRefresh(buildSessionSearchSnapshot(), payload?.hubSessionId || event));
+  transcriptTap.on(event, payload => sessionSearchService.queueRefresh(buildSessionSearchSnapshot, payload?.hubSessionId || event));
 }
 transcriptTap.on('prompt-submitted', () => { lastPromptSubmittedAt = Date.now(); });
 
@@ -2084,48 +2055,67 @@ registerWorkbenchOperationsIpc(ipcMain, {
 });
 
 registerPathIpc(ipcMain);
-if (personalModules) registerChatgptBridgeIpc(ipcMain, { sessionManager });
+ipcMain.handle('community:setup', () => require('./core/community-setup').inspectSetupAsync({ packaged: app.isPackaged }));
 
 // --- Hook HTTP server ---
 // Receives POSTs from ~/.claude/scripts/session-hub-hook.py when Claude Code
 // fires lifecycle hooks. Forwards compact observations to the renderer's
 // RuntimeTruth reducer; the hook request never blocks on transcript parsing
 // except for the final Stop preview fallback.
+let hubAccountsService = null;
 const hookServer = http.createServer((req, res) => {
   res.setHeader('Content-Type', 'application/json');
 
+  // 社区版的 hook 由 PowerShell 原样转发 CLI 的载荷（scripts/session-hub-hook.ps1），
+  // 字段提取在这里做（core/hook-payload.js），之后与 Python 版走同一条处理路径。
+  const rawHookEvent = req.method === 'POST' && /^\/api\/hook-raw\/[a-z-]+$/.test(req.url)
+    ? req.url.slice('/api/hook-raw/'.length) : null;
+  if (rawHookEvent) req.url = '/api/hook/' + rawHookEvent;
   const isHook = req.method === 'POST' && req.url.startsWith('/api/hook/');
   const isStatus = req.method === 'POST' && req.url === '/api/status';
   const isNativeOwnership = req.method === 'POST' && req.url === '/api/native-ownership';
-  // 2026-05-16 道雪：防卡死 — 外部 HTTP 救援入口，tools/hub-escape.ps1 调
+  const isResearchAccount = false;
+  // 2026-05-16 maintainer：防卡死 — 外部 HTTP 救援入口，tools/hub-escape.ps1 调
   const isEscapeHome = req.method === 'POST' && req.url === '/api/escape-home';
-  // Plan 2: 3 个新聚合 endpoint（走 research-mcp/query.py 而非 LinDangAgent.data_query.py）
-  if (community && String(req.url).startsWith('/api/research/')) { res.writeHead(404); res.end(); return; }
-  const isResearchStockStatic = req.method === 'POST' && req.url === '/api/research/stock-static';
-  const isResearchStockMarket = req.method === 'POST' && req.url === '/api/research/stock-market';
-  const isResearchStockNews = req.method === 'POST' && req.url === '/api/research/stock-news';
-  const isResearchStockSentiment = req.method === 'POST' && req.url === '/api/research/stock-sentiment';
-  const isResearchStockScan = req.method === 'POST' && req.url === '/api/research/stock-scan';
-  const isResearchKlineSimilarity = req.method === 'POST' && req.url === '/api/research/kline-similarity';
-  const isResearchFetch = isResearchStockStatic || isResearchStockMarket || isResearchStockNews || isResearchStockSentiment || isResearchStockScan
-    || isResearchKlineSimilarity;
+  const isResearchFetch = false;
   // plan 2026-05-05 阶段 0: 群聊记忆 MCP 回调（loopback）。
-  if (!isHook && !isStatus && !isResearchFetch && !isEscapeHome && !isNativeOwnership) {
+  if (!isHook && !isStatus && !isResearchFetch && !isEscapeHome && !isNativeOwnership && !isResearchAccount) {
     res.writeHead(404); res.end('{}'); return;
   }
 
-  // Cap body size at 16KB — statusline payloads are tiny, hooks tinier
+  // Cap body size at 16KB — statusline payloads are tiny, hooks tinier.
+  // Raw hook payloads are untruncated CLI JSON (tool output included), so they
+  // get a larger cap and are decoded once, after all chunks arrive.
+  if (rawHookEvent && String(req.headers['x-hub-token'] || '') !== HOOK_TOKEN) {
+    res.writeHead(403); res.end('{}'); req.resume(); return;
+  }
   let body = '';
+  const rawChunks = [];
+  let rawBytes = 0;
   let tooBig = false;
   req.on('data', (c) => {
     if (tooBig) return;
+    if (rawHookEvent) {
+      rawBytes += c.length;
+      if (rawBytes > 8 * 1024 * 1024) { tooBig = true; return; }
+      rawChunks.push(c);
+      return;
+    }
     if (body.length + c.length > 16384) { tooBig = true; return; }
     body += c;
   });
   req.on('end', async () => {
     if (tooBig) { res.writeHead(413); res.end('{}'); return; }
     let parsed;
-    try { parsed = JSON.parse(body || '{}'); } catch { parsed = {}; }
+    if (rawHookEvent) {
+      parsed = require('./core/hook-payload').normalizeHookPayload(rawHookEvent, Buffer.concat(rawChunks), {
+        sessionId: String(req.headers['x-hub-session'] || ''),
+        token: String(req.headers['x-hub-token'] || ''),
+      });
+      if (!parsed) { res.writeHead(200); res.end('{}'); return; }
+    } else {
+      try { parsed = JSON.parse(body || '{}'); } catch { parsed = {}; }
+    }
     if (isNativeOwnership) {
       if (parsed.token !== HOOK_TOKEN) { res.writeHead(403); res.end('{}'); return; }
       // Main owns these identities. A restore must not wake every other
@@ -2136,7 +2126,7 @@ const hookServer = http.createServer((req, res) => {
       }));
       res.writeHead(200); res.end(JSON.stringify({ pid:process.pid, sessions })); return;
     }
-    // 2026-05-16 道雪：外部 HTTP 救援 — tools/hub-escape.ps1 调这条路由触发 escapeToHome()
+    // 2026-05-16 maintainer：外部 HTTP 救援 — tools/hub-escape.ps1 调这条路由触发 escapeToHome()
     if (isEscapeHome) {
       if (parsed.token !== HOOK_TOKEN) {
         console.warn('[escape-home] 403 wrong token from', req.socket && req.socket.remoteAddress);
@@ -2153,7 +2143,7 @@ const hookServer = http.createServer((req, res) => {
         return;
       }
       console.log('[escape-home] HTTP triggered');
-      // 2026-05-17 道雪：主 webContents 可能已被外部 URL navigate 走（renderer 跑的
+      // 2026-05-17 maintainer：主 webContents 可能已被外部 URL navigate 走（renderer 跑的
       //   是远程网页，preload IPC 失效，sendToRenderer('escape-home') 收不到）。
       //   此时直接 loadFile 拉回 index.html — Hub 主进程没死，session 子进程没丢，
       //   只是 renderer 重新初始化从 state.json 恢复。
@@ -2171,55 +2161,27 @@ const hookServer = http.createServer((req, res) => {
       res.end(JSON.stringify({ ok: true, pid: process.pid }));
       return;
     }
-    // Research mode MCP callbacks (loopback)：stock_static / stock_market / stock_news / scan_* 系列。
-    if (isResearchFetch) {
-      if (parsed.token !== HOOK_TOKEN) { res.writeHead(403); res.end('{}'); return; }
-      const { meetingId, kind, symbol, depth, mode, scan_type, only_subject_stock,
-              window: ksWindow, top_k: ksTopK, method: ksMethod, feature: ksFeature, exclude_self_recent: ksExclude } = parsed;
-      const meeting = meetingId ? meetingManager.getMeeting(meetingId) : null;
-      const chuxinResearch = chuxinBridge
-        && typeof chuxinBridge.isAuthorizedResearchScope === 'function'
-        && chuxinBridge.isAuthorizedResearchScope(meetingId);
-      const agentLeagueResearch = agentLeagueBridge
-        && typeof agentLeagueBridge.isAuthorizedResearchScope === 'function'
-        && agentLeagueBridge.isAuthorizedResearchScope(meetingId);
-      if ((!meeting || meeting.scene !== 'research') && !chuxinResearch && !agentLeagueResearch) {
-        res.writeHead(400); res.end('{"error":"not research mode"}'); return;
-      }
-      const t0 = Date.now();
-      let result;
-      try {
-        if (isResearchStockStatic) {
-          result = await lindangBridge.fetchStatic(symbol, depth);
-        } else if (isResearchStockMarket) {
-          result = await lindangBridge.fetchMarket(symbol, depth, mode);
-        } else if (isResearchStockNews) {
-          result = await lindangBridge.fetchNews(symbol, depth);
-        } else if (isResearchStockSentiment) {
-          result = await lindangBridge.fetchSentiment(symbol, depth, only_subject_stock);
-        } else if (isResearchStockScan) {
-          result = await lindangBridge.fetchScan(scan_type, depth);
-        } else if (isResearchKlineSimilarity) {
-          result = await lindangBridge.fetchKlineSimilarity(symbol, {
-            window: ksWindow, top_k: ksTopK, method: ksMethod,
-            feature: ksFeature, exclude_self_recent: ksExclude,
-          });
-        } else {
-          result = { ok: false, error: 'unknown research endpoint' };
-        }
-      } catch (e) {
-        result = { ok: false, error: 'bridge throw: ' + e.message };
-      }
-      const elapsed = Date.now() - t0;
-      console.log(`[research] ${req.url.split('/').pop()} kind=${kind} elapsed=${elapsed}ms ok=${result.ok}`);
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify(result));
-      return;
-    }
     if (parsed.token !== HOOK_TOKEN) {
       res.writeHead(403); res.end('{}'); return;
     }
     const hookTargetSession = parsed.sessionId ? sessionManager.getSession(parsed.sessionId) : null;
+    // Instruction receipts are observability only, never native turn authority.
+    if(isHook && req.url==='/api/hook/instructions-loaded') {
+      try {
+        const accepted=await sessionManager.memoryService?.nativeEvidence.loaded(hookTargetSession,parsed);
+        res.writeHead(accepted?200:202,{'Content-Type':'application/json'});res.end(JSON.stringify({accepted:!!accepted}));
+      } catch(error) {console.error('[memory] instruction hook failed:',error);res.writeHead(500);res.end('{"error":"instruction-receipt-failed"}');}
+      return;
+    }
+    if (isHook && hookTargetSession && isPtyCodexSession(hookTargetSession)) {
+      let outcome;
+      try { outcome = await handleCodexPtyHook(hookTargetSession, req.url.slice('/api/hook/'.length), parsed); }
+      catch (error) {
+        console.error('[codex hook] handling failed:', error);
+        res.writeHead(500); res.end('{"error":"codex-hook-failed"}'); return;
+      }
+      res.writeHead(outcome && outcome.ignored ? 202 : 200); res.end(JSON.stringify(outcome || {})); return;
+    }
     if (hookTargetSession && require('./core/codex-native-runtime').isCodexSession(hookTargetSession)) {
       res.writeHead(202); res.end('{"ignored":"codex-native-only"}'); return;
     }
@@ -2245,6 +2207,53 @@ const hookServer = http.createServer((req, res) => {
             initialTranscriptBucketMismatch = path.basename(path.dirname(parsed.transcriptPath)).toLowerCase()
               !== projectSlug(hookTargetSession.cwd).toLowerCase();
           } catch {}
+        }
+        // PTY Claude 的身份生命周期：/clear、/resume、退出后重启都会换 session_id。
+        // 只有当前绑定的会话先发出 SessionEnd，随后的新 SessionStart 才允许改绑；
+        // 其余不同 id 的事件照旧按嵌套进程/子代理拒收（core/claude-identity-switch.js）。
+        // /compact 的提交确认。PreCompact 是周期开始，带 trigger、custom_instructions（/compact 的参数）
+        // 和 prompt_id；压缩完成后的 SessionStart(source=compact) 是同一周期（同一 prompt_id）的结束。
+        // 谁被确认由 core/claude-local-command-acks 按参数与周期决定（R7）。不转给 renderer。
+        const compactSignal = hookTargetSession.agentRuntime === 'pty' && !parsed.agentId
+          && (event === 'pre-compact' || (event === 'session-start' && parsed.source === 'compact'))
+          && (!boundClaudeSessionId || incomingClaudeSessionId === boundClaudeSessionId);
+        if (compactSignal) {
+          sessionManager.emit('claude-local-command-ack', {
+            sessionId: parsed.sessionId, command: 'compact',
+            phase: event === 'pre-compact' ? 'start' : 'end',
+            cycleId: parsed.promptId || null,
+            args: event === 'pre-compact' && typeof parsed.customInstructions === 'string' ? parsed.customInstructions : null,
+            trigger: parsed.trigger || null,
+          });
+        }
+        if (event === 'pre-compact') { res.writeHead(200); res.end('{"ok":true}'); return; }
+        if ((event === 'session-start' || event === 'session-end') && hookTargetSession.agentRuntime === 'pty') {
+          const verdict = claudeIdentitySwitch.observe(parsed.sessionId, {
+            event, boundId: boundClaudeSessionId, incomingId: incomingClaudeSessionId,
+            source: parsed.source || null, reason: parsed.reason || null, agentId: parsed.agentId || null,
+            promptId: parsed.promptId || null,
+          });
+          if (verdict.action === 'rebind') {
+            const updated = updateSessionTranscriptBinding(parsed.sessionId, {
+              ccSessionId: incomingClaudeSessionId, transcriptPath: parsed.transcriptPath, cwd: parsed.cwd,
+            });
+            if (updated && updated.ccSessionId === incomingClaudeSessionId) {
+              console.log(`[claude hook] ${parsed.sessionId.slice(0, 8)} follows CLI identity `
+                + `${boundClaudeSessionId.slice(0, 8)} -> ${incomingClaudeSessionId.slice(0, 8)} (${parsed.source})`);
+              sessionManager.emit('claude-identity-switched', { sessionId: parsed.sessionId, to: incomingClaudeSessionId,
+                source: parsed.source || null, cycleId: verdict.cycleId || null });
+              sendToRenderer('claude-identity-switched', {
+                sessionId: parsed.sessionId, from: boundClaudeSessionId, to: incomingClaudeSessionId,
+                source: parsed.source || null, transcriptPath: parsed.transcriptPath || null, at: eventAt,
+              });
+            } else {
+              verdict.action = 'ignore';
+              verdict.why = 'rebind-rejected';
+            }
+          } else if (verdict.action === 'ignore' && verdict.why !== 'no-identity') {
+            console.warn(`[claude hook] ignored ${event} for ${parsed.sessionId.slice(0, 8)}: ${verdict.why}`);
+          }
+          res.writeHead(200); res.end(JSON.stringify({ ok: true, identity: verdict.action })); return;
         }
         if ((boundClaudeSessionId && incomingClaudeSessionId
               && boundClaudeSessionId !== incomingClaudeSessionId)
@@ -2610,7 +2619,6 @@ const tokenPlanUsage = createTokenPlanUsageService({
 });
 
 async function refreshTokenPlanUsage(force = false) {
-  if (community) return null;
   try { return await tokenPlanUsage.refresh(force); }
   finally { sendToRenderer('agent-usage', { tokenPlan: tokenPlanUsage.snapshot() }); }
 }
@@ -2653,12 +2661,19 @@ registerConfigIpc(ipcMain, {
 });
 
 const accountCenterHome = process.env.CLAUDE_HUB_HOME_DIR || os.homedir();
+const capabilityService = new (require('./core/capability-service').CapabilityService)({ sessionManager, dataDir: getHubDataDir() });
 const accountCenter = new (require('./core/account-center').AccountCenter)({
   dataDir: getHubDataDir(), homeDir: accountCenterHome,
   getConfig: () => require('./core/hub-config').getConfig(),
   adapter: require('./core/account-adapters').createAccountAdapters({ dataDir:getHubDataDir(),homeDir:accountCenterHome }),
 });
 require('./main/ipc/account-center-handlers').registerAccountCenterIpc(ipcMain,accountCenter);
+// The account page: one Hub Chrome holds every web login; CLIs report their own token files.
+hubAccountsService = new (require('./core/hub-accounts').HubAccounts)({
+  getToolCatalog: refresh => capabilityService.catalog(refresh),
+  recovery: new (require('./core/web-roundtable/recovery').AccountRecovery)({ dataDir: getHubDataDir() }),
+});
+require('./main/ipc/hub-accounts-handlers').registerHubAccountsIpc(ipcMain, hubAccountsService);
 
 require('./main/ipc/voice-input-handlers').registerVoiceInputIpc(ipcMain, {
   app, safeStorage: require('electron').safeStorage,
@@ -2681,9 +2696,8 @@ const hubMemoryService = new HubMemoryService({
   sendPrompt:(...args)=>require('./core/group-chat-watcher').sendToPty(...args),
 });
 require('./main/ipc/hub-memory-handlers').registerHubMemoryIpc(ipcMain,hubMemoryService);
-const { CapabilityService } = require('./core/capability-service');
 require('./main/ipc/capability-handlers').registerCapabilityIpc(ipcMain,
-  new CapabilityService({sessionManager,dataDir:getHubDataDir()}));
+  capabilityService);
 
 // --- Gemini/Codex/Kimi ring-buffer usage scanner ---
 // Periodically scans agent sessions' ring buffers for token/model patterns
@@ -3053,7 +3067,7 @@ app.whenReady().then(async () => {
 
     // 品牌化副本缺失或过期时后台重建。electron.exe 220MB+，读+改资源+写一整遍
     // 要好几秒，绝不能在主进程同步跑；用 ELECTRON_RUN_AS_NODE 起子进程。
-    // 只新增/替换 AIGroupChatHub.exe，永不触碰 electron.exe（node_modules 完整性铁律）。
+    // 只新增/替换 AIHubCommunity.exe，永不触碰 electron.exe（node_modules 完整性铁律）。
     const brandingState = describeBrandingHealth(brandingOptions);
     if (!brandingState.healthy && brandingState.expected) {
       console.log(`[hub-brand] ${brandingState.message}，后台重建中`);
@@ -3086,14 +3100,18 @@ app.whenReady().then(async () => {
   // Isolated E2E must not mutate or poll production ~/.claude settings. Real
   // Claude integration tests provide their own config explicitly; ordinary
   // renderer/PTY tests need no hook deployment at all.
-  const claudeDirs = (isIsolatedHub() || community)
+  // 端到端测试可以在完全伪造的 home 里部署 hook（CLAUDE_HUB_HOME_DIR 必须就是当前 home）。
+  const e2eFakeHome = process.env.CLAUDE_HUB_E2E_FAKE_HOME === '1' && !!process.env.CLAUDE_HUB_HOME_DIR
+    && path.resolve(process.env.CLAUDE_HUB_HOME_DIR).toLowerCase() === path.resolve(_home).toLowerCase();
+  const claudeDirs = isIsolatedHub() && !e2eFakeHome
     ? []
-    : ['.claude', '.claude-deepseek'].map(dir => path.join(_home, dir));
+    : ['.claude', '.claude-deepseek'].map(dir => path.join(_home, dir))
+      .filter((dir, index) => index === 0 || fs.existsSync(dir));
   const hookSourceScriptsDir = HUB_IS_PACKAGED
     ? path.join(process.resourcesPath, 'scripts')
     : path.join(__dirname, 'scripts');
   traceStartup('deploy hooks start');
-  // 2026-05-05 道雪：所有 Claude family 隔离配置目录都必须部署 Stop hook，否则
+  // 2026-05-05 maintainer：所有 Claude family 隔离配置目录都必须部署 Stop hook，否则
   //   该家族 sub session 完成时 CC 不调 hook → notifyClaudeStop 永不触发 →
   //   ClaudeTap.JsonlTail 永不启动 → stop_reason 主路径 + idle 兜底全失效 →
   //   群聊卡片自动同步死，只能等 5min 硬 timeout 或用户手动点提取。
@@ -3112,6 +3130,14 @@ app.whenReady().then(async () => {
     });
   }
   traceStartup('deploy hooks done');
+  // file-scope-guard hook 被中断/硬杀留下的 file-claims.json.tmp.<pid> 孤儿（只收 1 小时前的）。
+  try {
+    const tmpCleanup = cleanupFileClaimsTmp(getHubDataDir());
+    if (tmpCleanup.removed) console.log(`[群聊] 清理 file-claims 临时文件孤儿 ${tmpCleanup.removed} 个`);
+    if (tmpCleanup.errors.length) console.warn(`[群聊] file-claims 临时文件清理部分失败：${tmpCleanup.errors.slice(0, 3).join('；')}`);
+  } catch (error) {
+    console.warn('[群聊] file-claims 临时文件清理失败:', error && error.message);
+  }
   traceStartup('codex config start');
   ensureCodexContextConfig();
   traceStartup('codex config done');
@@ -3134,7 +3160,7 @@ app.whenReady().then(async () => {
 
   // 2026-06-05 联邦记忆下线：claude-memory-loader 只做 readFileSync，无需预热
 
-  // 2026-05-16 道雪：写 per-PID 控制文件（含 hookPort + cdpPort + HOOK_TOKEN）。
+  // 2026-05-16 maintainer：写 per-PID 控制文件（含 hookPort + cdpPort + HOOK_TOKEN）。
   //   救援脚本 tools/hub-escape.ps1 通过 <dataDir>/control/<pid>.json 发现 Hub
   //   端口和 token。CDP 端口从 <userData>/DevToolsActivePort 读取（Chromium 写入）。
   try {
@@ -3227,13 +3253,13 @@ async function runFinalShutdownCleanup() {
   // 原生投研 PTY 的全局租约属于 Hub 进程生命周期。退出时同步释放，
   // 让另一台/另一个 Hub 可以立即恢复同一个 native session；崩溃场景
   // 仍由 registry 的过期租约兜底。
-  if (chuxinBridge && typeof chuxinBridge.releaseAllOwnership === 'function') {
-    capture('chuxin-ownership', () => chuxinBridge.releaseAllOwnership());
+  if (xresearchBridge && typeof xresearchBridge.releaseAllOwnership === 'function') {
+    capture('xresearch-ownership', () => xresearchBridge.releaseAllOwnership());
   }
   if (agentLeagueBridge && typeof agentLeagueBridge.stopScheduler === 'function') {
     capture('agent-league-scheduler', () => agentLeagueBridge.stopScheduler());
   }
-  // 2026-05-07 道雪：退出时保证三层都同步落盘——state.json（lock + merge）、
+  // 2026-05-07 maintainer：退出时保证三层都同步落盘——state.json（lock + merge）、
   //   per-meeting JSON、per-session JSON。任意一层丢了，下次 boot 的 selfHeal
   //   都能从另一层恢复。
   capture('usage-cache', () => flushUsageCacheSync());
@@ -3259,7 +3285,7 @@ async function runFinalShutdownCleanup() {
     errors.push({ label: 'state-store', message: error && error.message ? error.message : String(error) });
   }
 
-  // 2026-05-16 道雪：清理自己的控制文件。unlinkSelf 内部已 try/catch + warn 非 ENOENT 错误，
+  // 2026-05-16 maintainer：清理自己的控制文件。unlinkSelf 内部已 try/catch + warn 非 ENOENT 错误，
   // 不外抛，所以这里裸调即可，不再加外层 catch（避免盖住内部 warn）。
   capture('hub-control', () => hubControl.unlinkSelf(getHubDataDir(), process.pid));
   if (errors.length) {
@@ -3284,10 +3310,38 @@ function restoreWindowAfterFailedShutdown() {
   }
 }
 
+// The renderer throttles persist-sessions (up to 2 s), so its newest workscene
+// may not have reached Main yet. Ask for it and wait for the acknowledgement:
+// the renderer sends persist-sessions first and the ack second, and Main
+// handles one renderer's messages in order, so the ack proves the workscene
+// is in lastPersistedSessions. Without waiting, a close with no live PTY
+// drained at once and the final save could beat the reply.
+function flushRendererWorkscene(timeoutMs = 1500) {
+  if (!mainWindow || mainWindow.isDestroyed()) return Promise.resolve(false);
+  const requestId = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return new Promise(resolve => {
+    let timer = null;
+    const onAck = (_event, ackId) => { if (ackId === requestId) finish(true); };
+    const finish = ok => {
+      clearTimeout(timer);
+      ipcMain.removeListener('hub:flush-workscene:done', onAck);
+      resolve(ok);
+    };
+    timer = setTimeout(() => {
+      console.warn('[shutdown] renderer did not confirm the final workscene; saving the last one received');
+      finish(false);
+    }, timeoutMs);
+    ipcMain.on('hub:flush-workscene:done', onAck);
+    try { mainWindow.webContents.send('hub:flush-workscene', { requestId }); }
+    catch { finish(false); }
+  });
+}
+
 function beginGracefulHubShutdown(reason, { beforeQuit } = {}) {
   if (shutdownDrainPromise) return shutdownDrainPromise;
 
   shutdownDrainState = 'draining';
+  global.__deliveryEngine?.freeze();
   console.log(`[shutdown] draining PTYs before Electron teardown (${reason})`);
   // Freeze Agent League dispatch before SessionManager starts terminating PTYs.
   // Active tasks remain durable/orphan-recoverable and the phase lease is only
@@ -3296,17 +3350,20 @@ function beginGracefulHubShutdown(reason, { beforeQuit } = {}) {
     try { agentLeagueBridge.beginHandoff(reason); }
     catch (error) { console.warn('[shutdown] agent league handoff preparation failed:', error && error.message); }
   }
-  shutdownDrainPromise = sessionManager.disposeGracefully({ logger: console, warnAfterMs: 5000, drainTimeoutMs: 15_000 })
+  shutdownDrainPromise = flushRendererWorkscene()
+    .then(() => sessionManager.disposeGracefully({ logger: console, warnAfterMs: 5000, drainTimeoutMs: 15_000 }))
     .then(async (result) => {
       if (!result || result.safeToQuit !== true) {
         shutdownDrainState = 'idle';
         shutdownDrainPromise = null;
         console.error('[shutdown] PTY drain did not reach a safe state; close was cancelled and may be retried', result);
         restoreWindowAfterFailedShutdown();
+        global.__deliveryEngine?.startWatching();
         return result;
       }
       closeHookServerForShutdown();
       const cleanup = await runFinalShutdownCleanup();
+      global.__deliveryEngine?.dispose();
       if (beforeQuit) {
         if (!cleanup.clean) throw new Error('最终保存或后台进程退出失败，已取消重启');
         await beforeQuit();
@@ -3325,6 +3382,7 @@ function beginGracefulHubShutdown(reason, { beforeQuit } = {}) {
       shutdownDrainPromise = null;
       console.error('[shutdown] PTY drain failed; refusing unsafe Electron teardown:', error && error.stack || error);
       restoreWindowAfterFailedShutdown();
+      global.__deliveryEngine?.startWatching();
       return { safeToQuit: false, error: error && error.message ? error.message : String(error) };
     });
   return shutdownDrainPromise;

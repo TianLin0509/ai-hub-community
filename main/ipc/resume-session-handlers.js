@@ -69,30 +69,7 @@ function createResumeSessionHandler(deps) {
       effectiveCodexSessionsRoot = defaultCodexSessionsRoot;
     }
     const hookPort = getHookPort();
-    const isAgentLeague = meta.purpose === 'agent-league' || meta.purpose === 'agent-league-virtual';
-
     let resumeOpts = {};
-    if (isAgentLeague) {
-      const agentId = path.basename(String(meta.cwd || '')).toLowerCase();
-      const scopePrefix = meta.purpose === 'agent-league-virtual' ? 'agent-league-virtual-' : 'agent-league-';
-      const scopeId = /^[a-z0-9][a-z0-9_-]{2,63}$/.test(agentId) ? `${scopePrefix}${agentId}` : '';
-      if (scopeId && hookPort) {
-        const hubDataDir = getHubDataDir();
-        if (isClaudeCliResumable) {
-          resumeOpts.mcpConfigFile = scenes.writeResearchMcpConfig(
-            hubDataDir, scopeId, hookPort, hookToken, meta.kind || 'claude', { enableChuxin: true },
-          );
-        } else if (isCodexRuntime && scenes.buildResearchMcpEntryForCodex) {
-          resumeOpts.codexBypassApprovals = true;
-          resumeOpts.mcpProfile = 'lean';
-          addCodexMcpEntry(resumeOpts, scenes.buildResearchMcpEntryForCodex(
-            scopeId, hookPort, hookToken, hubDataDir, { enableChuxin: true },
-          ));
-        }
-      } else if (!hookPort) {
-        logger.warn('[agent-league] resume without hookPort; Chuxin MCP is unavailable');
-      }
-    }
     if (meta.meetingId) {
       const meeting = meetingManager.getMeeting(meta.meetingId);
       if (meeting && meeting.groupChat) resumeOpts.noInheritCursor = true;
@@ -121,33 +98,6 @@ function createResumeSessionHandler(deps) {
       const codexMcpEnabled = meta.mcpProfile !== 'none';
       if (meeting && meeting.groupChat && isCodexRuntime && codexMcpEnabled && scenes.buildAiTeamMcpEntryForCodex) {
         addCodexMcpEntry(resumeOpts, scenes.buildAiTeamMcpEntryForCodex(meta.meetingId, meta.kind || 'codex'));
-      }
-      if (meeting && meeting.groupChat && meeting.scene === 'research' && hookPort) {
-        const hubDataDir = getHubDataDir();
-        if (isClaudeCliResumable) {
-          resumeOpts.mcpConfigFile = scenes.writeResearchMcpConfig(
-            hubDataDir, meta.meetingId, hookPort, hookToken, meta.kind || 'claude', { enableChuxin: true },
-          );
-        } else if (isGemini) {
-          resumeOpts.extraEnv = {
-            ...(resumeOpts.extraEnv || {}),
-            ELECTRON_RUN_AS_NODE: '1',
-            ARENA_MEETING_ID: meta.meetingId,
-            ARENA_HUB_PORT: String(hookPort),
-            ARENA_HOOK_TOKEN: hookToken,
-            ARENA_AI_KIND: 'gemini',
-            ARENA_HUB_DATA_DIR: hubDataDir,
-            ARENA_CHUXIN_ENABLED: '1',
-            SPIRIT_REGISTRY_ROOT: process.env.SPIRIT_REGISTRY_ROOT || path.join(os.homedir(), 'spirit-lens-registry'),
-          };
-        } else if (isCodexRuntime && codexMcpEnabled) {
-          resumeOpts.codexBypassApprovals = true;
-          addCodexMcpEntry(resumeOpts, scenes.buildResearchMcpEntryForCodex(
-            meta.meetingId, hookPort, hookToken, hubDataDir, { enableChuxin: true },
-          ));
-        }
-      } else if (meeting && meeting.groupChat && meeting.scene === 'research' && !hookPort) {
-        logger.warn('[群聊] research scene resume for meeting ' + meta.meetingId + ' but hookPort unavailable — stock MCP tools unavailable');
       }
     }
 
@@ -191,6 +141,24 @@ function createResumeSessionHandler(deps) {
         if (discovered) resumeTranscriptPath = discovered;
       } catch {}
     }
+    // 一轮都没跑过的 Codex 会话（原生时代建的，或 PTY 下开了没聊），改走 PTY 恢复时
+    // 没有任何可恢复的历史：要么没有 thread id，要么 App Server 只建了 thread、rollout
+    // 从未落盘。此时 `codex resume` 只会停在「Resume a previous session」选择框，还会
+    // 吞掉第一条消息。同一个 Hub id 直接新开；跑出第一轮后 hook 会绑定原生身份。
+    // 只认正面证据：原生快照没有任何轮次，且 Hub 从未记录过开始/完成/记录路径。
+    // 跑过但没绑上 id 的老会话仍走选择框，那是绑定失败时唯一不丢历史的兜底。
+    // 用户主动选的「Codex Resume」（kind=codex-resume）本来就要选择框，不受影响。
+    const nativeSnapshot = meta.nativeRuntime;
+    const codexNeverRan = isCodexRuntime && !isDeepSeek && (meta.kind || 'codex') === 'codex'
+      && require('../../core/agent-runtime-mode').usesPtyAgentRuntime('codex')
+      && (!nativeSnapshot || (!nativeSnapshot.turnId && !nativeSnapshot.submission && !nativeSnapshot.startedAt
+        && !(nativeSnapshot.endedTurns || []).length))
+      && !meta.lastRunStartedAt && !meta.lastCompletedAt && !meta.transcriptPath
+      && (!effectiveCodexSid || !resumeTranscriptPath);
+    if (codexNeverRan) {
+      logger.log(`[resume-session] Codex session ${String(meta.hubId).slice(0, 8)} never ran a turn; starting fresh under PTY`);
+      effectiveCodexSid = null;
+    }
     const codexMissingSid = (isCodexRuntime && !effectiveCodexSid);
     // A persisted Agent League shell may not have completed its first provider
     // turn yet. In that state there is no native conversation to resume. Every
@@ -209,7 +177,7 @@ function createResumeSessionHandler(deps) {
       && (isDevSeat || meta.nativeRuntime?.connection === 'unstarted');
     const isFileFlowMember = require('../../core/dev-file-workflow').enabled(managedMeeting)
       && managedMeeting.subSessions?.includes(meta.hubId);
-    const freshUnboundAgentLeague = unstartedCodex || (isAgentLeague || isFileFlowMember) && (
+    const freshUnboundAgentLeague = unstartedCodex || codexNeverRan || (isAgentLeague || isFileFlowMember) && (
       codexMissingSid
       || (isClaudeCliResumable && !meta.ccSessionId)
       || (isGemini && !meta.geminiChatId)
@@ -282,6 +250,7 @@ function createResumeSessionHandler(deps) {
       ...(meta.codexApprovalPolicy ? {approvalPolicy:meta.codexApprovalPolicy} : {}),
       ...(meta.codexSandbox ? {sandbox:meta.codexSandbox} : {}),
       codexProfile: isCodexRuntime ? (meta.codexProfile || null) : null,
+      ...(isCodexRuntime ? {codexSessionsRoot:effectiveCodexSessionsRoot} : {}),
       // MCP 档位现在 Claude 家族也有（core/claude-mcp-profile.js），不能再只给
       // codex runtime 继承 —— 否则 resume 出来的 Claude 会话会从用户选的 Lean
       // 悄悄变回 Full，一次多起七个 MCP 进程。
@@ -325,7 +294,7 @@ function createResumeSessionHandler(deps) {
         : {}),
       ...(meta.purpose ? { purpose: meta.purpose } : {}),
       ...(meta.researchSessionId ? { researchSessionId: meta.researchSessionId } : {}),
-      ...(meta.chuxinTaskId ? { chuxinTaskId: meta.chuxinTaskId } : {}),
+      ...(meta.xresearchTaskId ? { xresearchTaskId: meta.xresearchTaskId } : {}),
       ...(Array.isArray(meta.heroIds) ? { heroIds: meta.heroIds } : {}),
       ...(meta.promptPolicyVersion ? { promptPolicyVersion: meta.promptPolicyVersion } : {}),
       ...(meta.hiddenFromSidebar ? { hiddenFromSidebar: true } : {}),

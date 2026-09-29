@@ -80,7 +80,7 @@ function createSessionSplit({ document: doc, window: win, primary, buttons, serv
   function sync() {
     const active = s.primaryId();
     if (previousPrimary !== active) { previousPrimary = active; if (view?.sessionId === active) clearRight(); }
-    const rows = s.sessions().filter(session => session.purpose !== 'chuxin-research');
+    const rows = s.sessions().filter(session => session.purpose !== 'xresearch-research');
     const signature = JSON.stringify(rows.map(v => [v.id, v.title, v.kind, v.status]));
     for (const [select, selected] of [[leftSelect, active], [rightSelect, opening || view?.sessionId]]) {
       if (select.dataset.signature !== signature) {
