@@ -19,6 +19,7 @@ const CURRENT_VERSION = 1;
 //   - 锁拿不到时拒绝无锁直写；Windows 原子替换的瞬时 EPERM 则在持锁期内有界重试。
 
 const _removedSessionIds = new Set();
+const { preserveLatestInteraction } = require('./session-recency');
 const _removedMeetingIds = new Set();
 
 function markRemovedSession(hubId) { if (hubId) _removedSessionIds.add(hubId); }
@@ -136,8 +137,10 @@ function loadAndSelfHeal({ sessionStore, meetingStore, canEditSession = () => tr
           if (!data || !data.hubId) continue;
           if (onDisk.has(data.hubId)) {
             const i = disk.sessions.findIndex(s => s.hubId === data.hubId);
-            if (i >= 0 && (data.updatedAt || 0) > (disk.sessions[i].updatedAt || 0)) {
-              disk.sessions[i] = { ...disk.sessions[i], ...data };
+            if (i >= 0) {
+              const prior = disk.sessions[i];
+              const winner = (data.updatedAt || 0) > (prior.updatedAt || 0) ? { ...prior, ...data } : prior;
+              disk.sessions[i] = preserveLatestInteraction(winner, prior, data);
             }
           } else {
             disk.sessions.push({ ...data });
@@ -148,11 +151,13 @@ function loadAndSelfHeal({ sessionStore, meetingStore, canEditSession = () => tr
       }
     }
 
+    let meetingBackups = [];
     // meeting orphans
     if (meetingStore && typeof meetingStore.listMeetingFilesWithData === 'function') {
       try {
         const onDisk = new Set(disk.meetings.map(m => m.id));
         const fromFiles = meetingStore.listMeetingFilesWithData();
+        meetingBackups = fromFiles;
         for (const data of fromFiles) {
           if (!data || !data.id) continue;
           if (onDisk.has(data.id)) {
@@ -169,6 +174,15 @@ function loadAndSelfHeal({ sessionStore, meetingStore, canEditSession = () => tr
         }
       } catch (e) {
         console.warn('[hub] meeting-store self-heal scan failed:', e.message);
+      }
+    }
+
+    // Older builds deleted group members on unexpected CLI exit. An intact
+    // roster backup plus exact native identities can restore the empty room.
+    if (haveLock && sessionStore && meetingStore) {
+      const repairs = require('./meeting-member-recovery').recoverEmptyMeetingMembers(disk, meetingBackups, { canEditSession });
+      for (const repair of repairs) {
+        for (const member of repair.members) sessionStore.saveSessionFile(member.hubId, member);
       }
     }
 
@@ -211,9 +225,8 @@ function mergeState(diskState, memState, removed = { sessions: [], meetings: [] 
     const s = migrateLegacyBranchSessionMeta(raw);
     if (!s || !s.hubId) continue;
     const existing = sessByHubId.get(s.hubId);
-    if (!existing || (s.updatedAt || 0) >= (existing.updatedAt || 0)) {
-      sessByHubId.set(s.hubId, s);
-    }
+    const winner = !existing || (s.updatedAt || 0) >= (existing.updatedAt || 0) ? s : existing;
+    sessByHubId.set(s.hubId, preserveLatestInteraction(winner, existing, s));
   }
   for (const id of removed.sessions || []) sessByHubId.delete(id);
 

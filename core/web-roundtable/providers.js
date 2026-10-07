@@ -3,7 +3,7 @@
 // arbitrary URL, or caller-supplied JavaScript is exposed through MCP.
 const providers = {
   deepseek:{ name:'DeepSeek', url:'https://chat.deepseek.com/', conversation:'^/a/chat/s/[a-zA-Z0-9-]+$', composer:'textarea[placeholder="Message DeepSeek"]', answer:'.ds-assistant-message-main-content', container:'[data-virtual-list-item-key]', done:'[aria-label="Read aloud"],[aria-label="朗读"]' },
-  kimi:{ name:'Kimi', url:'https://www.kimi.com/', conversation:'^/chat/[a-zA-Z0-9-]+$', composer:'.chat-input-editor[contenteditable="true"]', auth:'[data-testid="sidebar-user-menu-trigger"] .user-name', answer:'.segment-assistant', content:'.markdown', exclude:'.thinking-container,.toolcall-content', done:'.segment-assistant-actions .icon-button' },
+  kimi:{ name:'Kimi', url:'https://www.kimi.com/', conversation:'^/chat/[a-zA-Z0-9-]+$', composer:'.chat-input-editor[contenteditable="true"]', auth:'[data-testid="sidebar-user-menu-trigger"] .user-name', quota:'.chat-input-bar-content', answer:'.segment-assistant', content:'.markdown', exclude:'.thinking-container,.toolcall-content', done:'.segment-assistant-actions .icon-button' },
   qwen:{ name:'千问', url:'https://www.qianwen.com/', conversation:'^/chat/[a-zA-Z0-9-]+$', composer:'[role="textbox"][data-slate-editor="true"]', answer:'.answer-common-card .qk-markdown', doneSelf:'qk-markdown-complete', send:'button[aria-label="发送消息"]' },
 };
 function get(provider) { if(!Object.hasOwn(providers,provider))throw Error('Unsupported web provider: '+provider); return providers[provider]; }
@@ -14,7 +14,9 @@ function inspectPage(p, prompt='') {
   const normalize=s=>String(s||'').replace(/\s+/g,' ').trim();
   const controls=[...document.querySelectorAll('button,a,[role="button"]')].filter(visible);
   const labels=controls.map(e=>(e.getAttribute('aria-label')||e.innerText||'').trim());
-  const challenge=!![...document.querySelectorAll('iframe[src*="challenges.cloudflare.com"],.ds-shumei-captcha-modal,[class*="captcha_verify_container"]')].find(visible);
+  // A top-level Cloudflare gate has no iframe; its title plus Cloudflare's own script is the proof.
+  const gate=/^(Just a moment|请稍候|請稍候)/.test(document.title)&&(typeof window._cf_chl_opt==='object'||!!document.querySelector('script[src*="/cdn-cgi/challenge-platform/"]'));
+  const challenge=gate||!![...document.querySelectorAll('iframe[src*="challenges.cloudflare.com"],.ds-shumei-captcha-modal,[class*="captcha_verify_container"]')].find(visible);
   const login=labels.some(t=>/^(log in|sign in|登录|登入|登录账号|登录帐号)$/i.test(t)) || /\/sign_in|\/login|from_logout/.test(location.href);
   const composer=[...document.querySelectorAll(p.composer)].find(visible);
   const answers=[...document.querySelectorAll(p.answer)].map(e=>{
@@ -25,7 +27,8 @@ function inspectPage(p, prompt='') {
   const echo=prompt?[...document.querySelectorAll('p,div,span')].filter(e=>!e.closest('[contenteditable],textarea')&&!e.closest(p.answer) && normalize(e.innerText)===normalize(prompt) && ![...e.children].some(c=>normalize(c.innerText)===normalize(prompt))).length:0;
   const editor=composer?.cloneNode(true);editor?.querySelectorAll('[data-slate-placeholder],[data-slate-zero-width]').forEach(e=>e.remove());
   const authReady=!p.auth||[...document.querySelectorAll(p.auth)].some(e=>visible(e)&&e.textContent.trim()&&!/登录|sign in|log in/i.test(e.textContent));
-  return {url:location.href,host:location.host,challenge,login,ready:!!composer&&authReady,composerText:composer?(composer.value??editor.textContent):'',echo,answers};
+  const quotaMessage=p.quota?[...document.querySelectorAll(p.quota)].filter(e=>visible(e)&&!e.closest(p.answer)&&!e.closest('[contenteditable],textarea')).map(e=>normalize(e.innerText)).find(t=>/\bquota (?:is )?(?:used up|exhausted)|额度.{0,8}(?:用完|耗尽|不足)|次数.{0,8}(?:用完|耗尽)/i.test(t))||null:null;
+  return {url:location.href,host:location.host,challenge,login,quotaMessage,ready:!!composer&&authReady,composerText:composer?(composer.value??editor.textContent):'',echo,answers};
 }
 function expression(provider, prompt) { return `(${inspectPage.toString()})(${JSON.stringify(get(provider))},${JSON.stringify(prompt||'')})`; }
 async function snapshot(page,provider,prompt) { const value=await page.evaluate(expression(provider,prompt)); if(value.host!==new URL(get(provider).url).host)throw Error('Official page redirected; manual verification required'); return value; }

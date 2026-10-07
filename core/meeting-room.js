@@ -3,7 +3,8 @@ const meetingStore = require('./meeting-store');
 
 // scene 白名单 (与 core/group-chat-scenes.js SCENE_REGISTRY keys 同步)
 //   2026-05-04 maintainer: 'dev' 加入 (plan-dev-scenario.md MVP)
-const MEETING_MODES = ['general', 'research', 'dev'];
+//   2026-09-30 'writing' 加入：写作 Tab 的「新文章」一键创建写作群聊
+const MEETING_MODES = ['general', 'research', 'dev', 'writing'];
 
 // 模式 → 房名前缀。前端 +号菜单点击两模式入口时透传 mode,createMeeting 据此生成
 // 自带语义的房名(每模式独立计数,后期允许用户重命名)。未传 mode 时默认 'general' 走
@@ -14,11 +15,18 @@ const MODE_TITLE_PREFIX = {
   general: '通用',
   research: '投研',
   dev: '开发',
+  writing: '写作',
 };
 
 function cloneSerialWorkflow(workflow) {
   if (!workflow || typeof workflow !== 'object' || Array.isArray(workflow)) return null;
   return JSON.parse(JSON.stringify(workflow));
+}
+
+// AI 编排模式（2026-10-04）：只存静态身份与设置；进度账本在 task-docs/<群>/orchestration/。
+function cloneOrchestration(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || value.enabled !== true) return null;
+  return JSON.parse(JSON.stringify(value));
 }
 
 function ensureStableSlotSpecs(slotSpecs, subSessions) {
@@ -47,7 +55,7 @@ class MeetingRoomManager {
   constructor() {
     this.meetings = new Map();
     // 各模式独立计数,跨模式不共享
-    this._counters = { general: 0, research: 0, dev: 0 };
+    this._counters = { general: 0, research: 0, dev: 0, writing: 0 };
   }
 
   createMeeting(opts = {}) {
@@ -94,6 +102,7 @@ class MeetingRoomManager {
       // free-mode（2026-05-04）：自由模式参与者 slot 列表，默认全员勾选
       participants: Array.isArray(opts.participants) ? opts.participants.slice() : [0, 1, 2],
       serialWorkflow: cloneSerialWorkflow(opts.serialWorkflow),
+      orchestration: cloneOrchestration(opts.orchestration),
     };
     // Hub Timeline phase 1 (in-memory only)
     meeting._timeline = [];
@@ -169,6 +178,7 @@ class MeetingRoomManager {
       autoTitleGenerated: !!m.autoTitleGenerated,
       participants: Array.isArray(m.participants) ? [...m.participants] : null,
       serialWorkflow: cloneSerialWorkflow(m.serialWorkflow),
+      orchestration: cloneOrchestration(m.orchestration),
     } : null;
   }
 
@@ -189,6 +199,7 @@ class MeetingRoomManager {
       autoTitleGenerated: !!m.autoTitleGenerated,
       participants: Array.isArray(m.participants) ? [...m.participants] : null,
       serialWorkflow: cloneSerialWorkflow(m.serialWorkflow),
+      orchestration: cloneOrchestration(m.orchestration),
     }));
   }
 
@@ -278,11 +289,12 @@ class MeetingRoomManager {
       'lastMessageTime', 'lastCompletedAt', 'status', 'lastScene', 'scene', 'covenantText',
       'userRenamed', 'autoTitlePending', 'autoTitleGenerated',
       'serialWorkflow', 'workspace', 'workspaceLabel',
-      'completionNotificationEnabled',
+      'completionNotificationEnabled', 'orchestration',
     ];
     for (const key of allowed) {
       if (key in fields) {
-        m[key] = key === 'serialWorkflow' ? cloneSerialWorkflow(fields[key]) : fields[key];
+        m[key] = key === 'serialWorkflow' ? cloneSerialWorkflow(fields[key])
+          : key === 'orchestration' ? cloneOrchestration(fields[key]) : fields[key];
       }
     }
     // Placement is a three-state choice: top / normal / bottom.  Normalize at
@@ -294,7 +306,7 @@ class MeetingRoomManager {
     //   避免新群聊首次 markDirty 时 prev 残缺导致 title/subSessions 被默认值覆盖。
     if ('serialWorkflow' in fields || 'workspace' in fields || 'workspaceLabel' in fields
         || 'lastMessageTime' in fields || 'lastCompletedAt' in fields
-        || 'completionNotificationEnabled' in fields
+        || 'completionNotificationEnabled' in fields || 'orchestration' in fields
         || 'pinned' in fields || 'bottomed' in fields) {
       meetingStore.markDirty(meetingId, m);
     }
@@ -302,6 +314,7 @@ class MeetingRoomManager {
       ...m,
       subSessions: [...m.subSessions],
       serialWorkflow: cloneSerialWorkflow(m.serialWorkflow),
+      orchestration: cloneOrchestration(m.orchestration),
     };
   }
 
@@ -392,6 +405,7 @@ class MeetingRoomManager {
       participants: Array.isArray(meetingData.participants) ? meetingData.participants : null,
       // 串行工作流配置（2026-06-17 maintainer）：重启恢复
       serialWorkflow: cloneSerialWorkflow(meetingData.serialWorkflow),
+      orchestration: cloneOrchestration(meetingData.orchestration),
       _timeline: [],
       _cursors: {},
       _nextIdx: 0,
@@ -429,6 +443,9 @@ class MeetingRoomManager {
     }
     if (!m.serialWorkflow && data.serialWorkflow && typeof data.serialWorkflow === 'object') {
       m.serialWorkflow = cloneSerialWorkflow(data.serialWorkflow);
+    }
+    if (!m.orchestration && data.orchestration && typeof data.orchestration === 'object') {
+      m.orchestration = cloneOrchestration(data.orchestration);
     }
     return true;
   }

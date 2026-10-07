@@ -12,6 +12,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const routing = require('./hub-browser-routing');
 
 // `cookie`: the cookie that carries the login; readable offline because Chrome does not
 // encrypt cookie names or expiry. Sites without one keep their login in localStorage, which
@@ -33,6 +34,7 @@ const DEFAULT_IDENTITIES = [
   { id: 'alt', label: '副', sites: ALL_SITES },
 ];
 const OFFSCREEN = { left: -32000, top: -32000, width: 1280, height: 900 };
+const ONSCREEN = { left: 60, top: 40, width: 1280, height: 860 };
 
 function defaultRoot(env = process.env) {
   if (env.HUB_CHROME_ROOT) return path.resolve(env.HUB_CHROME_ROOT);
@@ -66,13 +68,14 @@ function hostMatches(hostKey, host) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 class HubChrome {
-  constructor({ root, env = process.env, spawnImpl = spawn, identities = DEFAULT_IDENTITIES, executable, now = Date.now } = {}) {
+  constructor({ root, env = process.env, spawnImpl = spawn, identities = DEFAULT_IDENTITIES, executable, now = Date.now, proxy } = {}) {
     this.root = root || defaultRoot(env);
     this.env = env;
     this.spawn = spawnImpl;
     this.identities = identities;
     this.executable = executable || (() => chromeExecutable(env));
     this.now = now;
+    this.proxy = proxy;
     this.starting = null;
     this.contexts = new Map();
   }
@@ -190,7 +193,10 @@ class HubChrome {
         let probe;
         try { probe = await page.evaluate(require('./account-browser').PROBE); }
         catch (e) { if (!/Execution context was destroyed|Cannot find context with specified id/i.test(e.message || '')) throw e; }
-        if (probe?.challenge) throw Object.assign(Error('网站安全验证拦截了后台检查'), { code: 'HUB_LOGIN_CHECK_RESTRICTED' });
+        if (probe?.challenge) {
+          require('./web-risk-guard').recordChallenge(this.root, { identity: identityId, site: 'chatgpt', kind: 'cloudflare', source: 'account-check' });
+          throw Object.assign(Error('网站安全验证拦截了后台检查'), { code: 'HUB_LOGIN_CHECK_RESTRICTED' });
+        }
         if (probe?.host === 'chatgpt.com' && probe.login) return '';
         const email = await page.evaluate(`(async()=>{if(location.hostname!=='chatgpt.com')return '';try{const r=await fetch('/api/auth/session',{credentials:'include',signal:AbortSignal.timeout(4000)});if(!r.ok)return '';const j=await r.json();return (j&&j.user&&j.user.email)||'';}catch{return ''}})()`).catch(e => {
           if (!/Execution context was destroyed|Cannot find context with specified id/i.test(e.message || '')) throw e;
@@ -251,27 +257,47 @@ class HubChrome {
       + `Hub 的网页工具都在这里工作，请不要关闭这个窗口。</body>`;
     if (!fs.existsSync(file) || fs.readFileSync(file, 'utf8') !== html) fs.writeFileSync(file, html, 'utf8');
   }
-  launchArgs(identityId, { debug = true, visible = false, headless = false, url, urls } = {}) {
+  // The Hub's proxy (hub-config.js) for every launch. Without it Chrome follows the Windows
+  // system proxy, which the proxy client may switch off; then ChatGPT never loads (measured
+  // 2026-09-30: navigating to chatgpt.com timed out, with the Hub proxy it loaded at once).
+  proxyServer() {
+    // Read on every launch: saving Hub settings must not leave this instance
+    // permanently bound to the first proxy it saw.
+    const value=typeof this.proxy==='function'?this.proxy():this.proxy===undefined?require('./hub-config').getConfig().proxy:this.proxy;
+    return routing.normalizeProxy(value);
+  }
+  routingStatus() { return routing.status(this.root,routing.policy(this.proxyServer()),this.profileHeld()); }
+  launchArgs(identityId, { debug = true, visible = false, headless = false, newWindow = true, url, urls } = {}) {
     return [
+      ...routing.policy(this.proxyServer()).args,
       '--user-data-dir=' + this.root,
       '--profile-directory=' + identityId,
       ...(debug ? ['--remote-debugging-port=0'] : []),
       ...(headless ? ['--headless=new'] : []),
       '--no-first-run', '--no-default-browser-check',
+      // Tool tabs live in windows parked off screen. Without these Chrome reports them hidden:
+      // timers are throttled and no animation frame runs, so a Playwright click waits forever
+      // for the element to be stable (measured 2026-09-30 on the bridge's send button). Chrome
+      // launched by Playwright carries the same three switches.
+      '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding', '--disable-background-timer-throttling',
       // Set an explicit visible state instead of restoring a parked off-screen window.
       // Measured on Windows Chrome: --window-position overrides --start-maximized,
       // for both the first launch and a new window in an already running browser.
       ...(visible ? ['--start-maximized']
         : ['--window-position=-32000,-32000', '--window-size=1280,900']),
-      '--new-window', ...(urls && urls.length ? urls : [url || this.markerUrl(identityId)]),
+      ...(newWindow ? ['--new-window'] : []), ...(urls && urls.length ? urls : [url || this.markerUrl(identityId)]),
     ];
   }
   launch(identityId, options) {
+    const plan=routing.policy(this.proxyServer()),held=this.profileHeld();
+    routing.assertCurrent(this.root,plan,held);
     this.writeMarker(identityId);
     return new Promise((resolve, reject) => {
       const child = this.spawn(this.executable(), this.launchArgs(identityId, options), { env: this.env, detached: true, stdio: 'ignore', windowsHide: !options?.visible });
       child.once('error', reject);
-      child.once('spawn', () => { this.lastLaunchPid = child.pid; child.unref(); resolve(); });
+      child.once('spawn', () => { this.lastLaunchPid = child.pid; child.unref();
+        try { if(!held)routing.record(this.root,plan,child.pid);resolve(); }catch(e){reject(e);}
+      });
     });
   }
   // Chrome holds <profile>/lockfile exclusively for as long as it runs, so a failed open
@@ -302,6 +328,7 @@ class HubChrome {
     this.assertAvailable();
     const existing = await this.endpoint();
     if (existing) {
+      routing.assertCurrent(this.root,routing.policy(this.proxyServer()),this.profileHeld());
       if (headless && !existing.headless) throw Error('专属 Chrome 正在使用中，请关闭网页窗口后检查');
       return existing;
     }
@@ -368,6 +395,30 @@ class HubChrome {
     }
     throw new Error('Hub 浏览器没有打开新标签页');
   }
+  // A person's window in a running Hub Chrome: Chrome opens it from its own command line, so
+  // no debugger ever attaches to that page, and it is placed with browser-level window calls
+  // only. Observed 2026-09-29: such a window inherited the parked off-screen position
+  // (-14564,-14564) despite --window-position, so the person saw nothing when clicking it.
+  async openVisible(identityId, url) { return this.lifecycle(() => this._openVisible(identityId, url)); }
+  async _openVisible(identityId, url) {
+    const { cdp } = await this.browser();
+    try {
+      const mark = await this.marker(identityId, cdp);
+      const before = new Set((await this.pagesIn(cdp, mark.browserContextId)).map(t => t.targetId));
+      await this.launch(identityId, { visible: true, url });
+      let target;
+      for (const end = Date.now() + 15000; !target && Date.now() < end;) {
+        target = (await this.pagesIn(cdp, mark.browserContextId)).find(t => !before.has(t.targetId));
+        if (!target) await sleep(200);
+      }
+      if (!target) throw new Error('Hub 浏览器没有打开网页窗口');
+      await this.place(cdp, target.targetId, ONSCREEN);
+      const { windowId } = await cdp.call('Browser.getWindowForTarget', { targetId: target.targetId });
+      await cdp.call('Browser.setWindowBounds', { windowId, bounds: { windowState: 'maximized' } });
+      await cdp.call('Target.activateTarget', { targetId: target.targetId }).catch(() => {});
+      return { targetId: target.targetId };
+    } finally { cdp.close(); }
+  }
   // A tab in the given identity. `visible` is a login: a normal Chrome window on screen and in
   // front, opened by Chrome's own "open in this profile" path. Otherwise the tab gets a window
   // of its own parked off screen — its own window so it stays the active, unthrottled tab.
@@ -375,6 +426,7 @@ class HubChrome {
     return this.lifecycle(() => this._openTab(identityId, url, { visible }));
   }
   async _openTab(identityId, url, { visible = false } = {}) {
+    if (!visible) require('./web-risk-guard').assertAutomationAllowed(this.root, { identity: identityId, url });
     const { ep, cdp } = await this.browser();
     try {
       const mark = await this.marker(identityId, cdp);
@@ -440,11 +492,46 @@ class HubChrome {
     return this.lifecycle(async () => {
       this.assertAvailable();
       this.identity(identityId);
-      const site = this.site(siteKey), ep = await this.endpoint();
+      const site = this.site(siteKey);let ep = await this.endpoint();
       if (ep?.headless) throw Error('正在后台检查登录，请等待结束或取消检查');
-      if (ep) return this._openTab(identityId, site.url, { visible: true });
-      return this._openLogin(identityId, [siteKey]);
+      // This explicit account-page action owns the lifecycle lock. A browser
+      // containing only Hub markers has no website or draft to interrupt.
+      if(ep&&this.routingStatus().state==='restart_required'&&!require('./web-risk-guard').handoff(this.root)&&!(await this.workTabs())){
+        await this.close();ep=null;
+      }
+      const guard = require('./web-risk-guard');
+      if (guard.blocked(this.root, identityId, guard.siteOf(site.url))) {
+        const { lease, cleared } = await guard.openForHuman(this, { identity: identityId, url: site.url, by: 'account-tab' });
+        return { mode: 'ordinary', handoff: true, until: lease.until, cleared };
+      }
+      // A visible page in a debugging process still has the debugging port. Account-page
+      // visits use the same ordinary Chrome as login, with the same profile and proxy.
+      return this._openOrdinary(identityId, site.url);
     });
+  }
+  async assertOrdinaryAvailable() {
+    this.assertAvailable();
+    const ep = await this.endpoint();
+    if (ep?.headless) throw Error('正在后台检查登录，请等待结束或取消检查');
+    if (ep) {
+      const busy = await this.workTabs();
+      if (busy > 0) throw Object.assign(Error(`专属 Chrome 中还有 ${busy} 个网页或任务；请先保存并关闭这些标签页，再打开账号网站或去验证，登录记录会保留`), { code: 'HUB_BROWSER_BUSY' });
+    }
+    return ep;
+  }
+  async _openOrdinary(identityId, urls) {
+    this.identity(identityId);
+    const ep = await this.assertOrdinaryAvailable();
+    if (ep) {
+      await this.close();
+      for (let i = 0; i < 40 && (await this.owners()).length; i++) await sleep(250);
+      if ((await this.owners()).length) throw new Error('Hub 浏览器没能及时退出，请稍后再打开');
+    }
+    // Chrome creates a window if this profile has none, otherwise appends tabs.
+    // Let its process singleton handle even clicks during initial startup;
+    // --new-window would force a second window before the profile lock appears.
+    await this.launch(identityId, { debug: false, visible: true, newWindow: false, urls: [].concat(urls) });
+    return { identity: identityId, mode: 'ordinary', pid: routing.read(this.root)?.pid || this.lastLaunchPid };
   }
   async _openLogin(identityId, siteKeys) {
     this.assertAvailable();
@@ -452,15 +539,7 @@ class HubChrome {
     const keys = [].concat(siteKeys || identity.sites).filter(Boolean);
     for (const k of keys) if (!identity.sites.includes(k) && !Object.hasOwn(require('./external-accounts').EXTERNAL_SITES, k)) throw new Error(`身份「${identity.label}」不负责 ${this.site(k).name}`);
     const urls = keys.map(k => this.site(k).url);
-    if ((await this.owners()).some(o => o.automated)) {
-      const busy = await this.workTabs();
-      if (busy > 0) throw new Error(`有 ${busy} 个网页任务正在用 Hub 浏览器，等它们结束再登录（Google 不允许在被程序控制的浏览器里登录）`);
-      await this.close();
-      for (let i = 0; i < 40 && (await this.owners()).length; i++) await sleep(250);
-      if ((await this.owners()).length) throw new Error('Hub 浏览器没能及时退出，请稍后再点登录');
-    }
-    await this.launch(identityId, { debug: false, visible: true, urls });
-    return { identity: identity.id, sites: keys, mode: 'ordinary' };
+    return { ...await this._openOrdinary(identity.id, urls), sites: keys };
   }
   // Any non-marker page may still belong to a task or the user, irrespective of placement.
   async workTabs() {
@@ -479,7 +558,9 @@ class HubChrome {
   // Sites that keep their login in localStorage can only be read from a live page.
   async liveStatus(identityId, siteKey, { timeoutMs = 15000, signal } = {}) {
     if (!(await this.running())) return { state: 'needs_browser' };
-    const site = this.site(siteKey);
+    const site = this.site(siteKey), guard = require('./web-risk-guard');
+    // A site that just challenged automation is not visited again until its pause ends.
+    if (guard.blocked(this.root, identityId, guard.siteOf(site.url))) return { state: 'needs_attention', reason: 'challenge' };
     const { PROBE } = require('./account-browser');
     const { targetId } = await this.openTab(identityId, site.url);
     let page;
@@ -495,10 +576,12 @@ class HubChrome {
           // loss of the JavaScript context; real probe/connection errors stay visible.
           if (!/Execution context was destroyed|Cannot find context with specified id/i.test(e.message || '')) throw e;
         }
-        if (r?.challenge) return { state: 'needs_attention', reason: 'challenge' };
+        if (r?.challenge) {
+          guard.recordChallenge(this.root, { identity: identityId, site: guard.siteOf(site.url) || siteKey, kind: 'probe', source: 'account-check' });
+          return { state: 'needs_attention', reason: 'challenge' };
+        }
         if (siteKey === 'google' && r?.host === 'accounts.google.com') return { state: 'signed_out' };
         if (r && r.host === host) {
-          if (r.challenge) return { state: 'needs_attention', reason: 'challenge' };
           if (r.login) return { state: 'signed_out' };
           if (r.profile) return { state: 'signed_in' };
         }

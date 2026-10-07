@@ -13,6 +13,8 @@
     resolveDefaultModel,
   } = require('../core/default-model-preference.js');
   const { defaultCodexContextWindow } = require('../core/codex-context-window.js');
+  const { DEFAULT_EFFORT, DEFAULT_EFFORT_BY_KIND, DEFAULT_MCP_BY_KIND,
+    DEFAULT_CODEX_SPEED_BY_KIND, defaultEffortFor } = require('../core/session-creation-defaults.js');
 
   const KIND_LABELS = {
     ...require('../core/acp-profiles').LABELS,
@@ -47,10 +49,8 @@
   // Codex 也有 fast —— 是 service_tier（priority 通道，1.5× 速度、用量更高），
   // 跟 Claude 的 fastMode 完全两套机制，所以两个 kind 走两个不同控件。
   const CODEX_TIER_KINDS = new Set(['codex', 'deepseek']);
-  const DEFAULT_EFFORT = 'max';
   // 2026-09-05：Claude / Codex 两家默认降到 high。max 在日常任务上只是更慢更贵，
   // 需要时用户仍可在弹窗里手动往上调。DeepSeek 未被点名，保持原来的 max。
-  const DEFAULT_EFFORT_BY_KIND = { claude: 'high', codex: 'high' };
   const CLAUDE_EFFORT_OPTIONS = [
     ['max', 'max · 最强'],
     ['xhigh', 'xhigh'],
@@ -99,10 +99,8 @@
       ['full', 'Full · 全部全局 MCP'],
     ],
   };
-  const DEFAULT_MCP_BY_KIND = { claude: 'none', codex: 'none', deepseek: 'none' };
   // 2026-09-05：Codex 的 fast（service_tier=priority）默认关掉 —— 用户要的是
   // 深思而不是抢通道，1.5× 速度换来的用量代价在长任务上不划算。
-  const DEFAULT_CODEX_SPEED_BY_KIND = { codex: 'standard', deepseek: 'inherit' };
   const EFFORT_LABEL_BY_KIND = {
     claude: '思考强度 (--effort)',
     codex: '思考强度 (reasoning effort)',
@@ -119,7 +117,6 @@
   };
 
   function effortFamily(kind) { return kind === 'claude' ? 'claude' : 'codex'; }
-  function defaultEffortFor(kind) { return DEFAULT_EFFORT_BY_KIND[kind] || DEFAULT_EFFORT; }
   function mcpOptionsFor(kind) { return MCP_OPTIONS[effortFamily(kind)] || []; }
   function defaultMcpFor(kind) { return DEFAULT_MCP_BY_KIND[kind] || 'none'; }
   function defaultCodexSpeedFor(kind, modelId) {
@@ -711,10 +708,9 @@
   function setError(message = '') {
     const errorEl = document.getElementById('new-session-error');
     if (!errorEl) return;
-    errorEl.textContent = selectedKind === 'chatgpt'
-      ? message.replace(/Error invoking remote method '[^']+': (?:Error: )?/, '') : message;
+    errorEl.textContent = message.replace(/Error invoking remote method '[^']+': (?:Error: )?/, '');
     errorEl.hidden = !message;
-    if (message && selectedKind === 'chatgpt') errorEl.scrollIntoView({ block: 'nearest' });
+    if (message && (selectedKind === 'chatgpt' || /官方登录界面|登录入口/.test(message))) errorEl.scrollIntoView({ block: 'nearest' });
   }
 
   // Recent workspaces are the primary way to pick an existing path; the OS folder
@@ -899,7 +895,7 @@
     if (accountNote) {
       accountNote.hidden=!showAccount;
       accountNote.textContent=accountReadError || (accountSaving ? '正在切换全局账号…' : accountNotice)
-        || '选择后立即设为全局账号。新建、恢复和重启都跟随；正在回答的会话在本轮结束后切换。';
+        || '选择后，新建、恢复和重启使用所选账号额度；已打开的会话继续使用原账号。';
     }
     if (accountSelect) {
       const signature=JSON.stringify(codexAccounts);
@@ -1208,7 +1204,7 @@
     // 当前清单里时就会这样），判据直接落空、用户设的默认值被丢掉；反过来，用户
     // 手选的模型若恰好等于出厂默认，又会被这次回读悄悄改掉。
     void loadHubDefaultModels().then(async () => {
-      if (selectedKind === 'codex') await loadCodexTuningCatalog();
+      await loadModelCatalog(selectedKind);
       if (!modelTouchedByUser && selectedKind !== 'chatgpt') {
         selectedModel = resolveDefaultModel(
           selectedKind,
@@ -1402,12 +1398,12 @@
       const profileId=event.target.value;
       accountSaving=true;pendingAccountId=profileId;configReadRevision++;accountNotice='';setError('');paint();
       try {
-        const result=await ipcRenderer.invoke('codex:set-global-account',{profileId});
+        const result=await ipcRenderer.invoke('codex:set-global-account',{profileId,scope:'launch'});
         if (!result?.ok) throw new Error(result?.error || '账号切换失败');
         codexAccountId=result.profileId;
         const failed=(result.sessions || []).filter(s=>s?.error).length;
         const pending=(result.sessions || []).filter(s=>s?.pending).length;
-        accountNotice=failed ? `全局账号已保存；${failed} 个会话切换失败，请查看会话提示并重试恢复。`
+        accountNotice=result.scope==='launch' ? '后续会话的用量账号已切换；已打开的会话保持原账号，新建、恢复和重启使用新账号。' : failed ? `全局账号已保存；${failed} 个会话切换失败，请查看会话提示并重试恢复。`
           : pending ? `全局账号已切换；${pending} 个进行中的会话将在本轮结束后切换。` : '全局账号已切换，新建、恢复和重启会话均跟随。';
         codexTuningCatalog=null;
         await loadCodexTuningCatalog({force:true});
@@ -1571,6 +1567,7 @@
     loadCodexTuningCatalog,
     loadModelCatalog,
     loadPrimaryModelCatalogs,
+    loadSessionDefaults: () => Promise.all([loadHubDefaultModels(), loadPrimaryModelCatalogs()]),
     workspaceTierLabel,
   };
 

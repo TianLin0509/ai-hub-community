@@ -26,7 +26,14 @@ function buildAcpOptions(kind, opts, config, dataDir, baseEnv = process.env) {
   const models = require('./acp-model-catalog').acpModelOptions(kind, model);
   if(!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(model))throw new Error('请填写套餐模型 ID，不可切到其他供应商命名空间');
   let mcpServers=[];
-  if(entry.mcpConfigPath) {
+  if(opts.assistantMcpServers) {
+    if(opts.purpose!=='hub-assistant'||!Array.isArray(opts.assistantMcpServers)
+      ||opts.assistantMcpServers.length!==1||opts.assistantMcpServers[0]?.name!=='hub_assistant'
+      ||!opts.assistantMcpServers[0].env?.some(e=>e.name==='HUB_ASSISTANT_SESSION_ID'&&e.value===opts.id))
+      throw new Error('助理 MCP 配置身份不一致');
+    mcpServers=opts.assistantMcpServers;
+  }
+  if(entry.mcpConfigPath && !opts.assistantMcpServers) {
     if(!path.isAbsolute(entry.mcpConfigPath))throw new Error('MCP 配置文件必须使用绝对路径');
     mcpServers=JSON.parse(fs.readFileSync(entry.mcpConfigPath,'utf8').replace(/^\uFEFF/,''));
     if(!Array.isArray(mcpServers))throw new Error('MCP 配置应为 ACP server 数组');
@@ -77,13 +84,15 @@ function buildAcpOptions(kind, opts, config, dataDir, baseEnv = process.env) {
     if(!entry.bridgePath)throw new Error('DeepSeek 完整交互需要配置 ACP 扩展包目录');
     env.DSH_HOME = path.join(home, '.dsh');
     env.BAILIAN_API_KEY = key;
-    env.BAILIAN_TPP_API_KEY = key;
+    // authenticate persists the native provider credential in this isolated
+    // profile. DSH rejects that write if the same key is injected read-only
+    // through BAILIAN_TPP_API_KEY. The model adapter uses BAILIAN_API_KEY.
     const settings = {
       'agent-default-model': { provider: 'bailian-tpp', model },
       'llm-pi-ai': { providers: { 'bailian-tpp': { api: 'openai-completions', baseURL,
         apiKeyEnv: 'BAILIAN_API_KEY', models: models.map(({id}) => ({ id,
           reasoningEfforts: require('./acp-model-catalog').deepseekReasoningEfforts(id),
-          compat: { thinkingFormat: 'deepseek' } })) } } },
+          compat: { thinkingFormat: 'deepseek', supportsDeveloperRole: false } })) } } },
     };
     writeJson(path.join(env.DSH_HOME, 'settings.yaml'), settings);
     const patch = path.join(sessionRoot, 'acp-route.yaml');

@@ -36,6 +36,7 @@ const {
   waitForPasteSettled,
   snapshotPasteMarker,
   pasteStillInInputBox,
+  hasPromptInInputLine,
 } = require('./pty-prompt-submit.js');
 
 let _deps = null;
@@ -487,7 +488,7 @@ async function sendToPtyImpl(sid, prompt, kind, options = {}) {
     if (!ready) {
       const buf = sessionManager.getSessionBuffer(sid) || '';
       console.warn(`[group-chat] cli not ready for ${kind}(${sid.slice(0, 8)}) after 60s; bufLen=${buf.length}; tail=${JSON.stringify(buf.slice(-160))}`);
-      return false;
+      return {ok:false,notSent:true,sendStatus:'rejected',error:'cli-not-ready',message:'助理启动尚未完成，本条消息未发送；稍后再发送即可。'};
     }
     sessionManager.setGroupChatReady(sid, true);
   }
@@ -567,6 +568,7 @@ async function sendToPtyImpl(sid, prompt, kind, options = {}) {
     //   被当粘贴尾巴吃掉。分片写让队列在最后一片写完时接近空，\r 才可能独立成块。
     const baselineMarker = snapshotPasteMarker(sessionManager, sid);
     if (!usedCodexEditorInput) await writeBracketedPaste(sessionManager, sid, prompt, {
+      inlinePieces: isClaudeFamily(kind), // 不让 Claude 把整段标成 <pasted_content>（见 pty-prompt-submit）
       chunkSize: Number(_deps && _deps.bracketedPasteChunkSize) || undefined,
       gapMs: Number(_deps && _deps.bracketedPasteChunkGapMs) || undefined,
     });
@@ -703,7 +705,7 @@ async function sendToPtyImpl(sid, prompt, kind, options = {}) {
           acknowledgement = turnStart.acknowledgement;
           break;
         }
-        const pasteStillPending = pasteStillInInputBox(probeState);
+        const pasteStillPending = pasteStillInInputBox(probeState, prompt);
         if (!pasteStillPending && looksAlreadyRunning(probeState)) {
           observedRunningWithClearInput = true;
           if (runningExtends >= maxRunningExtends) {
@@ -718,7 +720,7 @@ async function sendToPtyImpl(sid, prompt, kind, options = {}) {
         attempt += 1;
         recoveryAttempts += 1;
         enterAttempts += 1;
-        console.warn(`[group-chat] ${kind} prompt has no agent work-start acknowledgement for ${sid.slice(0, 8)}${pasteStillPending ? ' and a collapsed paste is still sitting in the input box' : ''}; sending late Enter recovery ${attempt}/${retryMax}`);
+        console.warn(`[group-chat] ${kind} prompt has no agent work-start acknowledgement for ${sid.slice(0, 8)}${pasteStillPending ? ' and pending text is still sitting in the input box' : ''}; sending late Enter recovery ${attempt}/${retryMax}`);
         sessionManager.writeToSession(sid, '\r');
         acknowledgement = await waitForAgentWorkStart(turnStart, sessionManager, sid, kind, recoveryAckMs, probeState, livePtyObserver);
       }
@@ -1019,14 +1021,7 @@ async function resendCurrentPrompt({ sid, kind, prompt, promptHeader, timing, al
       await live.probe(probe);
       if (submissionReceipt.status === 'content-mismatch') return { ok: false, mode: 'none', reason: 'content-mismatch' };
       if (submissionReceipt.started) return { ok: true, mode: 'already-submitted' };
-      const lines = probe.lastLiveLines || [];
-      const inputAt = lines.findLastIndex(line => /^\s*[›❯>]\s*/.test(line));
-      const inputText = inputAt >= 0 ? lines[inputAt].replace(/^\s*[›❯>]\s*/, '').trim() : '';
-      const tailIsChrome = lines.slice(inputAt + 1).every(line => !line.trim()
-        || /^[\s─━╭╰╯╮│┌└┘┐┤├]+$/.test(line)
-        || /(?:Context \d+%|shift\+tab|\? for shortcuts)/i.test(line));
-      const promptLine = inputAt >= 0 && !/[\r\n]/.test(prompt)
-        && inputText === prompt.trim() && tailIsChrome;
+      const promptLine = hasPromptInInputLine(probe.lastLiveScreen || probe.lastLiveLines, prompt);
       // Rewriting an uncertain input can duplicate a submitted message or
       // append another copy in Claude. Only recover a visible pending input.
       // A collapsed marker hides the text; matching its size alone cannot
@@ -1064,7 +1059,7 @@ async function resendCurrentPrompt({ sid, kind, prompt, promptHeader, timing, al
       //   150ms + \r"，正是本次要修掉的那套开环时序。补发是这个 bug 的**恢复路径**，
       //   它自己再踩一次同一个坑就毫无意义，所以改走与主路径同一套分块 + 自适应 settle。
       const baselineMarker = snapshotPasteMarker(sessionManager, sid);
-      await writeBracketedPaste(sessionManager, sid, prompt);
+      await writeBracketedPaste(sessionManager, sid, prompt, { inlinePieces: isClaudeFamily(kind) });
       require('./codex-pty-input').flushCodexPasteInput(sessionManager,sid,kind,prompt);
       noteSubmittedPrompt(sid, kind, prompt);
       await waitForPasteSettled({

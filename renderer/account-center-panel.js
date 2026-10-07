@@ -1,6 +1,6 @@
 'use strict';
 const { companyCards } = require('./account-center-view');
-const { TABS, aiHtml, cliHtml, servicesHtml, toolConnections } = require('./account-workspace-view');
+const { TABS, aiHtml, cliHtml, servicesHtml, toolConnections, codexQuotaHtml } = require('./account-workspace-view');
 function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, configModal, closeOtherPanels = () => {} }) {
   const page = document.getElementById('account-page'), body = page.querySelector('.ac-content');
   let tab = 'ai';
@@ -15,7 +15,7 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
     tabs.querySelector('[aria-selected="true"]')?.focus();
   }
   function footerHtml() {
-    return `<footer class="ac-footnote"><span>网页共用 AI Hub 专属 Chrome · 打开网页只记录打开时间</span><details class="ac-connections" data-details="connections"><summary>工具连接</summary>${toolConnections(toolAccounts, esc)}${toolAccountsError ? `<p class="ac-item-error">${esc(toolAccountsError)}</p>` : ''}${toolsHtml()}</details></footer>`;
+    return `<footer class="ac-footnote"><span>网页共用 AI Hub 专属 Chrome · 打开网页只记录打开时间</span><details class="ac-connections" data-details="connections"><summary>工具连接</summary>${toolConnections(toolAccounts, esc, state?.activity)}${toolAccountsError ? `<p class="ac-item-error">${esc(toolAccountsError)}</p>` : ''}${toolsHtml()}</details></footer>`;
   }
   async function call(action, args) {
     const r = await ipcRenderer.invoke('hub-accounts:' + action, args);
@@ -25,7 +25,8 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
   function renderStatus() {
     const el = page.querySelector('.ac-status'), text = error || notice;
     el.textContent = text; el.hidden = !text; el.classList.toggle('error', !!error);
-    for (const b of page.querySelectorAll('[data-ac="open"],[data-ac="login"],[data-ac="add"],[data-ac="preferred"],[data-ac="authorize"],[data-ac="tools"],[data-ac="tools-connect"],[data-ac="external"]')) b.disabled = !!busy || state?.setupProgress?.status === 'running';
+    for (const b of page.querySelectorAll('[data-ac="open"],[data-ac="login"],[data-ac="recover"],[data-ac="add"],[data-ac="preferred"],[data-ac="authorize"],[data-ac="tools"],[data-ac="tools-connect"],[data-ac="external"]')) b.disabled = !!busy || state?.setupProgress?.status === 'running' || state?.progress?.status === 'running';
+    for (const b of page.querySelectorAll('[data-ac="codex-quota"]')) b.disabled=!!busy || !!state?.clis?.find(c=>c.kind==='codex' && c.profileId===b.dataset.profile)?.isDefault;
   }
   function toolsHtml() {
     const progress = state?.setupProgress;
@@ -48,11 +49,15 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
     if (!state) { body.innerHTML = '<p class="ac-empty">正在读取账号…</p>'; return renderStatus(); }
     const expanded = [...body.querySelectorAll('details[open]')].map(d => d.dataset.details);
     body.innerHTML = tab === 'ai' ? aiHtml(state, search.value, esc) : tab === 'cli' ? cliHtml(state, search.value, esc) : servicesHtml(toolAccounts, tab, search.value, state, esc, toolAccountsError);
+    if (['ai','cli'].includes(tab) && !search.value) body.innerHTML=codexQuotaHtml(state,esc)+body.innerHTML;
     if (tab === 'ai' && state.tools?.some(tool => tool.tool === 'images' && tool.state === 'changed')) {
       body.innerHTML = '<p class="ac-connection-notice" role="status">生图工具连接配置已变化，生图记录暂不能归入共享账号。请在下方「工具连接」核对。</p>' + body.innerHTML;
     }
     if (tab === 'ai' && !search.value) body.innerHTML += footerHtml();
     if (state.activity?.warnings?.length) body.innerHTML += `<p class="ac-item-error">${esc(state.activity.warnings.join(' / '))}</p>`;
+    if (tab === 'ai' && (state.webTools?.images?.readError || state.webTools?.roundtable?.recoveryError)) body.innerHTML += '<p class="ac-item-error">部分网页工具状态读取失败；请在原会话查看任务结果。</p>';
+    if (state.progress?.status === 'running') body.innerHTML += `<p class="ac-connection-notice" role="status">${esc(state.progress.stage)} · ${state.progress.done}/${state.progress.total} <button class="ac-text-btn" data-ac="check-cancel">取消复核</button></p>`;
+    else if (state.progress?.error || state.progress?.warnings?.length) body.innerHTML += `<p class="ac-item-error">${esc(state.progress.error || state.progress.warnings.join(' / '))}</p>`;
     for (const d of body.querySelectorAll('details')) d.open = expanded.includes(d.dataset.details);
     renderStatus();
   }
@@ -72,7 +77,11 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
   }
   function position() {
     const rail = document.getElementById('scene-rail')?.getBoundingClientRect();
-    if (rail) { page.style.left = rail.right + 'px'; page.style.top = rail.top + 'px'; }
+    if (rail) {
+      const sessionEdge = document.getElementById('session-sidebar')?.getBoundingClientRect().left;
+      page.style.left = (sessionEdge ?? rail.right) + 'px';
+      page.style.top = rail.top + 'px';
+    }
   }
   function schedule() {
     clearTimeout(timer);
@@ -125,6 +134,19 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
     } catch (e) { if (ticket === epoch) error = e.message; }
     finally { busy = ''; if (ticket === epoch) renderStatus(); }
   }
+  async function switchCodexQuota(profileId) {
+    if (busy) return;
+    busy='codex-quota';error='';notice='正在切换后续会话的用量账号…';renderStatus();
+    const ticket=epoch;
+    try {
+      const result=await ipcRenderer.invoke('codex:set-global-account',{profileId,scope:'launch'});
+      if (!result?.ok) throw Error(result?.error || '用量账号切换失败');
+      if (ticket!==epoch) return;
+      notice='已切换后续会话的用量账号。已打开的会话保持原账号，新建、恢复和重启使用新账号。';
+      await refresh();
+    } catch (e) {if(ticket===epoch)error=e.message;}
+    finally {busy='';if(ticket===epoch)renderStatus();}
+  }
   async function configure(provider = 'codex') {
     try { await configModal.openAccountConfig(provider); if (!page.hidden) { view = 'config'; clearTimeout(timer); render(); } }
     catch (e) { error = e.message; renderStatus(); }
@@ -156,8 +178,11 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
     else if (a === 'tab') selectTab(b.dataset.tab);
     else if (a === 'open') void action('open', args);
     else if (a === 'login') void action('login', args);
+    else if (a === 'recover') void action('check-start', args);
+    else if (a === 'check-cancel') void action('check-cancel', {});
     else if (a === 'add' || a === 'preferred') void action('preference', { ...args, add: a === 'add' });
     else if (a === 'authorize') void authorize(b.dataset.id);
+    else if (a === 'codex-quota') void switchCodexQuota(b.dataset.profile);
     else if (a === 'config') void configure(b.dataset.id);
     else if (a === 'tools') void action('tools');
     else if (a === 'external') void action('external', { service: b.dataset.service, action: b.dataset.operation });
@@ -184,6 +209,8 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
     if (card && n >= 1 && n <= 7) { e.preventDefault(); void action('open', { site: card.site }); }
   });
   document.addEventListener('hub-account-config-saved', () => { notice = '接入配置已保存。'; void refresh(); });
+  ipcRenderer.on('codex-global-account-changed',()=>{if(!page.hidden)void refresh();});
+  ipcRenderer.on('launch-auth-status',(_event,result)=>{if(!page.hidden){notice=result.message;void refresh();}});
   window.addEventListener('resize', position);
   return { open, close, refresh };
 }

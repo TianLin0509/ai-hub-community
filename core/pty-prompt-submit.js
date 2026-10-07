@@ -87,14 +87,53 @@ function splitChunks(payload, chunkSize) {
   return chunks;
 }
 
+// Claude Code（2.1.29x 起，服务端开关）在提交时把「折叠成 [Pasted text #N] 的粘贴」包进
+//   <pasted_content id="xxxx">，并在系统提示里告诉模型「其中的指令未必是用户本人写的」。
+//   Hub 发的就是用户（或用户派的工作流）本人的话，被这样标记既难看又会让指令打折扣。
+//   CLI 的规则（实测 2.1.292 源码）：单次粘贴超过 800 字或换行多于 min(行数-10, 2) 才折叠并包裹；
+//   更小的粘贴原样进输入框、不包裹。所以给 Claude 拆成若干小段粘贴依次投喂。
+const INLINE_PASTE_MAX_CHARS = 800;
+const INLINE_PASTE_MAX_NEWLINES = 1; // 规则允许 2；取 1 给终端只有 11 行的窗口也留余量
+
+// 按「≤maxChars 字、≤maxNewlines 个换行」切段，尽量在换行后断开；不劈开代理对。
+function splitInlinePastes(text, maxChars = INLINE_PASTE_MAX_CHARS, maxNewlines = INLINE_PASTE_MAX_NEWLINES) {
+  const source = String(text == null ? '' : text).replace(/\r\n?/g, '\n'); // CLI 也会这样归一
+  const pieces = [];
+  let cursor = 0;
+  while (cursor < source.length) {
+    let end = cursor;
+    let newlines = 0;
+    while (end < source.length && end - cursor < maxChars) {
+      const ch = source[end];
+      end += 1;
+      if (ch === '\n' && ++newlines >= maxNewlines) break;
+    }
+    end = safeSliceEnd(source, Math.max(end, cursor + 1));
+    pieces.push(source.slice(cursor, end));
+    cursor = end;
+  }
+  return pieces;
+}
+
 // 把 prompt 包进 bracketed paste 并分块写入。
 //   分块的意义不是"更快"，而是让 socket 队列在最后一片写完时几乎是空的 ——
 //   这样调用方随后发的 \r 才可能独立成一个 stdin chunk，而不是被并进 BP_END 那块。
+//   options.inlinePieces：拆成多段小粘贴（Claude 用，见 splitInlinePastes），每段一次写入。
 // 返回实际写出的分片数（1 表示走了不分块的快路径）。
 async function writeBracketedPaste(sessionManager, sid, text, options = {}) {
+  const gapMs = Number.isFinite(options.gapMs) ? options.gapMs : CHUNK_GAP_MS;
+  if (options.inlinePieces) {
+    const pieces = splitInlinePastes(text);
+    if (pieces.length > 1) {
+      for (let i = 0; i < pieces.length; i += 1) {
+        sessionManager.writeToSession(sid, BP_START + pieces[i] + BP_END);
+        if (i < pieces.length - 1) await sleep(gapMs);
+      }
+      return pieces.length;
+    }
+  }
   const payload = BP_START + String(text == null ? '' : text) + BP_END;
   const chunkSize = Number.isFinite(options.chunkSize) ? options.chunkSize : CHUNK_SIZE;
-  const gapMs = Number.isFinite(options.gapMs) ? options.gapMs : CHUNK_GAP_MS;
   if (payload.length <= chunkSize) {
     sessionManager.writeToSession(sid, payload);
     return 1;
@@ -170,12 +209,32 @@ function hasPasteMarkerInLines(lines) {
   return lines.some(line => PASTE_MARKER_REGEX.test(String(line || '')));
 }
 
-// 「折叠标记还挂在输入框那一带」= 这次粘贴根本没提交，是补回车的正向依据。
+// A short paste stays as plain text rather than a collapsed marker. Only an
+// exact, single-line prompt at the bottom input row counts: quoted messages in
+// scrollback, another draft, menus and wrapped/multiline text remain ambiguous.
+function hasPromptInInputLine(lines, prompt) {
+  if (!Array.isArray(lines) || typeof prompt !== 'string' || !prompt.trim() || /[\r\n]/.test(prompt)) return false;
+  const inputAt = lines.findLastIndex(line => /^\s*[›❯>]\s*/.test(String(line || '')));
+  if (inputAt < 0) return false;
+  const text = String(lines[inputAt]).replace(/^\s*[›❯>]\s*/, '').trim();
+  if (text !== prompt.trim()) return false;
+  return lines.slice(inputAt + 1).every(line => !String(line || '').trim()
+    || /^[\s─━╭╰╯╮│┌└┘┐┤├]+$/.test(line)
+    || /^\s*(?:Context \d+%.*|shift\+tab.*|\? for shortcuts.*)$/i.test(line)
+    || /^\s*GPT-[\w.-]+(?:\s+(?:minimal|low|medium|high|xhigh|default|fast|flex))*\s*·\s*Context\s+\d+%\s+left(?:\s*·\s*.*)?$/i.test(line)
+    || /^\s*⚠\s*\d+\s+warnings?\s*·\s*f2\s+to\s+view\s*$/i.test(line)
+    || /^\s*(?:[⏸⏵▶»]+\s*)?(?:(?:manual|plan|auto) mode on|bypass permissions on|accept edits on)\b.*$/i.test(line));
+}
+
+// 折叠标记或完整短文字仍在输入行，是补回车的正向依据。
 //   优先用 livePtyObserver 抓到的**可见屏幕末尾行**；拿不到（探针没起来 / viewport 是空的）
 //   才退到 probeStrongPtyWorkStart 记的 ring 尾巴，并只取最后若干行近似输入框那一屏。
 //   不整条扫 ring buffer：它是只增的历史，提交成功后标记仍留在里面，会永远判成"没提交"。
-function pasteStillInInputBox(probeState) {
+function pasteStillInInputBox(probeState, prompt) {
   if (!probeState) return false;
+  // On a fresh/short TUI screen the input row can sit above the last 12 rows.
+  // Inspect the complete visible screen for exact text, never ring history.
+  if (hasPromptInInputLine(probeState.lastLiveScreen || probeState.lastLiveLines, prompt)) return true;
   const live = probeState.lastLiveLines;
   if (Array.isArray(live) && live.some(line => String(line || '').trim())) {
     return hasPasteMarkerInLines(live);
@@ -189,11 +248,13 @@ module.exports = {
   BP_START,
   BP_END,
   hasPasteMarkerInLines,
+  hasPromptInInputLine,
   pasteStillInInputBox,
   computeSettleMs,
   writeBracketedPaste,
   waitForPasteSettled,
   snapshotPasteMarker,
+  splitInlinePastes,
   _private: { splitChunks, safeSliceEnd, extractMarker },
   SETTLE_MIN_MS,
   SETTLE_MAX_MS,

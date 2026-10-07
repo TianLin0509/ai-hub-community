@@ -241,8 +241,8 @@ function artifactsInstruction(workspace) {
   const dir = workspace && String(workspace).trim()
     ? `${String(workspace).replace(/[\\/]+$/, '')}\\artifacts\\`
     : '当前工作目录下的 artifacts\\';
-  return `简单问题直答；复杂分析 / 多方案 / 含表格 / 预计 > 300 字 -> HTML 三段式`
-    + `（先口头大纲 -> 写 ${dir}{msgId}-{name}.html -> 贴绝对路径+3-8 条摘要卡片）。`;
+  return `默认在聊天正文回答，可用 Markdown 表格。用户指定格式时照做；图解、交互或独立保存明显有助于使用时再制作 HTML，`
+    + `写入 ${dir}{msgId}-{name}.html，贴绝对路径并简述结果。`;
 }
 
 function buildSystemPromptText(displayName, scene, opts = {}) {
@@ -255,6 +255,8 @@ function buildSystemPromptText(displayName, scene, opts = {}) {
     '## 输出',
     artifactsInstruction(opts.workspace),
   ];
+  // AI 编排模式：编排员守则或成员说明（只随首次系统规则发送）。
+  if (typeof opts.extraRules === 'string' && opts.extraRules.trim()) parts.push('', opts.extraRules.trim());
   return parts.join('\n');
 }
 
@@ -940,6 +942,7 @@ class GroupChatOrchestrator {
 
   rollbackTurn(turnNum, runId = null) {
     this.state.messages = this.state.messages.filter(m => m.turnNum !== turnNum);
+    if (this.state.answerFiles) delete this.state.answerFiles[String(Number(turnNum))];
     this.state.turns = this.state.turns.filter(t => t.n !== turnNum);
     const lastIdx = this.state.messages.length - 1;
     for (const sid of Object.keys(this.state.lastDeliveredIdx || {})) {
@@ -1217,7 +1220,12 @@ class GroupChatOrchestrator {
       this.state.groupContextPendingBySid = {};
     }
     const receipt = this.state.groupContextBySid[selfSid] || null;
+    const rulesHash = promptFingerprint(String(systemPromptText || ''));
     let includeRules = firstTime;
+    // Silent committee cursors do not establish delivery of these group rules.
+    const rulesChanged = !firstTime && receipt && (receipt.rulesDeliveredAt || receipt.rulesHash)
+      && receipt.rulesHash !== rulesHash;
+    if (rulesChanged) includeRules = true;
     let compacted = false;
     if (!firstTime && receipt) {
       const check = checkCompaction(receipt.peakContext, opts.contextUsed);
@@ -1230,7 +1238,8 @@ class GroupChatOrchestrator {
     }
     this.state.groupContextPendingBySid[selfSid] = {
       rules: includeRules,
-      ...(compacted ? { reason: 'compacted' } : {}),
+      rulesHash,
+      ...(rulesChanged ? { reason: 'rules-changed' } : compacted ? { reason: 'compacted' } : {}),
       ...(roster ? { roster } : {}),
     };
     const delta = this.buildDelta(selfSid, userInput, opts);
@@ -1260,7 +1269,10 @@ class GroupChatOrchestrator {
     if (!existing || (pending && pending.rules)) {
       // 规则刚送达（首次或压缩后重发）：峰值从零重新观测。
       receipt.peakContext = 0;
-      if (pending && pending.rules) receipt.rulesDeliveredAt = Date.now();
+      if (pending && pending.rules) {
+        receipt.rulesDeliveredAt = Date.now();
+        receipt.rulesHash = pending.rulesHash;
+      }
     }
     if (pending && Array.isArray(pending.roster)) receipt.roster = pending.roster;
     this.state.groupContextBySid[sid] = receipt;
@@ -1340,7 +1352,7 @@ class GroupChatOrchestrator {
       //   答案抹成空气泡。真理源统一为 by[sid]，消息正文从 by[sid] 取，不再直接用 r.text。
       const _rStatus = r.status || 'completed';
       // trim 判空与渲染层口径一致（多方审查加固）：纯空白文本视为无内容，不覆盖已有答案。
-      const _writeContent = !!(r.text && String(r.text).trim().length);
+      const _writeContent = !!(r.text && String(r.text).trim().length) && !this.answerFileFor(turnNum, sid);
       const _prevStatus = byStatus[sid];
       const _existingMsg = this.state.messages.find(m => m && m.role === 'assistant'
         && Number(m.turnNum) === Number(turnNum) && m.sid === sid && !m.supplementReply && !isProgressUpdateMessage(m));
@@ -1566,6 +1578,44 @@ class GroupChatOrchestrator {
     this._saveState('run_cleared', { runId, turnNum });
   }
 
+  // ---- Markdown answers (core/group-answer-files.js) -------------------------
+  // A member with a registered answer file only ever shows that file's text;
+  // transcript-derived results keep updating status and attempts, never content.
+  registerAnswerFile(turnNum, sid, entry) {
+    const byTurn = this.state.answerFiles || (this.state.answerFiles = {});
+    const key = String(Number(turnNum));
+    const previous = byTurn[key]?.[sid];
+    (byTurn[key] || (byTurn[key] = {}))[sid] = { ...entry, ...(previous ? { hash: previous.hash, state: previous.state, outcome: previous.outcome } : {}) };
+    const keep = Number(turnNum) - 200;
+    for (const k of Object.keys(byTurn)) if (Number(k) < keep) delete byTurn[k];
+    this._saveState('answer_file_registered', { turnNum, sid });
+  }
+  answerFileFor(turnNum, sid) { return this.state.answerFiles?.[String(Number(turnNum))]?.[sid] || null; }
+  applyAnswerFile(turnNum, sid, { state, outcome = null, text, hash }) {
+    const entry = this.answerFileFor(turnNum, sid);
+    if (!entry || (entry.hash === hash && entry.state === state && entry.outcome === outcome)) return false;
+    Object.assign(entry, { hash, state, outcome, appliedAt: Date.now() });
+    let msg = this.state.messages.find(m => m && Number(m.turnNum) === Number(turnNum)
+      && m.role === 'assistant' && m.sid === sid && !m.supplementReply && !isProgressUpdateMessage(m));
+    if (!msg) {
+      msg = this._appendMessage({ id: `a${turnNum}-${entry.memberId || sid.slice(0, 8)}`, turnNum, role: 'assistant', sid,
+        memberId: entry.memberId || sid, speaker: entry.speaker || 'AI', content: '', status: 'handed_off' });
+    }
+    // A changed answer gets a new seq so peers whose cursor already passed it
+    // (late file, correction after rescue) receive it in their next delta.
+    if (msg.content !== text && String(msg.content || '').length + String(text).length > 0) {
+      msg.seq = Math.max(Number(msg.seq) || 0, Number(this.state.nextMessageSeq) || 1);
+      this.state.nextMessageSeq = msg.seq + 1;
+    }
+    msg.content = text;
+    msg.answer = { state, outcome, at: entry.appliedAt };
+    msg.updatedAt = entry.appliedAt;
+    const turn = this.state.turns.find(t => t.n === Number(turnNum));
+    if (turn) (turn.by || (turn.by = {}))[sid] = text;
+    this._saveState('answer_file_applied', { turnNum, sid, state, outcome });
+    return true;
+  }
+
   patchTurnResult(turnNum, sid, {
     text,
     status,
@@ -1610,7 +1660,8 @@ class GroupChatOrchestrator {
     }
 
     // 任意终态只要带非空文本就先保住正文；errored + partial text 也比丢结果更有价值。
-    const _writeContent = !!(text && String(text).trim().length);
+    // 登记了回答文件的成员，正文只来自文件（applyAnswerFile）。
+    const _writeContent = !!(text && String(text).trim().length) && !this.answerFileFor(turnNum, sid);
     const _prevPatchStatus = byStatus[sid];
     const _hasManualResult = _prevPatchStatus === 'manual_extracted'
       && !!(by[sid] && String(by[sid]).trim().length);

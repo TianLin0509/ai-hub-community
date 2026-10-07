@@ -15,7 +15,7 @@ const THEMES = Object.freeze([
   Object.freeze({
     id: 'dark',
     label: '深色',
-    hint: '深海夜幕 · 微暖钛金 · 默认',
+    hint: '深海夜幕 · 微暖钛金',
     swatch: Object.freeze(['#081522', '#102238', '#e3be85']),
   }),
   Object.freeze({
@@ -32,9 +32,9 @@ const THEMES = Object.freeze([
   }),
   Object.freeze({
     id: 'codex',
-    label: 'Codex 纸白',
-    hint: '瓷白 · 清晰分层 · 蓝色点睛',
-    swatch: Object.freeze(['#f4f6fa', '#ffffff', '#2768bd']),
+    label: '冷白工作室',
+    hint: '冷白画布 · 清晰文字导航 · 默认',
+    swatch: Object.freeze(['#fbfcfd', '#ffffff', '#3065bd']),
   }),
   Object.freeze({
     id: 'hub',
@@ -54,9 +54,22 @@ const THEME_IDS = Object.freeze(THEMES.map(t => t.id));
 /* 深色皮肤要点名，不能用「不是 dark 就是浅色」反推：冷杉是第二套深色，
    靠反推会被判成浅色，浅色专属的终端岛内缩、黑色 overlay 会一起错上去。 */
 const DARK_THEME_IDS = Object.freeze(['dark', 'frost']);
-const DEFAULT_THEME = 'dark';
+const DEFAULT_THEME = 'codex';
 const THEME_STORAGE_KEY = 'hub.theme';
 const THEME_ATTRIBUTE = 'data-theme';
+const THEME_PREFERENCE_KEY = 'hub.themePreference.v2';
+
+// Establish the user's light starting point once; later manual choices survive restarts.
+function readInitialTheme(storage) {
+  try {
+    if (storage?.getItem(THEME_PREFERENCE_KEY) !== '1') {
+      storage?.setItem(THEME_STORAGE_KEY, DEFAULT_THEME);
+      storage?.setItem(THEME_PREFERENCE_KEY, '1');
+      return DEFAULT_THEME;
+    }
+    return normalizeTheme(storage?.getItem(THEME_STORAGE_KEY));
+  } catch { return DEFAULT_THEME; }
+}
 
 function normalizeTheme(value) {
   const id = String(value || '').trim().toLowerCase();
@@ -85,6 +98,8 @@ module.exports = {
   DEFAULT_THEME,
   THEME_STORAGE_KEY,
   THEME_ATTRIBUTE,
+  THEME_PREFERENCE_KEY,
+  readInitialTheme,
   normalizeTheme,
   getTheme,
   nextTheme,

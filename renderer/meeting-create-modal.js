@@ -4,14 +4,14 @@
 const { ipcRenderer } = require('electron');
 const { checkDevWorkspace } = require('./dev-workspace-guard.js');
 const { KIND_LABELS } = require('../core/ai-kinds.js');
-const { MODEL_OPTIONS_BY_KIND, DEFAULT_MODEL_BY_KIND, modelOptionsFor } = require('../core/model-options.js');
+const { MODEL_OPTIONS_BY_KIND, modelOptionsFor } = require('../core/model-options.js');
 
 const MODEL_KINDS = new Set(Object.keys(MODEL_OPTIONS_BY_KIND));
 
 const DEFAULT_SLOTS = [
-  { kind: 'claude', model: DEFAULT_MODEL_BY_KIND.claude },
-  { kind: 'codex', model: DEFAULT_MODEL_BY_KIND.codex },
-  { kind: 'deepseek', model: DEFAULT_MODEL_BY_KIND.deepseek },
+  { kind: 'claude' },
+  { kind: 'codex' },
+  { kind: 'deepseek' },
 ];
 const GROUP_MEMBER_KINDS = ['claude', 'codex', 'deepseek', 'qwen', 'deepseek-acp', 'glm'];
 // Claude + Codex are the durable default pair. DeepSeek is an explicit third
@@ -44,6 +44,9 @@ let _projectLibraryLoading = null;
 let _projectLibraryOpen = false;
 let _creating = false;
 let _presentation = { embedded: false, onCreated: null };
+// AI 编排模式：成员 1 当编排员，用户预先选定工作成员，编排员安排其分工与参与阶段。
+let _orchestrationOn = false;
+const ORCHESTRATOR_KINDS = ['claude', 'codex'];
 
 function _paintWorkspace(workspace) {
   if (workspace) _meetingWorkspace = workspace;
@@ -215,9 +218,11 @@ function _selectOptions(entries, selected) {
 
 function _normalizeSlotSpec(spec = {}) {
   const kind = MODEL_KINDS.has(spec.kind) ? spec.kind : 'claude';
-  const tuning = window.WorkspaceController.resolveSessionTuning(kind, spec.model, spec);
+  const followDefault = spec.followDefault ?? !spec.model;
+  const tuning = window.WorkspaceController.resolveSessionTuning(kind, followDefault ? undefined : spec.model, spec);
   return {
     kind,
+    followDefault,
     model: tuning.model,
     effort: tuning.effort,
     mcpProfile: tuning.mcpProfile,
@@ -249,7 +254,7 @@ function _paintSceneHint() {
   const hint = _modalEl && _modalEl.querySelector('#mcm-scene-hint');
   if (!hint) return;
   if (_currentMode === 'dev') {
-    hint.textContent = '从「项目库」选择项目，或选择已有文件夹。至少保留两位成员，点「开题」后由第一位实现、第二位验证与合并。单人开发请使用普通会话的「一键开工」。';
+    hint.textContent = '从「项目库」选择项目，或选择已有文件夹。至少保留两位成员。建好后直接输入任务，Hub 安排第一位开题与实现、第二位独立审查与合并。单人开发请使用普通会话的「一键开工」。';
     hint.style.display = '';
   } else {
     hint.textContent = '';
@@ -294,8 +299,11 @@ function _slotHtml(i, spec, isGroup) {
   ).join('');
   const avatarSrc = _aiLogo(def.kind);
   const avatarAlt = KIND_LABELS[def.kind] || def.kind;
-  const label = isGroup ? `成员 ${i + 1}` : `Slot ${i + 1} · ${SLOT_NAMES[i]}`;
-  const removeBtn = isGroup && i >= 1 && (_currentMode !== 'dev' || _groupSlots.length > 2)
+  const orchLead = isGroup && _orchestrationOn && i === 0;
+  const label = !isGroup ? `Slot ${i + 1} · ${SLOT_NAMES[i]}`
+    : orchLead ? '成员 1 · 编排员'
+    : _orchestrationOn ? `成员 ${i + 1} · 工作成员` : `成员 ${i + 1}`;
+  const removeBtn = isGroup && i >= 1 && (_orchestrationOn || _currentMode !== 'dev' || _groupSlots.length > 2)
     ? `<button type="button" class="mcm-remove-member" data-remove-member="${i}" title="移除此成员">×</button>`
     : '';
   const effortField = tuning.showEffort ? `
@@ -316,7 +324,7 @@ function _slotHtml(i, spec, isGroup) {
         <select class="mcm-codex-tier-select">${_selectOptions(tuning.codexTierOptions, tuning.codexSpeedTier)}</select>
       </label>` : '';
   return `
-    <div class="mcm-slot${isGroup ? ' mcm-group-member' : ''}" data-slot="${i}" data-kind="${_escapeHtml(def.kind)}">
+    <div class="mcm-slot${isGroup ? ' mcm-group-member' : ''}${orchLead ? ' mcm-orch-lead' : ''}" data-slot="${i}" data-kind="${_escapeHtml(def.kind)}">
       ${removeBtn}
       <div class="mcm-slot-head">
         <img class="mcm-avatar" src="${_escapeHtml(avatarSrc)}" alt="${_escapeHtml(avatarAlt)}">
@@ -345,6 +353,7 @@ function _readSlotSpec(el, i, { strict = true } = {}) {
   const spec = {
     kind: aiSelect.value === 'deepseek' ? (el.querySelector('.mcm-deepseek-route')?.value || 'deepseek') : aiSelect.value,
     model: modelSelect ? modelSelect.value : '',
+    followDefault: _groupSlots[i]?.followDefault ?? !_groupSlots[i]?.model,
   };
   const effort = el.querySelector('.mcm-effort-select');
   const mcp = el.querySelector('.mcm-mcp-select');
@@ -384,17 +393,18 @@ function _renderSlots() {
       const i = Number(slotEl.getAttribute('data-slot'));
       const selected = slotEl.querySelector('.mcm-ai-select').value;
       const kind = selected;
-      _groupSlots[i] = _normalizeSlotSpec({ kind, model: DEFAULT_MODEL_BY_KIND[kind] });
+      _groupSlots[i] = _normalizeSlotSpec({ kind });
       _renderSlots();
     });
     slotEl.querySelector('.mcm-model-select').addEventListener('change', () => {
+      _groupSlots[Number(slotEl.dataset.slot)].followDefault = false;
       _syncGroupSlotsFromDom();
       // Codex 的 effort / Fast 选项跟模型目录走，切模型后要重新生成这一张卡。
       _renderSlots();
     });
     slotEl.querySelector('.mcm-deepseek-route')?.addEventListener('change', event => {
       const kind = event.target.value;
-      _groupSlots[Number(slotEl.getAttribute('data-slot'))] = _normalizeSlotSpec({kind, model:DEFAULT_MODEL_BY_KIND[kind]});
+      _groupSlots[Number(slotEl.getAttribute('data-slot'))] = _normalizeSlotSpec({ kind });
       _renderSlots();
     });
     slotEl.querySelectorAll('.mcm-effort-select, .mcm-mcp-select, .mcm-fast-checkbox, .mcm-codex-tier-select')
@@ -452,6 +462,15 @@ function _ensureModal() {
           ${_renderSceneChoices('dev')}
         </div>
         <div class="mcm-scene-hint" id="mcm-scene-hint" style="display:none; font-size:12px; color:#888; margin:-6px 0 12px; line-height:1.6;"></div>
+        <div class="mcm-orch-row" id="mcm-orch-row">
+          <label class="mcm-orch-switch"><input type="checkbox" id="mcm-orch-toggle" role="switch"><span class="mcm-orch-track" aria-hidden="true"></span><strong>编排员</strong></label>
+          <span class="mcm-orch-hint" id="mcm-orch-hint">打开后成员 1 当编排员：你只和它对话，它使用你选好的成员，自主分工、设计工作流并汇报进展；通过与否由审核位决定。</span>
+          <div class="mcm-orch-options" id="mcm-orch-options" hidden>
+            <label>迭代上限 <input type="number" id="mcm-orch-rounds" min="2" max="30" value="8"> 轮</label>
+            <label>时长上限 <input type="number" id="mcm-orch-hours" min="0.5" max="24" step="0.5" value="3"> 小时</label>
+            <span class="mcm-orch-note">关掉开关 = 和现在完全一样</span>
+          </div>
+        </div>
         <div class="mcm-member-caption">
           <strong>成员配置</strong>
           <span>开发群聊第一位实现、第二位独立验证与合并。需要第三视角时再添加 DeepSeek。可继续加人，同一种 AI 也能多开。每位成员可独立选择模型、思考强度、速度与 MCP。</span>
@@ -470,6 +489,35 @@ function _ensureModal() {
   return _modalEl;
 }
 
+function _setOrchestration(on) {
+  _orchestrationOn = !!on;
+  if (!_modalEl) return;
+  const toggle = _modalEl.querySelector('#mcm-orch-toggle');
+  if (toggle) toggle.checked = _orchestrationOn;
+  _modalEl.querySelector('#mcm-orch-row')?.classList.toggle('on', _orchestrationOn);
+  const options = _modalEl.querySelector('#mcm-orch-options');
+  if (options) options.hidden = !_orchestrationOn;
+  const caption = _modalEl.querySelector('.mcm-member-caption span');
+  if (caption) {
+    if (!caption.dataset.plainText) caption.dataset.plainText = caption.textContent;
+    caption.textContent = _orchestrationOn
+      ? '成员 1 为编排员，其余为工作成员。成员与模型由你选，分工和参与阶段由编排员安排；额度可在任务中用自然语言指定。'
+      : caption.dataset.plainText;
+  }
+  const hint = _modalEl.querySelector('#mcm-orch-hint');
+  if (hint) hint.textContent = _orchestrationOn
+    ? '已开启：成员 1 当编排员。你只和它用自然语言对话，它使用你选好的成员自主分工、推进到结项，处理成员故障；需要你取舍时它会在对话里问。通过与否由审核位决定。'
+    : '打开后成员 1 当编排员：你只和它对话，它使用你选好的成员，自主分工、设计工作流并汇报进展；通过与否由审核位决定。';
+  _renderSlots();
+}
+
+function _orchestrationPayload() {
+  if (!_orchestrationOn || !_modalEl) return null;
+  const rounds = Number(_modalEl.querySelector('#mcm-orch-rounds')?.value) || 8;
+  const hours = Number(_modalEl.querySelector('#mcm-orch-hours')?.value) || 3;
+  return { enabled: true, settings: { roundCap: Math.round(rounds), timeCapMin: Math.round(hours * 60) } };
+}
+
 function _bindEvents() {
   _modalEl.querySelector('.mcm-close').addEventListener('click', closeMeetingCreateModal);
   _modalEl.querySelector('.mcm-cancel').addEventListener('click', closeMeetingCreateModal);
@@ -480,7 +528,7 @@ function _bindEvents() {
   _modalEl.querySelector('#mcm-add-member').addEventListener('click', () => {
     _syncGroupSlotsFromDom();
     const nextKind = _nextGroupMemberKind();
-    _groupSlots.push(_normalizeSlotSpec({ kind: nextKind, model: DEFAULT_MODEL_BY_KIND[nextKind] }));
+    _groupSlots.push(_normalizeSlotSpec({ kind: nextKind }));
     _renderSlots();
   });
   _modalEl.querySelectorAll('[data-mcm-workspace-mode]').forEach(button => {
@@ -512,6 +560,10 @@ function _bindEvents() {
     _renderProjectLibrary();
     void _chooseMeetingExistingWorkspace().catch(err => _showError(`选择目录失败：${err && err.message ? err.message : String(err)}`));
   });
+  _modalEl.querySelector('#mcm-orch-toggle').addEventListener('change', event => {
+    _syncGroupSlotsFromDom();
+    _setOrchestration(event.target.checked);
+  });
   _modalEl.querySelectorAll('input[name="mcm-scene"]').forEach(radio => {
     radio.addEventListener('change', () => {
       if (!radio.checked) return;
@@ -538,7 +590,7 @@ async function _onCreate() {
   try {
     // 即使用户在模型目录异步返回前立刻点创建，也要先用真实目录重新归一化。
     // 否则 gpt-5.5 可能把 fallback 里的 max 带进 CLI（该模型真实只支持到 xhigh）。
-    await window.WorkspaceController.loadPrimaryModelCatalogs();
+    await window.WorkspaceController.loadSessionDefaults();
     _syncGroupSlotsFromDom({ strict: true });
     _renderSlots();
     // 读取 DOM 也必须在 try 内。历史状态或第三方样式脚本一旦留下残缺 slot / 未选
@@ -554,7 +606,10 @@ async function _onCreate() {
     if (!slots.length) throw new Error('请至少保留一个群聊成员');
     const sceneInput = _modalEl.querySelector('input[name="mcm-scene"]:checked');
     const scene = sceneInput ? sceneInput.value : 'general';
-    if (scene === 'dev' && slots.length < 2) throw new Error('开发群聊至少需要两位成员；单人开发请使用普通会话的“一键开工”。');
+    const orchestration = _orchestrationPayload();
+    if (orchestration && slots.length < 2) throw new Error('编排群至少需要编排员和一位工作成员；请先选择成员');
+    if (orchestration && !ORCHESTRATOR_KINDS.includes(slots[0].kind)) throw new Error('编排员（成员 1）请选 Claude 或 Codex');
+    if (!orchestration && scene === 'dev' && slots.length < 2) throw new Error('开发群聊至少需要两位成员；单人开发请使用普通会话的“一键开工”。');
     // createMeeting 的 scene 实际取自 mode（过 MEETING_MODES 白名单），scene 字段只是透传
     const mode = (scene === 'research' || scene === 'dev') ? scene : 'general';
     const titleInput = _modalEl.querySelector('#mcm-title-input');
@@ -600,7 +655,8 @@ async function _onCreate() {
         if (_projectLibraryError) throw _projectLibraryError;
       }
     }
-    const serialWorkflow = _buildDefaultDevWorkflow(scene, slots, { atWorkRoot, projects: devProjects });
+    // 编排群的工作流由编排员按计划配置，建群时不预置。
+    const serialWorkflow = orchestration ? null : _buildDefaultDevWorkflow(scene, slots, { atWorkRoot, projects: devProjects });
     createBtn.textContent = '正在创建成员会话...';
     const meeting = await ipcRenderer.invoke('create-meeting', {
       mode,
@@ -610,11 +666,12 @@ async function _onCreate() {
       groupChat: _isGroupChat,
       groupMode: _isGroupChat ? 'deliberation' : null,
       groupRecentRawN: 5,
-      participants: _isGroupChat ? (scene === 'dev' ? [slots[0].index] : slots.map((_, i) => i)) : null,
+      participants: _isGroupChat ? (orchestration || scene === 'dev' ? [slots[0].index] : slots.map((_, i) => i)) : null,
       workspace: workspace.path,
       workspaceLabel: workspace.label,
       workspaceDraft: !!workspace.draft,
       serialWorkflow,
+      ...(orchestration ? { orchestration } : {}),
     });
     if (!meeting || !meeting.id) throw new Error('create-meeting returned empty meeting');
     const onCreated = _presentation.onCreated;
@@ -664,10 +721,16 @@ function _buildDefaultDevWorkflow(scene, slots, workspaceHint = {}) {
     devPhase: 'discuss',
   });
   if (!config) throw new Error('无法生成默认开发工作流，请重试创建');
-  config.templateId = templateId;
+  // 2026-09-28: new rooms run on the delivery engine only; the legacy template
+  // above is used just for its project-locator fields.
+  const delivery = require('../core/workflow-settings').createDeliveryConfig('development', members, {
+    ...(config.projectLocator ? { projectLocator: config.projectLocator } : {}),
+    ...(config.projectLibrary ? { projectLibrary: config.projectLibrary } : {}),
+    workRoot: !!config.workRoot,
+  });
   // Submit with create-meeting: the first creation event and response must
   // already contain the workflow, before the room constructs its controls.
-  return config;
+  return delivery;
 }
 
 function _showError(text) {
@@ -711,6 +774,8 @@ function openMeetingCreateModal(mode = 'general', options = {}) {
     onCreated: typeof options.onCreated === 'function' ? options.onCreated : null,
   };
   _clearError();
+  _orchestrationOn = false;
+  _setOrchestration(false);
   _applyScene('dev', { clearTitle: true, resetSlots: true });
   _meetingWorkspaceMode = 'existing';
   _meetingWorkspace = null;
@@ -734,7 +799,7 @@ function openMeetingCreateModal(mode = 'general', options = {}) {
   _modalEl.style.display = 'flex';
   // 单会话与群聊共用 codex-cli 的模型目录。目录异步返回后保留用户已选值重绘，
   // 让 gpt-5.6 的 ultra / Fast 与旧模型的较短枚举始终准确。
-  void window.WorkspaceController.loadPrimaryModelCatalogs().then(() => {
+  void window.WorkspaceController.loadSessionDefaults().then(() => {
     if (!_modalEl || _modalEl.style.display === 'none') return;
     _syncGroupSlotsFromDom();
     _renderSlots();

@@ -30,6 +30,7 @@ function createResumeSessionHandler(deps) {
     sendToRenderer,
     sessionManager,
     slotIds,
+    ensureLaunchAuth,
   } = deps;
 
   function addCodexMcpEntry(resumeOpts, entry) {
@@ -40,12 +41,24 @@ function createResumeSessionHandler(deps) {
   return async function resumeSession(meta) {
     if (!meta || !meta.hubId) return null;
     const reservedId=meta.hubId;
+    // Login may wait on an official CLI/browser. Do this before taking the
+    // writer reservation, so the dormant card remains editable during login.
+    if (ensureLaunchAuth) {
+      const authMeta=require('../../core/session-store').loadSessionFile(reservedId,{strict:true}) || meta;
+      await ensureLaunchAuth(authMeta.kind || 'claude',{...authMeta,model:sessionModelId(authMeta)});
+    }
     const reservation=sessionManager.reserveSessionOpen?.(reservedId);
     try {
     // This window may have been idle since before another Hub's last turn.
     // Resume the persisted authoritative identity, never its boot-time copy.
     const saved = require('../../core/session-store').loadSessionFile(meta.hubId,{strict:true});
     if (saved) meta = {...meta, ...saved, hubId:meta.hubId};
+    // 显式的启动覆盖（助理切换模型/深度）在磁盘记录之后生效，否则会被旧记录里的型号盖回去。
+    if (meta.launchOverrides) {
+      const { model, ...rest } = meta.launchOverrides;
+      meta = { ...meta, ...rest, ...(model ? { model, currentModel: { id: model, displayName: model } } : {}) };
+      delete meta.launchOverrides;
+    }
 
     require('../../core/session-meeting-membership.js').restoreMissingMeetingIds(
       [meta], meetingManager.getAllMeetings?.() || []);

@@ -91,6 +91,9 @@ const { registerPersistenceIpc } = require('./main/ipc/persistence-handlers.js')
 const { registerAppUtilityIpc } = require('./main/ipc/app-utility-handlers.js');
 const { createDesktopNotificationController } = require('./main/desktop-notification-controller.js');
 const { registerProcessReclaimIpc } = require('./main/ipc/process-reclaim-handlers.js');
+const { registerMemoryReleaseIpc } = require('./main/ipc/memory-release-handlers.js');
+const { registerDiskReleaseIpc } = require('./main/ipc/disk-release-handlers.js');
+const { registerDesktopOrganizerIpc } = require('./main/ipc/desktop-organizer-handlers.js');
 const { registerAutoSuspendIpc } = require('./main/ipc/auto-suspend-handlers.js');
 const { registerGroupchatQueryIpc } = require('./main/ipc/groupchat-query-handlers.js');
 const { registerGroupchatRecoveryIpc } = require('./main/ipc/groupchat-recovery-handlers.js');
@@ -537,6 +540,7 @@ sessionManager.on('native-agent-lifecycle', event => {
 // meeting's timeline (if the sub-session belongs to a meeting).
 transcriptTap.on('turn-complete', (ev) => {
   const { hubSessionId, text, completedAt } = ev || {};
+  try { assistantService?.onTurnComplete?.(hubSessionId, { ...(ev || {}), completedAt: normalizeEventTime(completedAt, Date.now()) }); } catch (error) { console.warn('[assistant] usage', error.message); }
   sessionManager.noteAgentTurnFinished(hubSessionId, ev || {});
   const completionAt = normalizeEventTime(completedAt, Date.now());
   let session = sessionManager.getSession(hubSessionId);
@@ -1075,6 +1079,7 @@ function createWindow() {
     },
   });
   mainWindow._hubNativeTitleBar = nativeTitleBar;
+  require('./main/ipc/preview-immersive-handlers.js').bindPreviewImmersiveWindow(mainWindow);
   // 工具栏要知道窗口是不是最大化：Windows 最大化一个隐藏标题栏的窗口时，
   // 窗口会比屏幕大出一圈边框，顶部那几像素会被切掉。渲染层拿这个状态决定
   // 要不要补那一圈，而不是靠猜。
@@ -1398,7 +1403,9 @@ function updateSessionTranscriptBinding(hubSessionId, fields = {}) {
 }
 
 const { addMeetingSubInternal } = registerMeetingCreateIpc(ipcMain, {
+  ensureLaunchAuth:(kind,opts)=>launchAuth.ensure(kind,opts),
   fs,
+  getOrchestrationService: () => global.__orchestrationService || null,
   getHookPort: () => hookPort,
   getHubDataDir,
   getMeetingWorkspaceDir,
@@ -1456,6 +1463,7 @@ registerMeetingIpc(ipcMain, {
 // Group Chat Mode dispatch
 // =====================================================================
 groupChatDispatcher = createGroupChatDispatcher({
+  recoverLaunchAuth:(session,failure)=>launchAuth.recover(session.kind,{...session,model:session.currentModel?.id},failure),
   cliReadyDetector,
   getHubDataDir,
   groupchat,
@@ -1509,16 +1517,8 @@ try {
     // invoked after startup, when the provider-native resume handler exists.
     resumeSession: (meta) => resumeSession(meta),
     loadSessionMeta: (sid) => stateStore.isMarkedRemovedSession(sid) ? null : sessionStore.loadSessionFile(sid),
-    writeReport: (html) => {
-      try {
-        const fsx = require('fs'), pathx = require('path'), osx = require('os');
-        const dir = pathx.join(osx.homedir(), 'Desktop', 'claude-artifacts');
-        fsx.mkdirSync(dir, { recursive: true });
-        const f = pathx.join(dir, 'loop-report-' + Date.now() + '.html');
-        fsx.writeFileSync(f, html, 'utf8');
-        return f;
-      } catch (e) { return null; }
-    },
+    // 循环报告写到产物根（AI_HUB_ARTIFACTS_ROOT，默认 ~/AI-Artifacts），不再落桌面。
+    writeReport: (html) => require('./core/loop-report-file.js').writeLoopReport(html),
     logger: console,
   });
   require('./main/ipc/loop-handlers.js').registerLoopIpc(ipcMain, { loopEngine: global.__loopEngine, deliveryEngine:()=>global.__deliveryEngine });
@@ -1538,6 +1538,7 @@ try {
       const attempt=matches[0];return {attempt,sourceCompletedAt:orch.state.devChatHistory?.receipts?.[attempt.attemptId]?.sourceCompletedAt};
     },
     sendToRenderer,
+    onStatus: id => global.__orchestrationService?.onDeliveryStatus(id),
   });
   global.__deliveryEngine.registerIpc(ipcMain);
   global.__deliveryEngine.startWatching();
@@ -1663,10 +1664,19 @@ registerAutoSuspendIpc(ipcMain, {
 
 const xresearchBridge = null;
 
+// Group chat cards come from members' Markdown answer files (2026-09-30).
+const answerFileMonitor = require('./main/groupchat/answer-file-monitor').createAnswerFileMonitor({
+  getHubDataDir, meetingManager, sendToRenderer, logger: console,
+  onChanged: (id, orch) => global.__orchestrationService?.onAnswersChanged(id, orch),
+  getOrchestrator: id => groupchat.getOrchestrator(getHubDataDir(), id),
+});
+answerFileMonitor.start();
+
 registerGroupchatQueryIpc(ipcMain, {
   getHubDataDir,
   groupchat,
   transcriptTap,
+  reconcileAnswers: id => answerFileMonitor.reconcile(id),
 });
 
 registerGroupchatRecoveryIpc(ipcMain, {
@@ -1722,6 +1732,17 @@ registerTranscriptIpc(ipcMain, {
 // Module C 后 blackboard 已删除,该 handler 不再被任何前端代码调用,清理。
 
 const resumeSession = createResumeSessionHandler({
+  ensureLaunchAuth:(kind,opts)=>launchAuth.ensure(kind,opts),
+  async prepareAssistantResume(meta) {
+    if (!assistantService) throw new Error('助理服务尚未就绪');
+    assistantService.requireAssistantResume(meta);
+    await assistantService.connectBridge();
+    return assistantService.getLaunchOptions(meta.kind, meta.hubId);
+  },
+  prepareOrchestratorResume: meta => {
+    if (!global.__orchestrationService) throw new Error('AI 编排服务尚未就绪，编排员暂不能恢复');
+    return global.__orchestrationService.resumeOptions(meta);
+  },
   defaultCodexSessionsRoot: DEFAULT_CODEX_SESSIONS_ROOT,
   findCodexRolloutBySid,
   findTranscriptByCCSessionId,
@@ -1760,7 +1781,8 @@ const resumeSession = createResumeSessionHandler({
   slotIds: SLOT_IDS,
 });
 
-registerSessionIpc(ipcMain, {
+const sessionOperations = registerSessionIpc(ipcMain, {
+  ensureLaunchAuth:(kind,opts)=>launchAuth.ensure(kind,opts),
   getPersistedSessions: () => lastPersistedSessions,
   getTerminalOutputBatchStats: () => terminalOutputBatcher.snapshotStats(),
   meetingManager,
@@ -1773,7 +1795,107 @@ registerSessionIpc(ipcMain, {
 
 // 普通会话输入框的闭环发送。必须排在 registerSessionIpc 之后：它复用
 //   group-chat-watcher 的 sendToPty，而那份 _deps 由群聊 dispatcher 的 init 注入。
-registerPromptSubmitIpc(ipcMain, { sessionManager, transcriptTap, sendToRenderer });
+let assistantService = null;
+let phoneService = null;
+const promptOperations = registerPromptSubmitIpc(ipcMain, {
+  sessionManager, transcriptTap, sendToRenderer,
+  onPromptReceipt: receipt => { assistantService?.observePromptReceipt?.(receipt); phoneService?.observeReceipt(receipt); },
+  preparePrompt(request, session) {
+    if (session?.purpose !== 'hub-assistant') return request;
+    if (!assistantService) throw new Error('助理服务尚未就绪，消息未发送');
+    if (session.id !== request.sessionId || !assistantService.isAssistantSession(session.id)) throw new Error('请求不是固定助理会话，消息未发送');
+    return assistantService.preparePrompt(request);
+  },
+});
+try {
+  assistantService = require('./main/ipc/assistant-handlers').registerAssistantIpc(ipcMain, {
+    dataDir: getHubDataDir(),
+    historyDatabasePath: (() => {
+      const file = process.env.CLAUDE_HUB_ASSISTANT_HISTORY_DB;
+      if (!file || process.env.CLAUDE_HUB_E2E !== '1') return undefined;
+      const base = path.resolve(getHubDataDir()), target = path.resolve(file);
+      if (!process.env.CLAUDE_HUB_DATA_DIR || base === path.resolve(require('node:os').homedir(), '.ai-hub-community')) throw new Error('助理验收必须使用独立数据目录');
+      const relative = path.relative(base, target);
+      if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('助理验收历史必须位于隔离数据目录内');
+      return target;
+    })(),
+    createSession: (kind, opts) => sessionOperations.createSession({ kind, opts }),
+    sendPrompt: (sessionId, text, clientSubmissionId) => promptOperations.submitPrompt(null, { sessionId, text, clientSubmissionId, waitForCliReady: true }),
+    // 助理 Tab 输入框的快速回答：与手机共用同一套凭据（Token Plan 优先、百炼按量兜底）。
+    fastLane: process.env.HUB_ASSISTANT_FAST_LANE === '0' ? null : new (require('./core/hub-assistant/fast-lane').FastLane)({ credentials: () => require('./core/hub-assistant/fast-lane').fastLaneSources({ dataDir: getHubDataDir(), safeStorage: require('electron').safeStorage }) }),
+    hasPendingPrompt:sessionId=>promptOperations.isAssistantSubmissionPending(sessionId),
+    isAgentTurnActive:sessionId=>sessionManager.isAgentTurnActive(sessionId),
+    getSession: id => sessionManager.getSession(id),
+    getAllSessions: () => sessionManager.getAllSessions(),
+    readNativeTurns: id => {
+      const native=sessionManager.getNativeSession(id);
+      if(!native?.readTranscript)return null;
+      return {identity:native.threadId,turns:native.readTranscript({limit:80})};
+    },
+    getSessionMetadata: id => {
+      if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,160}$/.test(id)) return null;
+      const live = sessionManager.getSession(id);
+      if (live) return live;
+      const saved = require('./core/session-store').loadSessionFile(id, { strict: true });
+      return saved ? { ...saved, id: saved.hubId || id } : null;
+    },
+    listKnownSessions: () => lastPersistedSessions.map(meta => ({ ...meta, id: meta.hubId || meta.id })),
+    onAssistantNotification: notification => {
+      sendToRenderer('assistant:notification', notification); phoneService?.kick?.();
+      // 到点提醒在电脑上也弹出通知（用户可能没在看 Hub）。
+      // 用 Hub 自绘的桌面通知卡片（项目约定不用 Windows 原生通知）；点击回到助理会话。
+      if (notification?.kind === 'reminder') { try { void desktopNotificationController?.show({ sessionId: assistantService?.store?.get('sessionId') || 'hub-assistant', title: 'AI Hub 提醒', body: String(notification.text || ''), kind: 'reminder' }); } catch (error) { console.warn('[assistant] reminder notification', error.message); } }
+    },
+    onReminderChanged: event => phoneService?.reminder?.(event),
+    // 备忘变了：助理页实时刷新，手机通道下一轮把清单发过去。
+    onMemosChanged: () => { sendToRenderer('assistant:memos-changed', {}); phoneService?.kick?.(); },
+    // 资料口播：Opus 写稿（失败退千问）、微软曉臻合成（失败退千问语音），产物在 Hub 数据目录 assistant/podcasts。
+    podcast: (() => { const electron = require('electron'), sc = require('./core/hub-assistant/podcast/script'), voice = require('./core/hub-assistant/podcast/voice'), fl = require('./core/hub-assistant/fast-lane');
+      return { extract: file => require('./core/hub-assistant/podcast/extract').extract(file, { electron }),
+        writers: [sc.claudeWriter({ cwd: getHubDataDir() }), sc.qwenWriter({ source: () => fl.fastLaneSources({ dataDir: getHubDataDir(), safeStorage: electron.safeStorage }).find(s => s.via === 'token-plan') })],
+        synthesize: (text, out) => voice.synthesize(text, out, { credentials: () => require('./core/hub-phone/voice').dashscopeCredentials({ dataDir: getHubDataDir(), safeStorage: electron.safeStorage }) }) }; })(),
+    onPodcastsChanged: () => { sendToRenderer('assistant:podcasts-changed', {}); phoneService?.kick?.(); },
+    openPath: file => shell.openPath(file),
+    getMeetings: () => meetingManager.getAllMeetings(),
+    getDefaults: kind => require('./core/session-creation-defaults').creationDefaults(kind, getHubConfig()),
+    resumeSession: async (id, _launchOptions, overrides) => {
+      const meta = require('./core/session-store').loadSessionFile(id, { strict: true });
+      // overrides：助理切换模型时，休眠中的助理直接按新模型恢复，避免先按旧模型启动再重启。
+      return meta ? resumeSession({ ...meta, ...(overrides ? { launchOverrides: overrides } : {}), hubId: id }) : null;
+    },
+    restartSession: (id, overrides) => sessionOperations.restartSession(id, overrides),
+    retireSession: async id => {
+      const session = sessionManager.getSession(id);
+      if (!session) return;
+      const title = String(session.title || 'AI Hub 助理').replace(/（已换班）$/, '') + '（已换班）';
+      const updated = sessionManager.updateSessionMeta(id, { title });
+      if (updated) sessionStore.markDirty(id, updated);
+      return sessionManager.closeSessionRecoverably(id, { reason: 'assistant-rotated' });
+    },
+    onAssistantRotated: event => sendToRenderer('assistant:rotated', event),
+    onFrontDeskChanged: frontDesk => { sendToRenderer('assistant:front-desk', frontDesk); phoneService?.kick?.(); },
+    onDialogEntry: entry => sendToRenderer('assistant:dialog', entry),
+    onAssistantTurnComplete: () => { phoneService?.kick?.(); setTimeout(() => phoneService?.kick?.(), 1200); },
+  });
+  assistantService.startWatching();
+  phoneService = require('./main/ipc/phone-handlers').registerPhoneIpc(ipcMain, assistantService, {dataDir:getHubDataDir(),electron:require('electron')});
+} catch (error) { console.error('[assistant] service unavailable:', error.message); }
+// AI 编排模式（2026-10-04）：编排员通过 hub_orchestrator 工具驱动群聊与交付工作流。
+try {
+  global.__orchestrationService = require('./main/orchestration/service').createOrchestrationService({
+    meetingManager, sessionManager, getHubDataDir, sendToRenderer, logger: console,
+    getDispatcher: () => (__testHooks ? __testHooks.dispatcher : groupChatDispatcher),
+    getDeliveryEngine: () => global.__deliveryEngine,
+    getMembers: meeting => groupChatDispatcher.groupMembersForMeeting(meeting, { includeDormant: true }),
+    addMeetingSubInternal,
+    ensureMemberReady: (meeting, memberId) => global.__loopEngine?.ensureMemberReady(meeting, memberId),
+    // 编排员处理成员故障：重启该成员的 CLI 会话（接着原会话历史）。
+    restartSession: id => sessionOperations.restartSession(id),
+    getDefaults: kind => require('./core/session-creation-defaults').creationDefaults(kind, getHubConfig()),
+  });
+  require('./main/ipc/orchestration-handlers').registerOrchestrationIpc(ipcMain, () => global.__orchestrationService);
+  global.__orchestrationService.start().catch(error => console.error('[orchestration] start failed:', error.message));
+} catch (error) { console.error('[orchestration] service unavailable:', error.message); }
 // 原生 Claude 额度看门狗。同样依赖 sendToPty 的 _deps，所以排在这之后。
 claudeQuotaResume.start();
 registerClaudeQuotaIpc(ipcMain, claudeQuotaResume);
@@ -1891,6 +2013,10 @@ let lastPersistedMeetings = bootMeetings;
 for (const m of bootMeetings) {
   meetingManager.restoreMeeting(m);
 }
+// 2026-09-28: one workflow engine. Idle legacy rooms move to the delivery
+// engine once; rooms with a recent unfinished legacy task stay until it ends.
+try { require('./core/delivery-migration').migrateAll({ meetingManager, dataDir: getHubDataDir(), logger: console }); }
+catch (error) { console.error('[workflow-migration] failed:', error); }
 
 registerMeetingTimelineIpc(ipcMain, {
   meetingManager,
@@ -2033,6 +2159,8 @@ registerAppUtilityIpc(ipcMain, {
   acknowledgeNetworkEgressChange: () => networkEgressMonitor.acknowledgeForeignChange(),
   imageDir,
   path,
+  app,
+  vpnTrafficDir: path.join(getHubDataDir(), 'traffic'),
 });
 
 // 全机残留回收。多个 Hub 实例共用同一个数据目录，所以任何一个实例打开这张卡片
@@ -2042,6 +2170,20 @@ registerProcessReclaimIpc(ipcMain, {
   getSessionManager: () => sessionManager,
   getDataDir: () => getHubDataDir(),
   logger: console,
+});
+
+// 底部状态条 CPU/内存/硬盘区点开的「释放内存」面板：按会话认领进程，结束残留或休眠空闲会话。
+registerMemoryReleaseIpc(ipcMain, {
+  app,
+  appVersion: app.getVersion(),
+  dataDir: getHubDataDir(),
+  getSessionManager: () => sessionManager,
+  logger: console,
+});
+registerDesktopOrganizerIpc(ipcMain, { dataDir: getHubDataDir(), shell });
+registerDiskReleaseIpc(ipcMain, {
+  app,
+  dataDir: getHubDataDir(),
 });
 
 // 驾驶舱 UI 删了，但这个服务还留着：工作台「最近文件」卡的 Git 变更来自它的 overview。
@@ -2648,6 +2790,7 @@ registerUsageIpc(ipcMain, {
 });
 
 registerConfigIpc(ipcMain, {
+  ensureLaunchAuth:(kind,opts)=>launchAuth.ensure(kind,opts),
   attachCodexUsageScope,
   clearCodexJsonlCache: () => _codexJsonlCachedByRoot.clear(),
   clearSessionManagerConfigCache,
@@ -2665,8 +2808,17 @@ const capabilityService = new (require('./core/capability-service').CapabilitySe
 const accountCenter = new (require('./core/account-center').AccountCenter)({
   dataDir: getHubDataDir(), homeDir: accountCenterHome,
   getConfig: () => require('./core/hub-config').getConfig(),
-  adapter: require('./core/account-adapters').createAccountAdapters({ dataDir:getHubDataDir(),homeDir:accountCenterHome }),
+  adapter: require('./core/account-adapters').createAccountAdapters({ dataDir:getHubDataDir(),homeDir:accountCenterHome,
+    onLoginComplete:result=>sendToRenderer('launch-auth-status',result) }),
 });
+const launchAuth = new (require('./core/launch-auth').LaunchAuth)({accounts:accountCenter,
+  getConfig:()=>require('./core/codex-global-account').currentConfig(),
+  notify:result=>sendToRenderer('launch-auth-status',result)});
+sessionManager.on('codex-session-updated',session=>{
+  const failure=session.nativeActionError || session.nativeRuntime?.reason || session.cliRuntime?.reason;
+  if (failure) void launchAuth.recover(session.kind,{...session,model:session.currentModel?.id},failure);
+});
+app.on('before-quit',()=>{accountCenter.stopPump();accountCenter.adapter.dispose?.();});
 require('./main/ipc/account-center-handlers').registerAccountCenterIpc(ipcMain,accountCenter);
 // The account page: one Hub Chrome holds every web login; CLIs report their own token files.
 hubAccountsService = new (require('./core/hub-accounts').HubAccounts)({
@@ -2677,7 +2829,14 @@ require('./main/ipc/hub-accounts-handlers').registerHubAccountsIpc(ipcMain, hubA
 
 require('./main/ipc/voice-input-handlers').registerVoiceInputIpc(ipcMain, {
   app, safeStorage: require('electron').safeStorage,
+  // 语音「动态背景」：当前会话聊天记录 md 的末尾（昨日之我的数据源），只给本地识别模型
+  getRecentContext: async hubSessionId => {
+    if (!hubSessionId || typeof sessionSearchService?.transcriptFor !== 'function') return '';
+    const found = await sessionSearchService.transcriptFor({ hubSessionId: String(hubSessionId) });
+    return found?.exists ? require('./core/voice-text').recentFromTranscript(found.path) : '';
+  },
 });
+require('./main/ipc/prompt-polish-handlers').registerPromptPolishIpc(ipcMain, { getConfig: getHubConfig });
 
 // --- 梦境系统（Dream Consolidation）+ 记忆面板 ---
 // 保留旧 IPC 兼容入口，但不再启动向原生规则写入的旧沉淀调度器。
@@ -3233,6 +3392,9 @@ async function runFinalShutdownCleanup() {
   windowsShellWatchdog = null;
   capture('terminal-output-batcher', () => terminalOutputBatcher.dispose({ flush: true }));
   capture('dev-workbench', () => devWorkbench?.dispose());
+  capture('hub-assistant', () => assistantService?.close());
+  capture('hub-orchestration', () => global.__orchestrationService?.stop());
+  capture('hub-phone', () => phoneService?.close());
   clearTimeout(sessionSearchPrewarmTimer);
   const workerResults = await Promise.allSettled([
     transcriptParserService.close(),
@@ -3342,6 +3504,7 @@ function beginGracefulHubShutdown(reason, { beforeQuit } = {}) {
 
   shutdownDrainState = 'draining';
   global.__deliveryEngine?.freeze();
+  global.__orchestrationService?.freeze();
   console.log(`[shutdown] draining PTYs before Electron teardown (${reason})`);
   // Freeze Agent League dispatch before SessionManager starts terminating PTYs.
   // Active tasks remain durable/orphan-recoverable and the phase lease is only
@@ -3358,7 +3521,7 @@ function beginGracefulHubShutdown(reason, { beforeQuit } = {}) {
         shutdownDrainPromise = null;
         console.error('[shutdown] PTY drain did not reach a safe state; close was cancelled and may be retried', result);
         restoreWindowAfterFailedShutdown();
-        global.__deliveryEngine?.startWatching();
+        global.__deliveryEngine?.startWatching(); global.__orchestrationService?.unfreeze();
         return result;
       }
       closeHookServerForShutdown();
@@ -3382,7 +3545,7 @@ function beginGracefulHubShutdown(reason, { beforeQuit } = {}) {
       shutdownDrainPromise = null;
       console.error('[shutdown] PTY drain failed; refusing unsafe Electron teardown:', error && error.stack || error);
       restoreWindowAfterFailedShutdown();
-      global.__deliveryEngine?.startWatching();
+      global.__deliveryEngine?.startWatching(); global.__orchestrationService?.unfreeze();
       return { safeToQuit: false, error: error && error.message ? error.message : String(error) };
     });
   return shutdownDrainPromise;

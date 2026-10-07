@@ -1,6 +1,6 @@
 {
   "name": "ai-hub-community",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local multi-agent desktop workspace using your own AI accounts",
   "main": "main-bootstrap.js",
   "scripts": {
@@ -85,6 +85,23 @@
         "filter": [
           "**/*",
           "!firewall-whitelist-electron.ps1"
+        ]
+      },
+      {
+        "from": "docs",
+        "to": "guides/docs",
+        "filter": [
+          "**/*.md"
+        ]
+      },
+      {
+        "from": ".",
+        "to": "guides",
+        "filter": [
+          "README.md",
+          "INSTALL.md",
+          "AGENTS.md",
+          "PRIVACY.md"
         ]
       }
     ]

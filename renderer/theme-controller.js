@@ -5,6 +5,8 @@ const {
   DEFAULT_THEME,
   THEME_STORAGE_KEY,
   THEME_ATTRIBUTE,
+  THEME_PREFERENCE_KEY,
+  readInitialTheme,
   normalizeTheme,
   nextTheme,
 } = require('../core/theme-config.js');
@@ -19,36 +21,45 @@ const GITHUB_DARK = {
   brightCyan: '#56d364', brightWhite: '#ffffff',
 };
 
-// Deep-sea D4 changes the terminal surface and default ANSI tones only. CLI
-// truecolor output remains owned by the real PTY application.
+// Warm gold for the real PTY: the terminal supplies ANSI/default colors while
+// Claude, Codex and other TUIs still own their truecolor rendering and input.
 const DEEP_SEA_DARK = {
   ...GITHUB_DARK,
-  background: '#081420', foreground: '#dce5ee', cursor: '#e3be85',
-  cursorAccent: '#081420', selectionBackground: 'rgba(227, 190, 133, 0.28)',
-  black: '#3c5065', white: '#dce5ee', brightBlack: '#8293a6',
-  brightWhite: '#f3f5f7', yellow: '#d7ad6d', brightYellow: '#f0d2a5',
+  background: '#081420', foreground: '#e8e3d8', cursor: '#e6bb7c',
+  cursorAccent: '#081420', selectionBackground: 'rgba(230, 187, 124, 0.3)',
+  black: '#3a4b5c', red: '#dc8585', green: '#86cda5', yellow: '#ddb575',
+  blue: '#92bad5', magenta: '#c4a4ce', cyan: '#80c6c1', white: '#e8e3d8',
+  brightBlack: '#8b9fb1', brightRed: '#f0a6a0', brightGreen: '#a9deb8',
+  brightYellow: '#f2d29b', brightBlue: '#b0d2e9', brightMagenta: '#dcc0e1',
+  brightCyan: '#a6dcd3', brightWhite: '#fff7eb',
+};
+
+const COLD_WHITE = {
+  background: '#fbfcfd', foreground: '#303b4b', cursor: '#3065bd',
+  cursorAccent: '#fbfcfd', selectionBackground: 'rgba(48, 101, 189, 0.20)',
+  black: '#303b4b', red: '#b42335', green: '#18704a', yellow: '#856000',
+  blue: '#3065bd', magenta: '#7944a1', cyan: '#16717e', white: '#526172',
+  brightBlack: '#637084', brightRed: '#b42335', brightGreen: '#18704a',
+  brightYellow: '#856000', brightBlue: '#3065bd', brightMagenta: '#7944a1',
+  brightCyan: '#16717e', brightWhite: '#222a36',
 };
 
 /**
- * 终端在所有主题下保持深色底（方案 T1「深色终端岛」）；D4 默认主题
- * 调整背景、光标和默认 ANSI 色，其余主题沿用原有 GitHub Dark 调色板。
- *
- * 不给浅色皮肤另配 light ANSI 的原因：xterm 里跑的是 Claude Code / Codex /
- * Gemini / Kimi 的 TUI，它们用 dim 灰自绘框线和分隔符，浅底下几乎看不见，
- * brightBlack 一类更是直接糊掉。要换必须逐个 CLI 实测过才算数。
- * 浅色皮肤改为把这块恒深区域收成圆角内缩的嵌入式终端（见 base.css 的
- * --machine-island-*），而不是硬把 ANSI 反色。
- *
- * 结构上留成映射：将来真要做 light ANSI，只需在这里补一套并逐 CLI 验收，
- * 调用方不用改。
+ * Cold white has a light ANSI palette and contrast protection for CLI-owned
+ * RGB text. Other themes keep their established palettes. Buffer contents,
+ * input, native colors and lifecycle events remain owned by the terminal.
  */
 const XTERM_THEMES = THEMES.reduce((acc, t) => {
-  acc[t.id] = t.id === 'dark' ? DEEP_SEA_DARK : GITHUB_DARK;
+  acc[t.id] = t.id === 'codex' ? COLD_WHITE : t.id === 'dark' ? DEEP_SEA_DARK : GITHUB_DARK;
   return acc;
 }, {});
 
 function resolveXtermTheme(theme) {
   return XTERM_THEMES[normalizeTheme(theme)] || XTERM_THEMES[DEFAULT_THEME];
+}
+
+function resolveXtermOptions(theme) {
+  return { theme: resolveXtermTheme(theme), minimumContrastRatio: normalizeTheme(theme) === 'codex' ? 4.5 : 1 };
 }
 
 /**
@@ -89,7 +100,7 @@ function buildPickerMarkup() {
   )).join('');
 }
 
-function createThemeController({ document, localStorage, terminalCache, openConfigModal }) {
+function createThemeController({ document, localStorage, terminalCache, openConfigModal, onThemeApplied = () => {} }) {
   if (!document) throw new Error('document is required');
   if (!terminalCache) throw new Error('terminalCache is required');
   if (typeof openConfigModal !== 'function') throw new Error('openConfigModal is required');
@@ -99,7 +110,7 @@ function createThemeController({ document, localStorage, terminalCache, openConf
   function readStoredTheme() {
     if (!store || typeof store.getItem !== 'function') return DEFAULT_THEME;
     try {
-      return normalizeTheme(store.getItem(THEME_STORAGE_KEY));
+      return readInitialTheme(store);
     } catch {
       return DEFAULT_THEME;
     }
@@ -109,6 +120,7 @@ function createThemeController({ document, localStorage, terminalCache, openConf
     if (!store || typeof store.setItem !== 'function') return;
     try {
       store.setItem(THEME_STORAGE_KEY, theme);
+      store.setItem(THEME_PREFERENCE_KEY, '1');
     } catch {
       // 存不下只影响下次启动的默认值，不该拦住这次切换。
     }
@@ -164,10 +176,12 @@ function createThemeController({ document, localStorage, terminalCache, openConf
     }
     if (previousTheme !== currentTheme) forceStyleRecalc(root);
 
-    const xtermTheme = resolveXtermTheme(currentTheme);
+    const xtermOptions = resolveXtermOptions(currentTheme);
     for (const [, cached] of terminalCache) {
-      cached.terminal.options.theme = xtermTheme;
+      Object.assign(cached.terminal.options, xtermOptions);
     }
+
+    onThemeApplied(currentTheme);
 
     syncPicker();
     return currentTheme;
@@ -260,6 +274,7 @@ function createThemeController({ document, localStorage, terminalCache, openConf
 module.exports = {
   XTERM_THEMES,
   resolveXtermTheme,
+  resolveXtermOptions,
   forceStyleRecalc,
   buildPickerMarkup,
   createThemeController,

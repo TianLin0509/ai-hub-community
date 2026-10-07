@@ -11,6 +11,7 @@ const {
   normalizeToolActivity,
 } = require('../core/turn-presentation.js');
 const { renderImageAttachments, createCardDetailControls } = require('./card-detail-controls.js');
+const { chatAvatarSrc, USER_AVATAR_SRC } = require('./chat-avatar');
 
 function createTurnCardRenderer(options = {}) {
   const doc = options.document || document;
@@ -21,7 +22,14 @@ function createTurnCardRenderer(options = {}) {
   function listen(type, handler) { root.addEventListener(type, handler); listeners.push([type, handler]); }
   const overlay = () => options.container || doc.getElementById('msg-overlay');
   const nav = options.navigator || (win && win.navigator) || {};
-  const clipboardApi = nav.clipboard || { writeText: () => Promise.reject(new Error('剪贴板不可用')) };
+  // All live Hub card surfaces share the native writer, verification and retries.
+  // The browser fallback only serves standalone renderers without Hub services.
+  const clipboardApi = typeof options.copyText === 'function' ? {
+    async writeText(text) {
+      const result = await options.copyText(text, { source: 'card-detail', silent: true });
+      if (result && result.ok === false) throw new Error(result.reason || '复制失败');
+    },
+  } : nav.clipboard || { writeText: () => Promise.reject(new Error('剪贴板不可用')) };
   const cssApi = options.CSS || (win && win.CSS) || {};
   const cssEscape = typeof cssApi.escape === 'function'
     ? (value) => cssApi.escape(String(value))
@@ -43,9 +51,13 @@ function createTurnCardRenderer(options = {}) {
   function prepareTurnForRender(sessionId, turn, opts = {}) {
     const session = opts.session || getSessionContext(sessionId) || null;
     if (turn?.role === 'user') {
+      const assistantContext=require('../core/assistant-context-display').assistantContextDisplay(turn.text,session?.purpose)
+        ||require('../core/hub-assistant/delegated-prompt').delegatedPromptDisplay(turn.text);
+      if(!turn.clientSubmissionId&&assistantContext?.clientSubmissionId)turn={...turn,clientSubmissionId:assistantContext.clientSubmissionId};
       const feedback = require('../core/native-feedback');
       const receiptAuthoritative = feedback.hasNativeReceipt(turn);
-      return { ...turn, attachmentCwd: session?.cwd || opts.cwd || turn.attachmentCwd,
+      return { ...turn, simpleChat: true, attachmentCwd: session?.cwd || opts.cwd || turn.attachmentCwd,
+        assistantContext,
         receiptAuthoritative, promptReceipt: feedback.promptReceipt(session, turn.clientSubmissionId,
           {authoritative: receiptAuthoritative, deliveryStatus: turn.deliveryStatus}) };
     }
@@ -64,7 +76,7 @@ function createTurnCardRenderer(options = {}) {
     const presentation = buildTurnPresentation(presentationTurn, {
       cwd: session && session.cwd || opts.cwd || null,
     });
-    return { ...presentationTurn, presentation };
+    return { ...presentationTurn, simpleChat: true, presentation, assistantIdentity: session?.purpose === 'hub-assistant' };
   }
 
   function publishTurnPresentation(sessionId, turn) {
@@ -192,11 +204,14 @@ function renderToolCluster(turnId, toolCalls, total = toolCalls?.length || 0) {
 }
 
 const renderDeliverySummary = delivery => require('./delivery-summary').renderDeliverySummary(delivery, escapeHtml);
+const renderDeliveryGlance = delivery => require('./delivery-summary').renderDeliveryGlance(delivery, escapeHtml);
 
 function _disclosureKey(element, index) {
   if (!element) return `details:${index}`;
   if (element.dataset && element.dataset.activityId) return `activity:${element.dataset.activityId}`;
+  if (element.classList?.contains('conversation-long-message')) return require('./message-disclosure-state').key(element);
   if (element.classList && element.classList.contains('turn-thinking')) return 'thinking';
+  if (element.classList && element.classList.contains('chat-process')) return 'chat-process';
   if (element.classList && element.classList.contains('turn-delivery-summary')) return 'delivery';
   if (element.classList && element.classList.contains('tc-cluster')) return `cluster:${element.dataset.turn || ''}`;
   return `details:${index}:${element.className || ''}`;
@@ -323,6 +338,7 @@ function _postProcessTurnCard(card, sessionId, deferActivity = false) {
   if (bodyEl && typeof wrapPathLinksInElement === 'function') wrapPathLinksInElement(bodyEl, { sessionId });
   postProcessCardMath(card);
   if (typeof postProcessLongTextFold === 'function') postProcessLongTextFold(card);
+  require('./message-disclosure-state').restore(card);
   if (!deferActivity) require('./conversation-message-view').syncResponseNeighbors(card);
 }
 
@@ -356,6 +372,7 @@ function patchTurnCardInPlace(existing, newCard, sessionId) {
   }
   _postProcessTurnCard(existing, sessionId, true);
   const selectionRestored = _restoreCardUiState(existing, snapshot);
+  require('./message-disclosure-state').restore(existing);
   require('./conversation-message-view').syncResponseNeighbors(existing);
   if (!win.__cardRenderMetrics) win.__cardRenderMetrics = { inPlacePatches: 0, rootReplacements: 0 };
   win.__cardRenderMetrics.inPlacePatches += 1;
@@ -381,21 +398,6 @@ function rerenderTurn(turnId) {
   }
 }
 
-// === Spec 1 v0.9.0 · D4 头像 ===
-function sanitizeAssetName(name) {
-  // 仅允许字母数字+横线下划线,防止路径遍历
-  return String(name || '').replace(/[^a-zA-Z0-9_-]/g, '');
-}
-function aiLogoSrc(kind) {
-  // 已有 logos: claude / codex / 等。其它 kind fallback 到字母。
-  // Spec 3 · W6 fix：claude-resume / gemini-resume / codex-resume / deepseek-resume / 等
-  // 都共享对应 base kind 的 logo（之前 -resume 后缀漏映射 → 字母 fallback "CL"）。
-  const known = ['claude','codex','gemini','deepseek','kimi','qwen','glm'];
-  let k = (kind || '').toLowerCase().replace(/-resume$/, '');
-  if (k === 'deepseek-acp') k = 'deepseek';
-  if (known.includes(k)) return `assets/ai-logos/${k}.svg`;
-  return null;
-}
 function aiLetterFallback(kind) {
   const k = (kind || '?').toUpperCase();
   return k.length >= 2 ? k.slice(0, 2) : k + '?';
@@ -425,15 +427,16 @@ function _fmtDuration(ms) {
   if (s >= 60) return (s / 60).toFixed(1) + 'min';
   return s.toFixed(1) + 's';
 }
-function _renderMetaPills(turn) {
+function _renderMetaPills(turn, compact = false) {
   // Item timestamps inherit the logical turn end; repeating that elapsed time
   // on every progress item is both noisy and misleading.
   if (turn.phase === 'commentary') return '';
   const isUser = turn.role === 'user';
   if (isUser) {
-    const n = (turn.text || '').length;
+    const n = (turn.assistantContext?.userText ?? turn.text ?? '').length;
     if (!n) return '';
-    return `<span class="turn-meta-pills"><span class="pill">📝 ${n} 字</span></span>`;
+    return compact ? `<span class="turn-meta chat-word-count" title="消息字数">${n} 字</span>`
+      : `<span class="turn-meta-pills"><span class="pill">📝 ${n} 字</span></span>`;
   }
   const pills = [];
   // Activity count moved into the richer lifecycle rail. Keeping the legacy
@@ -454,6 +457,11 @@ function _renderMetaPills(turn) {
   }
   if (pills.length === 0) return '';
   return `<span class="turn-meta-pills">${pills.join('')}</span>`;
+}
+
+function renderTurnSpeed(turn) {
+  const display = require('./turn-speed-display').speedDisplay(turn.turnSpeed);
+  return display ? `<span class="turn-speed" title="${escapeHtml(display.title)}" aria-label="${escapeHtml(display.text)}"><span class="turn-speed-detail">${escapeHtml(display.mode ? display.mode + ' · ' : '')}均速 </span>≈${escapeHtml(display.rate)}<span class="turn-speed-unit"> tok</span>/s</span>` : '';
 }
 
 // === Spec 1 v0.9.0 · turn 卡片渲染 ===
@@ -488,6 +496,7 @@ function confirmCardResend({ text, sessionLabel }) {
 function renderTurnCard(turn) {
   // turn = { id, role: 'user'|'assistant', text, ts, model?, kind?, toolCalls? }
   const isUser = turn.role === 'user';
+  const isSimple = turn.simpleChat === true;
   const isProgress = !isUser && turn.phase === 'commentary';
   // inherited = 从父会话补进来的「分支前」对话（见 core/branch-transcript-inheritance.js）。
   const cls = (isUser ? 'turn-card user' : 'turn-card assistant') + (turn.inherited ? ' inherited' : '');
@@ -497,11 +506,11 @@ function renderTurnCard(turn) {
   // 头像分支
   let avatarHtml;
   if (isUser) {
-    avatarHtml = `<span class="turn-avatar av-letter">你</span>`;
+    avatarHtml = `<span class="turn-avatar av-logo av-user"><img src="${USER_AVATAR_SRC}" alt="你 · AI Hub"></span>`;
   } else {
-    const logo = aiLogoSrc(turn.kind);
+    const logo = chatAvatarSrc(turn.kind, { assistant: turn.assistantIdentity });
     avatarHtml = logo
-      ? `<span class="turn-avatar av-logo"><img src="${logo}" alt="${escapeHtml(turn.kind || 'AI')}"></span>`
+      ? `<span class="turn-avatar av-logo ${turn.assistantIdentity ? 'av-assistant' : 'av-character'}"><img src="${logo}" alt="${turn.assistantIdentity ? '企鹅助理' : escapeHtml(turn.kind || 'AI')}"></span>`
       : `<span class="turn-avatar av-letter">${escapeHtml(aiLetterFallback(turn.kind))}</span>`;
   }
 
@@ -511,16 +520,26 @@ function renderTurnCard(turn) {
   // body reads like every other answer, matching Codex's card density.
   const nativeChip = turn.nativeActivity && !isProgress
     ? `<span class="turn-branch-chip turn-native-chip" title="Claude 自行发起的回合${turn.nativeOrigin?.kind ? '：' + escapeHtml(turn.nativeOrigin.kind) : ''}">后台</span>` : '';
-  const body = (isProgress ? require('./conversation-message-view').renderProgressRow(turn,
+  const body = (isProgress && !isSimple ? require('./conversation-message-view').renderProgressRow(turn,
     {escapeHtml,renderMarkdown:renderMarkdownPreservingLocalPaths,actions:renderCardActions(turn)})
     : emptyNative ? `<span class="turn-native-outcome">${escapeHtml(emptyNative)}</span>`
-    : require('./conversation-message-view').renderMessageBody(turn.text,
+    : require('./conversation-message-view').renderMessageBody(turn.assistantContext?.userText ?? turn.text,
       {isUser,escapeHtml,renderMarkdown:renderMarkdownPreservingLocalPaths}));
   const attachments = isUser ? renderImageAttachments(turn.attachments, { escapeHtml, cwd: turn.attachmentCwd }) : '';
+  const assistantContext = isUser && turn.assistantContext
+    ? `<details class="assistant-turn-context"><summary>本轮请求 · 查看原生提交内容</summary><pre>${escapeHtml(turn.assistantContext.rawText)}</pre></details>` : '';
   const presentation = turn.presentation || buildTurnPresentation(turn);
   // 活动轨保留原 tc-cluster class 兼容现有交互/样式，同时增加显式 lifecycle。
   const toolHtml = renderToolCluster(turn.id || '', _fullActivityTurns.has(turn.id) ? turn.toolCalls : presentation.activities, presentation.activityCount);
   const deliveryHtml = !isUser && turn.phase !== 'commentary' && turn.phase !== 'activity' ? renderDeliverySummary(presentation.delivery) : '';
+  const glanceHtml = deliveryHtml && !isSimple ? renderDeliveryGlance(presentation.delivery) : '';
+  const bodyHtml = `<div class="turn-body${isProgress && !isSimple ? ' conversation-progress-row' : ''}${turn.text || emptyNative ? '' : ' turn-body-empty'}">${body}</div>
+      ${attachments}
+      ${assistantContext}
+      ${isUser && turn.promptReceipt ? `<div class="turn-prompt-receipt" role="status">${escapeHtml(turn.promptReceipt)}</div>` : ''}`;
+  const primaryHtml = !isUser && !isProgress && turn.phase !== 'activity'
+    ? `<div class="turn-primary${glanceHtml ? ' has-glance' : ''}"><div class="turn-primary-copy">${bodyHtml}</div>${glanceHtml}</div>`
+    : bodyHtml;
 
   // === Spec 2 · S8: thinking 字段 (assistant only, default collapsed) ===
   // S1 parser exposes turn.thinking as multi-block joined string (or null).
@@ -541,26 +560,33 @@ function renderTurnCard(turn) {
       </details>`;
   }
 
-  return `<div class="${cls}"${isUser && turn.promptReceipt ? ` data-submission-id="${escapeHtml(turn.clientSubmissionId)}" data-receipt-authoritative="${turn.receiptAuthoritative === true}" data-delivery-status="${escapeHtml(turn.deliveryStatus || '')}"` : ''} data-turn-id="${escapeHtml(turn.id || '')}" data-response-id="${escapeHtml(turn.logicalTurnId || '')}" data-response-agent="${escapeHtml(turn.kind || '')}" data-phase="${escapeHtml(turn.phase || 'message')}" data-presentation-source="${escapeHtml(presentation.source || 'deterministic')}"${turn.inherited ? ' data-inherited="1"' : ''}>
+  const progressMessages = turn.chatProcessMessages || [];
+  const progressHtml = isSimple && progressMessages.length
+    ? require('./conversation-message-view').renderMessageSequence(progressMessages,
+      { escapeHtml, renderMarkdown: renderMarkdownPreservingLocalPaths, foldLong: true }) : '';
+  const processCount = progressMessages.length + Number(presentation.activityCount || 0);
+  // The activity preview shows only the latest items; warnings count the full reply.
+  const processFailures = (turn.toolCalls || []).map(normalizeToolActivity).filter(a => a.status === 'failed' || a.isError === true).length;
+  const processHtml = isSimple && (progressHtml || thinkingHtml || toolHtml || (!isUser && _renderMetaPills(turn)))
+    ? `<details class="chat-process" data-copy-exclude><summary title="展开本轮完整过程、工具结果与用量">过程${processCount ? ` ${processCount} 条` : ''}${processFailures ? `<span class="chat-process-warning"> · ${processFailures} 项失败</span>` : ''}</summary><div class="chat-process-body">${progressHtml}${thinkingHtml}${toolHtml}${_renderMetaPills(turn)}</div></details>` : '';
+
+  return `<div class="${cls}"${isSimple ? ' data-chat-style="message"' : ''}${isUser && turn.promptReceipt ? ` data-submission-id="${escapeHtml(turn.clientSubmissionId)}" data-receipt-authoritative="${turn.receiptAuthoritative === true}" data-delivery-status="${escapeHtml(turn.deliveryStatus || '')}"` : ''} data-turn-id="${escapeHtml(turn.id || '')}" data-response-id="${escapeHtml(turn.logicalTurnId || '')}" data-response-agent="${escapeHtml(turn.kind || '')}" data-phase="${escapeHtml(turn.phase || 'message')}" data-presentation-source="${escapeHtml(presentation.source || 'deterministic')}"${turn.inherited ? ' data-inherited="1"' : ''}>
     ${avatarHtml}
     <div class="turn-content">
       <div class="turn-head">
         <span class="turn-who">${escapeHtml(who)}</span>
         ${!isUser && turn.phase ? `<span class="conversation-phase">${turn.phase === 'final_answer' ? '结果' : turn.phase === 'commentary' ? '进展' : turn.phase === 'activity' ? '活动记录' : '消息'}</span>` : ''}
-        ${!isUser ? require('./conversation-header-activity').renderHeaderActivity('', '', true) : ''}
+        ${!isUser && !isSimple ? require('./conversation-header-activity').renderHeaderActivity('', '', true) : ''}
         ${turn.inherited ? '<span class="turn-branch-chip" title="分支前的对话，继承自父会话">分支前</span>' : ''}${nativeChip}
         <span class="turn-meta">${escapeHtml(ts)}</span>
+        ${!isUser ? renderTurnSpeed(turn) : ''}
+        ${isSimple && isUser ? _renderMetaPills(turn, true) : ''}
+        ${processHtml}
         <div class="turn-actions">
-          ${isProgress ? '<button class="conversation-response-copy" data-action="conversation-response-copy" title="复制本轮当前已收到的完整回复">复制本轮</button>' : renderCardActions(turn)}
+          ${isProgress && !isSimple ? '<button class="conversation-response-copy" data-action="conversation-response-copy" title="复制本轮当前已收到的完整回复">复制本轮</button>' : renderCardActions(turn)}
         </div>
       </div>
-      ${thinkingHtml}
-      <div class="turn-body${isProgress ? ' conversation-progress-row' : ''}${turn.text || emptyNative ? '' : ' turn-body-empty'}">${body}</div>
-      ${attachments}
-      ${isUser && turn.promptReceipt ? `<div class="turn-prompt-receipt" role="status">${escapeHtml(turn.promptReceipt)}</div>` : ''}
-      ${deliveryHtml}
-      ${toolHtml}
-      ${_renderMetaPills(turn)}
+      ${isSimple ? `<div class="chat-message-bubble">${primaryHtml}${deliveryHtml}</div>` : `${thinkingHtml}${primaryHtml}${deliveryHtml}${toolHtml}${_renderMetaPills(turn)}`}
     </div>
   </div>`;
   // 2026-06-28 maintainer · 深空灰气泡皮肤：气泡背景挂在 .turn-body 上，故把工具簇与 meta-pills
@@ -616,8 +642,8 @@ function postProcessCardCodeBlocks(cardEl) {
     // wrap pre in .code-block-wrap, add Copy button + fold toggle if long
     const lines = code.textContent.split('\n').length;
     const turnId = cardEl.dataset.turnId || '';
-    const codeKey = `${turnId}:code:${idx}`;
-    const expanded = _foldedCodesState.has(codeKey) ? _foldedCodesState.get(codeKey) : (lines <= _codeFoldThreshold);
+    const codeKey = `${cardEl.dataset.sessionId || ''}:${turnId}:code:${idx}`;
+    const expanded = _foldedCodesState.has(codeKey) ? _foldedCodesState.get(codeKey) : true;
     const wrap = doc.createElement('div');
     wrap.className = 'code-block-wrap';
     wrap.dataset.codeKey = codeKey;
@@ -649,9 +675,8 @@ function postProcessCardCodeBlocks(cardEl) {
   });
 }
 
-// === Spec 3 · 长 markdown 文本默认折叠 ===
-// 在卡片插入 DOM 后调用：检测 turn-body scrollHeight 超过阈值 → 加 .body-foldable.folded
-// + 插入"展开全文"按钮。必须在 mount 后调（detached 元素 scrollHeight=0）。
+// === Spec 3 · 长 markdown 文本默认展开，保留用户主动折叠 ===
+// Mount 后按正文高度提供折叠按钮；只在用户选择后添加 folded。
 const _BODY_FOLD_THRESHOLD_PX = 400;
 function postProcessLongTextFold(cardEl) {
   if (!cardEl) return;
@@ -661,8 +686,8 @@ function postProcessLongTextFold(cardEl) {
   // 已存在折叠按钮（rerender 路径） → 跳过
   if (cardEl.querySelector('.body-fold-toggle')) return;
   if (body.scrollHeight <= _BODY_FOLD_THRESHOLD_PX) return;
-  const turnId = cardEl.dataset.turnId || '';
-  const expanded = turnId && _bodyFoldState.get(turnId) === true;
+  const turnId = `${cardEl.dataset.sessionId || ''}:${cardEl.dataset.turnId || ''}`;
+  const expanded = _bodyFoldState.get(turnId) !== false;
   body.classList.add('body-foldable');
   if (!expanded) body.classList.add('folded');
   const btn = doc.createElement('div');
@@ -681,7 +706,7 @@ listen('click', (e) => {
   if (!card) return;
   const body = card.querySelector('.turn-body');
   if (!body) return;
-  const turnId = card.dataset.turnId || '';
+  const turnId = `${card.dataset.sessionId || ''}:${card.dataset.turnId || ''}`;
   if (btn.dataset.action === 'body-expand') {
     if (turnId) _bodyFoldState.set(turnId, true);
     body.classList.remove('folded');
@@ -931,7 +956,9 @@ function turnRenderSignature(turn) {
     tsEnd: turn.tsEnd || null,
     toolCalls: Array.isArray(turn.toolCalls) ? turn.toolCalls : [],
     usage: turn.usage || null,
+    turnSpeed: turn.turnSpeed || null,
     promptReceipt: turn.promptReceipt || '',
+    chatProcessMessages: turn.chatProcessMessages || null,
   });
   let hash = 2166136261;
   for (let i = 0; i < raw.length; i++) {
@@ -944,7 +971,7 @@ function turnRenderSignature(turn) {
 function mountSessionTurnCard(sessionId, turn, opts = {}) {
   if (turn && Array.isArray(turn.displayMessages)) {
     let last = null;
-    for (const message of require('../core/conversation-display').displayTurns([turn])) {
+    for (const message of require('./simple-chat-display').displayChatTurns([turn])) {
       last = mountSessionTurnCard(sessionId, message, opts) || last;
     }
     return last;
@@ -1128,23 +1155,14 @@ listen('click', (e) => {
       .catch(error=>{messageCopy.textContent='复制失败';console.warn('[conversation-copy]',error);});
     return;
   }
-  const filter = e.target.closest('[data-conversation-filter]');
-  if (filter) {
-    const results = filter.dataset.conversationFilter !== 'results';
-    filter.dataset.conversationFilter = results ? 'results' : 'all';
-    filter.setAttribute('aria-pressed', String(results));
-    filter.textContent = results ? '只看结果 · 进展已隐藏' : '全部消息';
-    doc.body.classList.toggle('conversation-results-only', results);
-    return;
-  }
   const copyBtn = e.target.closest('[data-action="code-copy"]');
   if (copyBtn) {
     const code = copyBtn.parentElement.querySelector('pre code');
     if (code) {
-      clipboardApi.writeText(code.textContent).then(() => {
+      Promise.resolve(clipboardApi.writeText(code.textContent)).then(() => {
         copyBtn.textContent = '✓ Copied';
         setTimeout(() => copyBtn.textContent = '📋 Copy', 1500);
-      });
+      }).catch(error => { copyBtn.textContent = '复制失败'; console.warn('[code-copy]', error); });
     }
     return;
   }

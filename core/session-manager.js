@@ -70,6 +70,19 @@ const RING_BUFFER_BYTES = 1024 * 1024;
 const CLAUDE_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 const CODEX_MCP_PROFILES = new Set(['none', 'lean', 'browser', 'wireless', 'full']);
 const DEFAULT_IDLE_SUSPEND_MS = 5 * 60 * 60 * 1000;
+// 「释放内存」面板休眠会话的闸门：正在回答、10 分钟内有活动、当前聚焦、群聊成员都不动。
+// 群聊成员由群聊整体休眠管理，单独休眠一个成员会打断群聊派发。
+// E2E 不能真等 10 分钟：仅在 CLAUDE_HUB_E2E=1 时允许用环境变量缩短（至少 1 ms，保留「正在回答不休眠」）。
+const MEMORY_RELEASE_MIN_IDLE_MS = process.env.CLAUDE_HUB_E2E === '1'
+  && Number.isFinite(Number(process.env.CLAUDE_HUB_E2E_MEMORY_RELEASE_IDLE_MS))
+  ? Math.max(1, Number(process.env.CLAUDE_HUB_E2E_MEMORY_RELEASE_IDLE_MS))
+  : 10 * 60 * 1000;
+const MEMORY_RELEASE_SUSPEND_OPTIONS = Object.freeze({
+  reason: 'memory-release',
+  minIdleMs: MEMORY_RELEASE_MIN_IDLE_MS,
+  excludeFocused: true,
+  excludeMeeting: true,
+});
 // One default for ordinary/group Codex sessions and every new/resume/fork/relaunch path.
 const CODEX_REASONING_EFFORT = 'max';
 // Codex 的思考深度档位。2026-08-16 查 ~/.codex/models_cache.json 实测：
@@ -290,7 +303,8 @@ function createNativeClaudeDriver(id, kind, opts, cwd, env, legacy) {
   if (!legacy && shouldUseClaudeFastSettings(cv, opts)) settings.push(resolveAsarUnpacked('claude-subscription-fast-settings.json'));
   const settingsFile = prepareClaudeSettingsOverlay(settings, {
     directory: path.join(hubDataDir, 'native-agent-settings'), sessionId: id + '-' + require('crypto').randomUUID(),
-    overrides: { ...require('./agent-user-context').claudeSharedConfig(env,hubDataDir),fastMode: !legacy && shouldUseClaudeFastSettings(cv, opts) },
+    overrides: { ...require('./agent-user-context').claudeSharedConfig(env,hubDataDir),fastMode: !legacy && shouldUseClaudeFastSettings(cv, opts),
+      ...(opts.purpose === 'hub-assistant' && opts.autonomous === true ? {skipDangerousModePermissionPrompt:true} : {}) },
   });
   const launchArgs = buildClaudeNativeArgs({ model: legacy ? normalizeLegacyDeepSeekClaudeModel(opts.model) : opts.model,
     effort: legacy || process.env.CLAUDE_HUB_NO_EFFORT_MAX === '1' ? null
@@ -345,9 +359,12 @@ function buildClaudePtyLaunch(id, kind, opts, cwd, env, cv) {
   if (opts.meetingId || opts.autonomous === true) settings.push(ensureGroupChatSettings(hubDataDir));
   if (fast) settings.push(resolveAsarUnpacked('claude-subscription-fast-settings.json'));
   const { buildClaudeNativeArgs, prepareClaudeSettingsOverlay } = require('./claude-native-launch');
+  let cliTheme = null;
+  try { cliTheme = require('./cli-coldwhite-theme').ensureClaudeTheme(env, opts.hubUiTheme); }
+  catch (error) { console.warn('[CLI theme] Claude:', error.message); }
   const settingsFile = prepareClaudeSettingsOverlay(settings, {
     directory: path.join(hubDataDir, 'native-agent-settings'), sessionId: id + '-' + require('crypto').randomUUID(),
-    overrides: { fastMode: fast, skipDangerousModePermissionPrompt: true },
+    overrides: { fastMode: fast, skipDangerousModePermissionPrompt: true, ...(cliTheme ? { theme: cliTheme } : {}) },
   });
   const args = buildClaudeNativeArgs({ model: opts.model,
     effort: process.env.CLAUDE_HUB_NO_EFFORT_MAX === '1' ? null
@@ -978,6 +995,9 @@ function buildCodexEphemeralMcpArgs(entries) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
       add(`mcp_servers.${name}.env.${key}=${literal(env[key])}`);
     }
+    for (const [tool, policy] of require('./codex-mcp-tool-policy').toolPolicyEntries(entry)) {
+      for (const [key, value] of Object.entries(policy)) add(`mcp_servers.${name}.tools.${tool}.${key}=${typeof value === 'number' ? value : literal(value)}`);
+    }
   }
   return out.join('');
 }
@@ -1030,6 +1050,10 @@ function ensureCodexMcpEntries(configDir, entries, managedNames = []) {
           block.push(`${key} = ${tomlString(env[key])}`);
         }
       }
+      for (const [tool, policy] of require('./codex-mcp-tool-policy').toolPolicyEntries(entry)) {
+        block.push('', `[mcp_servers.${name}.tools.${tool}]`);
+        for (const [key, value] of Object.entries(policy)) block.push(`${key} = ${typeof value === 'number' ? value : tomlString(value)}`);
+      }
       cfg += (cfg ? '\n' : '') + block.join('\n') + '\n';
     }
     fs.writeFileSync(cfgPath, cfg, 'utf8');
@@ -1068,6 +1092,9 @@ function buildNativeCodexOptions(info, opts, env) {
     for (const [key,value] of Object.entries(entry.env || {})) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error('Codex MCP 环境字段无效');
       config['mcp_servers.' + entry.name + '.env.' + key] = String(value);
+    }
+    for (const [tool, policy] of require('./codex-mcp-tool-policy').toolPolicyEntries(entry)) {
+      for (const [key, value] of Object.entries(policy)) config['mcp_servers.' + entry.name + '.tools.' + tool + '.' + key] = value;
     }
   }
   const tier = info.codexSpeedTier;
@@ -1112,6 +1139,7 @@ class SessionManager extends EventEmitter {
     } finally { driver.accountSyncRequest=null; }
   }
   async syncCodexAccounts() {
+    if (require('./codex-global-account').currentConfig().codexAccountSwitchScope === 'launch') return [];
     const entries=[...this.sessions.values()].filter(s=>s.pty?.options?.resolveAccount && !s.pty.closed);
     return Promise.all(entries.map(async ({pty,info})=>{
       try { return await this._syncCodexAccount(pty,info); }
@@ -1137,6 +1165,11 @@ class SessionManager extends EventEmitter {
 
   constructor() {
     super();
+    this.presentationTheme = require('./theme-config').DEFAULT_THEME;
+  }
+
+  setPresentationTheme(theme) {
+    if (require('./theme-config').THEME_IDS.includes(theme)) this.presentationTheme = theme;
   }
 
   // Callbacks
@@ -1215,7 +1248,7 @@ class SessionManager extends EventEmitter {
     try {
       if (lease) require('./session-store').resumeSessionWrites(id);
       require('./community-provider').assertProviderAvailable(kind);
-      return this._createSession(kind, {...opts, id});
+      return this._createSession(kind, {...opts, id, hubUiTheme: this.presentationTheme});
     }
     catch (error) {
       if (!this.sessions.has(id)) this._releaseOpenSession(id);
@@ -1229,6 +1262,7 @@ class SessionManager extends EventEmitter {
       throw new Error('Hub is shutting down; refusing to create a new PTY');
     }
     const id = opts.id || uuid();
+    const freshLaunch = require('./session-history-state').isFreshLaunch(kind, opts);
     const isAcp = isAcpKind(kind);
     const isProviderCli = ['qwen','glm'].includes(kind.replace(/-resume$/, '')) && require('./agent-runtime-mode').agentRuntimeMode() !== 'native';
     const isClaude = kind === 'claude' || kind === 'claude-resume';
@@ -1296,7 +1330,7 @@ class SessionManager extends EventEmitter {
     else title = `PowerShell ${++this.psCounter}`;
 
     const sessionEnv = { ...process.env };
-    applyInteractiveTerminalEnv(sessionEnv, { truecolor: isCodexRuntime });
+    applyInteractiveTerminalEnv(sessionEnv, { truecolor: isPtyAgent && (isClaude || isCodexRuntime) });
     let codexProfile = null;
 
     if (isClaude) {
@@ -1524,10 +1558,11 @@ class SessionManager extends EventEmitter {
     const isNativeClaude = (isClaude && nativeAgentRuntime) || isDeepSeekLegacy;
     // 个人规则同步与运行时无关：PTY 与原生的 Claude 都读同一个 CLAUDE_CONFIG_DIR。
     const contextKind = isCodexRuntime ? 'codex' : (isClaude || isDeepSeekLegacy) ? 'claude' : isKimi ? 'kimi' : isGemini ? 'gemini' : null;
+    if(opts.assistantMcpEntry) require('./hub-assistant/project-tools').configureProjectTools(kind,{...opts,id},spawnCwd);
     if (contextKind) {
       const contextHome = contextKind === 'codex' ? sessionEnv.CODEX_HOME || path.join(os.homedir(),'.codex')
         : contextKind === 'claude' ? sessionEnv.CLAUDE_CONFIG_DIR || path.join(os.homedir(),'.claude')
-        : contextKind === 'kimi' ? sessionEnv.KIMI_CODE_HOME || path.join(os.homedir(),'.kimi-code') : path.join(os.homedir(),'.gemini');
+        : contextKind === 'kimi' ? sessionEnv.KIMI_CODE_HOME || path.join(os.homedir(),'.kimi-code') : path.join(sessionEnv.GEMINI_CLI_HOME || os.homedir(),'.gemini');
       require('./agent-user-context').syncNativeUserContext({kind:contextKind,nativeHome:contextHome,env:sessionEnv,dataDir:getHubDataDir()});
     }
     if (followsGlobalAccount) codexSessionsRoot = opts.codexSessionsRoot;
@@ -1577,6 +1612,11 @@ class SessionManager extends EventEmitter {
         ...(followsGlobalAccount ? {accountId:globalAccount.id,ownershipHome:opts.codexHistoryHome,
           historyStorageHome:opts.codexHistoryStorageHome,
           resolveAccount:()=>{
+            const accounts=require('./codex-global-account');
+            return accounts.resolveRunningAccount(accounts.currentConfig(),{
+              id:ptyProcess.options.accountId,label:info.codexProfileLabel,
+              home:ptyProcess.options.env.CODEX_HOME});
+          },resolveLaunchAccount:()=>{
             const accounts=require('./codex-global-account');
             return accounts.resolveAccount(accounts.currentConfig());
           }} : {}),
@@ -1639,7 +1679,7 @@ class SessionManager extends EventEmitter {
       : null;
     const normalizedContextMax = normalizeCodexContextWindow(opts.contextMax);
     const effectiveContextMax = isCodexRuntime
-      ? (normalizedContextMax || resolveCodexContextWindow(currentModel && currentModel.id, null))
+      ? resolveCodexContextWindow(currentModel && currentModel.id, normalizedContextMax, { configDir: sessionEnv.CODEX_HOME })
       : (typeof opts.contextMax === 'number' ? opts.contextMax : null);
 
     const now = Date.now();
@@ -1649,6 +1689,7 @@ class SessionManager extends EventEmitter {
     const info = {
       id,
       kind,
+      freshLaunch,
       ...(isNativeClaude ? { runtimeBackend: 'claude-stream-json', nativeRuntime: ptyProcess.runtime,
         ccSessionId: ptyProcess.sessionId,
         nativeConfig: require('./claude-native-launch').claudeNativeResumeConfig({ ...opts,
@@ -2026,6 +2067,7 @@ class SessionManager extends EventEmitter {
 
     if (isGemini) {
       let cmd = ' gemini --approval-mode yolo';
+      if(opts.purpose==='hub-assistant')cmd+=' --skip-trust --allowed-mcp-server-names hub_assistant';
       cmd += ` --model ${opts.model || 'gemini-3-pro-preview'}`;
       if (opts.useResume && opts.geminiChatId && opts.geminiChatId.length > 8) {
         // Level 1: precise resume by full UUID.  The native id wins even when
@@ -2126,6 +2168,10 @@ class SessionManager extends EventEmitter {
         });
         info.hookIntegrationWarning = hookResult.errors.length ? hookResult.errors.join('；') : null;
         cmd += ` -c features.hooks=true`;
+        try {
+          const cliTheme = require('./cli-coldwhite-theme').ensureCodexTheme(sessionEnv, opts.hubUiTheme);
+          cmd += ` -c tui.theme=${cliTheme}`;
+        } catch (error) { console.warn('[CLI theme] Codex:', error.message); }
       }
       cmd += '\r\n';
       let sent = false;
@@ -2233,13 +2279,17 @@ class SessionManager extends EventEmitter {
       });
     }
     const meetingId = entry.info ? entry.info.meetingId : null;
-    const wasSuspended = !!entry.suspendRequestedAt;
+    // A CLI can exit before Hub enters graceful shutdown (for example when
+    // Windows closes the launcher console). That is not a request to remove
+    // the logical group member or its native conversation identity.
+    const unexpectedMemberExit = !!meetingId && !entry.closeRequestedAt && supportsRecoverableSession(entry.info);
+    const wasSuspended = !!entry.suspendRequestedAt || unexpectedMemberExit;
     const dormantInfo = wasSuspended
       ? {
         ...entry.info,
         status: 'dormant',
-        suspendedAt: entry.suspendRequestedAt,
-        suspendReason: entry.suspendReason || 'manual',
+        suspendedAt: entry.suspendRequestedAt || Date.now(),
+        suspendReason: entry.suspendReason || (unexpectedMemberExit ? 'process-exit' : 'manual'),
       }
       : null;
     if (entry.terminalSnapshot) entry.terminalSnapshot.dispose();
@@ -2458,6 +2508,40 @@ class SessionManager extends EventEmitter {
       byKind,
       items,
     };
+  }
+
+  // 「释放内存」面板用：每个活会话的终端进程 PID、身份与能否休眠。
+  // 能否休眠直接走 _evaluateSuspendEligibility，和真执行用同一套判据。
+  describeSessionsForMemory(options = {}) {
+    const now = Number(options.now) || Date.now();
+    const suspendOptions = { ...MEMORY_RELEASE_SUSPEND_OPTIONS, now };
+    const rows = [];
+    for (const [sessionId, session] of this.sessions) {
+      const info = session.info || {};
+      const verdict = this._evaluateSuspendEligibility(sessionId, suspendOptions);
+      const lastActivityAt = Math.max(
+        Number(session.startedAt) || 0, Number(session.lastInputAt) || 0, Number(session.lastOutputAt) || 0,
+      );
+      const ptyPid = Number(session.pty && session.pty.pid);
+      rows.push({
+        id: sessionId,
+        title: info.title || '',
+        kind: info.kind || '',
+        meetingId: info.meetingId || null,
+        pinned: info.pinned === true,
+        focused: this.focusedSessionId === sessionId,
+        running: session.agentTurnActive === true || info.status === 'running',
+        status: info.status || '',
+        nativeId: getSessionResumeIdentity(info) || null,
+        ptyPid: Number.isFinite(ptyPid) && ptyPid > 0 ? ptyPid : null,
+        lastActivityAt,
+        idleMs: Math.max(0, now - lastActivityAt),
+        suspendable: verdict.ok === true,
+        blockReason: verdict.ok ? null : (verdict.error || 'unknown'),
+        blockMessage: verdict.ok ? null : (verdict.message || ''),
+      });
+    }
+    return rows;
   }
 
   suspendSession(sessionId, options = {}) {
@@ -2726,7 +2810,7 @@ class SessionManager extends EventEmitter {
     return entry.codexEditorInput.load(text, data => {
       if (this.sessions.get(sessionId) !== entry) throw Object.assign(new Error('会话已变化，未提交'), {notSent:true});
       this.writeToSession(sessionId, data);
-    }, options);
+    }, {...options,preservePunctuation:entry.info.purpose==='hub-assistant'&&/[‘’“”]/.test(String(text))});
   }
 
   getNativeCodex(sessionId) {
@@ -2824,6 +2908,7 @@ class SessionManager extends EventEmitter {
     const s = this.sessions.get(sessionId);
     if (!s) return null;
     if (s.info.runtimeBackend === 'claude-stream-json' && event.signalSource !== 'claude-stream-json') return null;
+    s.info.freshLaunch = false;
     const observedAt = Number(event.observedAt || event.startedAt) || Date.now();
     s.agentTurnStartSeq = (s.agentTurnStartSeq || 0) + 1;
     s.agentTurnStartedAt = observedAt;
@@ -2845,6 +2930,18 @@ class SessionManager extends EventEmitter {
     };
     this.emit('agent-turn-started', payload);
     return payload;
+  }
+
+  prepareCodexFork(opts) {
+    return require('./codex-cross-account-fork').prepareCrossAccountCodexFork(opts, {
+      config: require('./codex-global-account').currentConfig(),
+    });
+  }
+
+  // 只读：CLI hook 报告的本轮是否仍在进行（AI 编排模式据此决定何时投递通知）。
+  isAgentTurnActive(sessionId) {
+    const s = this.sessions.get(sessionId);
+    return !!(s && s.agentTurnActive);
   }
 
   noteAgentTurnFinished(sessionId, event = {}) {
@@ -2911,7 +3008,7 @@ class SessionManager extends EventEmitter {
       const codexRelaunchModel = modelId || DEFAULT_MODEL_BY_KIND.codex;
       const codexReasoningArg = buildCodexReasoningConfigArg(normalizeCodexEffort(s.info && s.info.effort))
         + buildCodexSpeedTierArg(resolveCodexSpeedTier(runtimeKind, s.info && s.info.codexSpeedTier))
-        + buildCodexContextWindowArg(resolveCodexContextWindow(codexRelaunchModel, s.info && s.info.contextMax));
+        + buildCodexContextWindowArg(resolveCodexContextWindow(codexRelaunchModel, s.info && s.info.contextMax, { configDir: codexConfigDir }));
       ensureCodexMcpEntries(codexConfigDir, [], CODEX_MANAGED_MCP_NAMES);
       cmd = ` codex --dangerously-bypass-approvals-and-sandbox --model ${codexRelaunchModel}${codexReasoningArg}`;
       const relaunchMcpProfile = resolveCodexMcpProfile(runtimeKind, s.info && s.info.mcpProfile);
@@ -2927,7 +3024,7 @@ class SessionManager extends EventEmitter {
       });
       cmd += '\r\n';
     } else if (kind === 'gemini' || kind === 'gemini-resume') {
-      cmd = ` gemini --approval-mode yolo --model ${modelId || 'gemini-3-pro-preview'}\r\n`;
+      cmd = ` gemini --approval-mode yolo${s.info.purpose==='hub-assistant'?' --skip-trust --allowed-mcp-server-names hub_assistant':''} --model ${modelId || 'gemini-3-pro-preview'}\r\n`;
     } else if (kind === 'claude' || kind === 'claude-resume') {
       // 默认 --effort max（CLAUDE_HUB_NO_EFFORT_MAX=1 可关），但会话显式
       // 选过档位时必须沿用，不能在 CLI 原地重拉后静默回到 max。
@@ -2946,6 +3043,13 @@ class SessionManager extends EventEmitter {
       } else if (s.info?.fastMode === false) {
         const standardSettingsPath = resolveAsarUnpacked('claude-subscription-standard-settings.json');
         fastFlag = ` --settings "${standardSettingsPath.replace(/\\/g, '\\\\')}"`;
+      }
+      if (s.info?.purpose === 'hub-assistant' && autonomous) {
+        const fast = shouldUseClaudeFastSettings(cv, {fastMode:s.info.fastMode,autonomous});
+        const settingsFile = require('./claude-native-launch').prepareClaudeSettingsOverlay(
+          [ensureGroupChatSettings(getHubDataDir()),resolveAsarUnpacked(fast?'claude-subscription-fast-settings.json':'claude-subscription-standard-settings.json')],
+          {directory:path.join(getHubDataDir(),'native-agent-settings'),sessionId:sessionId+'-'+require('crypto').randomUUID(),overrides:{skipDangerousModePermissionPrompt:true}});
+        fastFlag = ` --settings "${settingsFile.replace(/\\/g, '\\\\')}"`;
       }
       // 单人和群聊都沿用自己的 MCP 档位；群聊与 autonomous 额外恢复 research config。
       const mcpPlan = (meetingId || (autonomous && s.claudeMcpConfigFile))
@@ -3014,9 +3118,12 @@ class SessionManager extends EventEmitter {
       meetingId: info.meetingId || null,
       title: info.title,
       kind: info.kind,
+      freshLaunch: info.freshLaunch === true,
       cwd: info.cwd,
       unreadCount: info.unreadCount,
       lastMessageTime: info.lastMessageTime,
+      // 本次进程启动（新建或恢复）的时刻；文件面板据此列出「本会话改动」。
+      ...(Number.isFinite(info.createdAt) ? { spawnedAt: info.createdAt } : {}),
       ...(typeof info.lastCompletedAt === 'number' ? { lastCompletedAt: info.lastCompletedAt } : {}),
       lastOutputPreview: info.lastOutputPreview,
       ...(info.pinned !== undefined ? { pinned: info.pinned } : {}),
@@ -3406,6 +3513,7 @@ async function readTranscriptTail(kind, sourcePath, n = 10, opts = {}) {
 
 module.exports = {
   SessionManager,
+  MEMORY_RELEASE_SUSPEND_OPTIONS,
   readTranscriptTail,
   dismissCodexUpdatePrompt,
   dismissCodexRateLimitDialog,

@@ -4,6 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const { HubChrome, defaultRoot } = require('./hub-chrome');
+const guard = require('./web-risk-guard');
 
 function argumentsOf(argv) {
   const args = [...argv];
@@ -38,7 +39,7 @@ function integrationStatus(root) {
     const connected = entries.filter(t => {
       if (typeof t.config !== 'string' || typeof t.entry !== 'string') return false;
       const config = read(t.config);
-      return config?.cli_entry === t.entry && fs.existsSync(t.entry);
+      return require('./hub-tool-binding').matchesBinding(t, config, { requireEntry: true });
     });
       return { tool, name: tool === 'images' ? '网页生图' : '中转工具', state: connected.length && connected.length === entries.length ? 'connected' : entries.length ? 'changed' : 'pending',
       identities: ['main', 'alt'].map(identity => ({ identity, count: connected.filter(t => t.identity === identity).length })).filter(i => i.count) };
@@ -54,7 +55,14 @@ class BrowserTool {
     this.file = path.join(binding.root, 'tool-pages', binding.id + '.json');
   }
   async target() {
-    const record = read(this.file), ep = await this.hub.endpoint();
+    const record = read(this.file);
+    if (!record) return null;
+    // A busy local CDP endpoint can miss its short health deadline while Chrome
+    // and the owned tab still exist. Recheck once before declaring the page gone.
+    const ep = await this.hub.endpoint() || await this.hub.endpoint();
+    // A missing health response is not proof that Chrome or the old task is gone.
+    // Keep its binding while the profile is held; opening again would orphan that task.
+    if (!ep && this.hub.profileHeld()) throw Error('Timeout: Hub browser endpoint unavailable; existing page preserved');
     if (!record || !ep || record.browserWs !== ep.ws || record.identity !== this.binding.identity) return null;
     const { CDP } = require('./web-roundtable/cdp');
     const cdp = await CDP.connect(ep.ws, ep.port);
@@ -62,39 +70,67 @@ class BrowserTool {
       const { targetInfos } = await cdp.call('Target.getTargets');
       const marker = targetInfos.find(t => t.url === this.hub.markerUrl(this.binding.identity));
       const target = targetInfos.find(t => t.targetId === record.targetId && t.type === 'page');
-      return marker && target && target.browserContextId === marker.browserContextId ? { ...record, ep } : null;
+      return marker && target && target.browserContextId === marker.browserContextId ? { ...record, ep, url: target.url } : null;
     } finally { cdp.close(); }
   }
   async open(url = 'about:blank') {
     const existing = await this.target();
     if (existing) return { targetId: existing.targetId, reused: true };
     const tab = await this.hub.openTab(this.binding.identity, url);
-    const ep = await this.hub.endpoint();
+    const ep = await this.hub.endpoint() || await this.hub.endpoint();
     try { save(this.file, { targetId: tab.targetId, browserWs: ep.ws, identity: this.binding.identity }); }
     catch (e) { await this.hub.closeTab(tab.targetId); throw e; }
     return { targetId: tab.targetId, reused: false };
   }
-  async withPage(fn) {
+  async withPage(fn, { downloads = false } = {}) {
+    guard.assertAutomationAllowed(this.binding.root, { identity: this.binding.identity });
     const target = await this.target();
     if (!target) throw Error('No browser session: owned Hub page is not open');
-    const chromium = this.chromium || require(this.binding.playwright).chromium;
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${target.ep.port}`);
+    guard.assertAutomationAllowed(this.binding.root, { identity: this.binding.identity });
+    // Attached to the owned page only: never the person's windows, other tools' tabs or the
+    // challenge frame inside a page (see scoped-cdp.js).
+    const connection = await this.connectPage(target, { downloads });
     try {
-      for (const context of browser.contexts()) for (const page of context.pages()) {
-        const cdp = await context.newCDPSession(page);
-        let info;
-        try { info = await cdp.send('Target.getTargetInfo'); } finally { await cdp.detach(); }
-        if (info.targetInfo.targetId === target.targetId) return await fn(page);
-      }
-      throw Error('No browser session: owned Hub page is not visible to the runtime');
-    } finally {
-      // For a CDP connection Playwright close disconnects its transport, not Chrome.
-      await browser.close();
-    }
+      guard.assertAutomationAllowed(this.binding.root, { identity: this.binding.identity, url: connection.page.url() });
+      return await guard.runProtected(this.binding.root, {
+        identity: this.binding.identity, page: connection.page, source: this.binding.id,
+      }, () => fn(connection.page));
+    } finally { await connection.close(); }
+  }
+  async connectPage(target, { downloads = false } = {}) {
+    const chromium = this.chromium || require(this.binding.playwright).chromium;
+    return require('./scoped-cdp').connectPage(chromium, target.ep, target.targetId, { downloads });
   }
   async execute(argv) {
     const [command, ...args] = argumentsOf(argv);
-    if (command === 'open') return this.open(args.find(a => !a.startsWith('--')) || 'about:blank');
+    const root = this.binding.root, identity = this.binding.identity;
+    if (guard.read(root).handoff) await guard.settleHandoff(this.hub).catch(() => {});
+    // A person asked to verify or sign in: the browser is theirs until they finish or 15 min pass.
+    if (command === 'human-open') {
+      const url = args.find(a => !a.startsWith('--')) || 'https://chatgpt.com/';
+      const { lease, cleared, site } = await this.hub.lifecycle(async () => {
+        // The guard has already parked a challenged task at about:blank. Close only
+        // this tool's verified, empty page so it cannot block an ordinary handoff.
+        const owned = await this.target();
+        if (owned?.url === 'about:blank') {
+          await this.hub.closeTab(owned.targetId);
+          fs.rmSync(this.file, { force: true });
+        }
+        return guard.openForHuman(this.hub, { identity, url, by: this.binding.id });
+      });
+      return { handoff: true, until: lease.until, site, cleared };
+    }
+    if (command === 'human-done') {
+      const site = guard.siteOf(args.find(a => !a.startsWith('--')) || 'https://chatgpt.com/');
+      const lease = guard.handoff(root);
+      if (lease && lease.identity === identity) guard.endHandoff(root, lease.id);
+      if (site) guard.releaseSite(root, identity, site);
+      return { handoff: false, site };
+    }
+    if (command === 'open') {
+      guard.assertAutomationAllowed(root, { identity });
+      return this.open(args.find(a => !a.startsWith('--')) || 'about:blank');
+    }
     if (command === 'close') {
       const target = await this.target();
       if (target) await this.hub.closeTab(target.targetId);
@@ -113,28 +149,72 @@ class BrowserTool {
       }
       return { managedBy: 'hub-chrome', exported: false };
     }
-    if (command === 'goto') return this.withPage(async page => { await page.goto(args[0], { waitUntil: 'domcontentloaded' }); return { url: page.url() }; });
+    if (command === 'goto') return this.withPage(async page => {
+      guard.assertAutomationAllowed(root, { identity, url: args[0] });
+      await page.goto(args[0], { waitUntil: 'domcontentloaded' });
+      if (await guard.inspectAndLeave(root, { identity, page, url: args[0], source: this.binding.id }))
+        throw Error('Site challenged: the page asked for human verification; left it and paused this site');
+      return { url: page.url() };
+    });
     if (command === 'run-code') {
       const at = args.indexOf('--filename');
       if (at < 0 || !args[at + 1]) throw Error('run-code requires a local filename');
       const source = require('./chatgpt-selector-compat').adaptSource(fs.readFileSync(args[at + 1], 'utf8'));
       // Trusted local tool code, identical authority to the original Playwright CLI.
       const fn = new Function('return (' + source + '\n)')();
-      return this.withPage(fn);
+      return this.withPage(async page => {
+        const result = await fn(page);
+        // Tool code that reports a human check (the image tool's login state does) gets the
+        // same treatment as a navigation that met one: record it and leave the page.
+        if (result && typeof result === 'object' && result.challenge === true) {
+          const site = guard.siteOf(page.url()) || 'unknown';
+          await page.goto('about:blank').catch(() => {});  // leave first; recording may fail
+          try { guard.recordChallenge(root, { identity, site, kind: 'reported', source: this.binding.id }); } catch {}
+        }
+        return result;
+      }, { downloads: /\bwaitForEvent\s*\(\s*['"]download['"]/.test(source) });
     }
     throw Error('Unsupported Hub browser command: ' + command);
   }
 }
+// The account page shows how the company bridge's last step on its login went. Image
+// results come from the image queue itself (hub-account-activity.js).
+function noteActivity(binding, argv, outcome) {
+  const [command] = argumentsOf(argv);
+  if (binding.tool !== 'bridge' || !['goto', 'run-code'].includes(command) || !outcome) return;
+  try { require('./hub-account-activity').recordActivity(binding.root, { identity: binding.identity, site: 'chatgpt', source: 'bridge', outcome }); } catch {}
+}
+function bridgeOutcome(result) {
+  if (result?.challenge === true || result?.cloudflare === true) return 'verification_required';
+  if (['login_required', 'credential_required', 'account_selection_required'].includes(result?.auth_state)) return 'login_required';
+  if (result?.logged_in === false) return 'failed';
+  return 'success';
+}
+function failureCategory(error) {
+  const message=String(error?.message || ''), network=message.match(/\b(?:ERR_[A-Z_]+|ECONN[A-Z]+)\b/);
+  return /^Unsupported Hub browser command/.test(message) ? 'Unsupported command'
+    : /^Human handoff/.test(message) ? 'Human handoff'
+    : /^Site challenged/.test(message) ? 'Site challenged'
+    : /No browser session/.test(message) ? 'No browser session'
+    : /IMAGE_TOOL_UNAVAILABLE/.test(message) ? 'IMAGE_TOOL_UNAVAILABLE'
+    : /strict mode violation/.test(message) ? 'strict mode violation'
+    : /Target.*closed/.test(message) ? 'Target closed'
+    : network ? 'Network ' + network[0]
+    : /Timeout|timeout/.test(message) ? 'Timeout' : 'Hub browser operation failed';
+}
 async function main(binding, argv = process.argv.slice(2)) {
-  try { const result = await new BrowserTool(binding).execute(argv); process.stdout.write(JSON.stringify({ result: result ?? null }) + '\n'); }
-  catch (e) {
+  try {
+    const result = await new BrowserTool(binding).execute(argv);
+    noteActivity(binding, argv, bridgeOutcome(result));
+    process.stdout.write(JSON.stringify({ result: result ?? null }) + '\n');
+  } catch (e) {
     // Native tools classify these categories; never print evaluated code or page contents.
-    const category = /No browser session/.test(e.message) ? 'No browser session'
-      : /IMAGE_TOOL_UNAVAILABLE/.test(e.message) ? 'IMAGE_TOOL_UNAVAILABLE'
-      : /strict mode violation/.test(e.message) ? 'strict mode violation'
-      : /Target.*closed/.test(e.message) ? 'Target closed'
-      : /Timeout|timeout/.test(e.message) ? 'Timeout' : 'Hub browser operation failed';
+    const category = failureCategory(e);
+    // A person holding the browser is not a failure of the tool.
+    noteActivity(binding, argv, category === 'Site challenged' ? 'verification_required' : category === 'Human handoff' ? null
+      : category.startsWith('Network ') ? 'network_error'
+      : /strict mode violation|IMAGE_TOOL_UNAVAILABLE/.test(category) ? 'adapter_changed' : 'failed');
     process.stdout.write(JSON.stringify({ isError: true, error: category }) + '\n'); process.exitCode = 1;
   }
 }
-module.exports = { BrowserTool, main, argumentsOf, validateBinding, save, read, integrationStatus };
+module.exports = { BrowserTool, main, noteActivity, bridgeOutcome, failureCategory, argumentsOf, validateBinding, save, read, integrationStatus };

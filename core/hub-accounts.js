@@ -8,7 +8,7 @@ const ROUNDTABLE_PROVIDER = { chatgpt: 'chatgpt', google: 'gemini', deepseek: 'd
 
 class HubAccounts {
   constructor({ hubChrome, getConfig = () => require('./hub-config').getConfig(), env = process.env, recovery, now = Date.now, inspect = inspectAccounts, getToolCatalog } = {}) {
-    this.chrome = hubChrome || new HubChrome({ env });
+    this.chrome = hubChrome || new HubChrome({ env, proxy: () => getConfig().proxy });
     Object.assign(this, { getConfig, env, recovery, now, inspect, getToolCatalog });
     this.checking = null; this.progress = null; this.lastState = null;
     this.setup = new (require('./hub-browser-setup').HubBrowserSetup)({ root: this.chrome.root, env });
@@ -72,9 +72,18 @@ class HubAccounts {
     return this.reading;
   }
   async passiveState() { return this.publicState(await this.compose({ passive: true })); }
-  publicState(value = this.lastState) { return JSON.parse(JSON.stringify({ ...value,
+  // Paused sites and a person's handoff, for the account page. Reading is file-only; while a
+  // handoff runs, a browser-level target listing ends it once the person closed the window.
+  riskState() {
+    const guard = require('./web-risk-guard'), now = this.now(), risk = guard.read(this.chrome.root);
+    if (risk.handoff) guard.settleHandoff(this.chrome).catch(() => {});
+    return { handoff: guard.handoff(this.chrome.root, now),
+      sites: Object.fromEntries(Object.entries(risk.sites).filter(([, e]) => e.until > now).map(([k, e]) => [k, { until: e.until, strikes: e.strikes, kind: e.kind }])) };
+  }
+  publicState(value = this.lastState) { return JSON.parse(JSON.stringify({ ...value, risk: this.riskState(),
     ...(this.setup.progress?.status === 'complete' ? { tools: require('./hub-browser-tool').integrationStatus(this.chrome.root) } : {}),
     activity: require('./hub-account-activity').readActivity(this.chrome.root, this.env),
+    webTools: require('./web-tool-status').readWebTools({ root: this.chrome.root, env: this.env, recovery: this.recovery, now: this.now() }),
     progress: this.progress, setupProgress: this.setup.progress })); }
   async compose({ passive = false } = {}) {
     const cache = this.readCache(), preferences = readPreferences(this.chrome.root);
@@ -95,7 +104,8 @@ class HubAccounts {
       identities.push({ id: identity.id, label: identity.label, account, accountStale: !status.account && !!account, sites });
     }
     const clis = cliAuthStatus({ env: this.env, config: this.getConfig(), now: this.now() }).map(cli => ({ ...cli, identity: this.owner(cli, identities) }));
-    return { chrome: { running, loginOpen: passive ? null : !running && this.chrome.profileHeld(), root: this.chrome.root }, identities, clis, preferences,
+    let network;try{network=this.chrome.routingStatus?.();}catch(e){network={state:'invalid',message:e.message};}
+    return { chrome: { running, loginOpen: passive ? null : !running && this.chrome.profileHeld(), root: this.chrome.root, network }, identities, clis, preferences,
       tools: require('./hub-browser-tool').integrationStatus(this.chrome.root), checkedAt: cache.checkedAt || 0 };
   }
   async startCheck({ identity, site } = {}) {
@@ -160,7 +170,10 @@ class HubAccounts {
     for (const identity of identities.filter(i => i.id === 'main')) for (const site of identity.sites) {
       const provider = ROUNDTABLE_PROVIDER[site.key];
       if (!provider || site.state !== 'signed_in' || !site.live || site.stale) continue;
-      try { await this.recovery.resume({ managedBrowser: true, provider }); }
+      try {
+        const result = await this.recovery.resume({ managedBrowser: true, provider });
+        if (result.errors?.length && this.progress) (this.progress.warnings ||= []).push((site.name || site.key) + '：部分原任务未恢复，请在原会话查看任务状态');
+      }
       catch (e) { if (this.progress) (this.progress.warnings ||= []).push((site.name || site.key) + '：任务恢复失败，' + e.message); }
     }
   }
@@ -178,15 +191,17 @@ class HubAccounts {
     if (identity === 'alt' && !prefs.secondary) throw Error('请先添加第二个账号');
     this.chrome.identity(identity);
     const fixture = this.fixture();
+    let opened;
     if (fixture?.recordOpens) {
       fs.appendFileSync(path.join(this.env.CLAUDE_HUB_HOME_DIR, 'accounts-open.jsonl'), JSON.stringify({ identity, site, url: SITES[site].url }) + '\n');
     } else if (login) await this.chrome.openLogin(identity, [site]);
-    else await this.chrome.openWebsite(identity, site);
+    else opened = await this.chrome.openWebsite(identity, site);
     this.lastState = null;
     let usageWarning = '';
     try { require('./hub-account-activity').recordActivity(this.chrome.root, { identity, site, outcome: 'opened', at: this.now() }); }
     catch { usageWarning = '；使用记录未保存'; }
-    return { identity, site, message: '已在 AI Hub 专属 Chrome 打开 ' + SITES[site].name + usageWarning };
+    const handoff = opened?.handoff ? '。网页工具已暂停并断开，你关掉这个窗口后自动恢复（最多 15 分钟）' : '';
+    return { identity, site, message: '已在 AI Hub 专属 Chrome 打开 ' + SITES[site].name + handoff + usageWarning };
   }
   async login({ identity = 'main', site } = {}) {
     if (site) return this.open({ identity, site, login: true });

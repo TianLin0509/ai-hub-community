@@ -28,7 +28,9 @@ const MARKERS = {
   // ready before the TUI input box exists.
   // 0.153 新会话的底栏不再有 "Context N% left"（首轮之后才出现），输入行是
   // `› <占位建议>`。选项菜单也用 `› 1. …`，所以提示符后面跟「数字.」的不算。
-  codex: ['Context ', /(?:^|\n)\s*›\s+(?!\d+\.\s)\S/],
+  // 0.159.3 may position the first input row with cursor moves and no LF.
+  // This native placeholder survives ConPTY stripping; launch args never contain it.
+  codex: ['Context ', 'Ask Codex to do anything', /(?:^|\n)\s*›\s+(?!\d+\.\s)\S/],
   deepseek: ['shift+tab', '? for shortcuts', 'bypass permissions', 'Try "edit'],
   // Kimi Code 官方 TUI 状态栏稳定显示小写 `context:`。不能设为强 marker：
   // 未登录启动也会短暂渲染状态栏，随后才显示 OAuth login expired。
@@ -69,6 +71,10 @@ const STALEABLE_BLOCKERS = {
 // 直接在原始字节上找 "manual mode on" 这类多词标记永远找不到。先还原成可读文字。
 function terminalText(buf) {
   return String(buf || '')
+    // Codex 0.159.3 paints its input at ESC[33;1H without a line feed.
+    // Preserve that row boundary before stripping ANSI, so the input marker
+    // cannot become attached to the preceding splash-screen artwork.
+    .replace(/\x1b\[(?:\d+;)?1[Hf]/g, '\n')
     .replace(/\x1b\[(\d*)C/g, (_m, n) => ' '.repeat(Math.min(Number(n) || 1, 200)))
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
     .replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '')

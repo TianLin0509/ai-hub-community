@@ -1,8 +1,11 @@
 'use strict';
 
 const systemOs = require('os');
+const { registerPreviewImmersiveIpc } = require('./preview-immersive-handlers.js');
 const { createSystemTelemetry } = require('../../core/system-telemetry.js');
 const { createLiveResourceTelemetry } = require('../../core/live-resource-telemetry.js');
+const { createClashVergeDelayReader } = require('../../core/clash-verge-delay.js');
+const { createVpnTrafficRecorder } = require('../../core/vpn-traffic-recorder.js');
 
 function readCpuTotals(osApi) {
   const cpus = osApi.cpus();
@@ -79,8 +82,10 @@ function saveClipboardImage(deps) {
 }
 
 function registerAppUtilityIpc(ipcMain, deps) {
+  registerPreviewImmersiveIpc(ipcMain, deps);
   const sampleSystemResourceUsage = createSystemResourceSampler(deps.os || systemOs);
   const systemTelemetry = deps.systemTelemetry || createSystemTelemetry();
+  const clashDelay = deps.clashDelay || createClashVergeDelayReader();
   const liveTelemetry = deps.liveTelemetry || createLiveResourceTelemetry();
   ipcMain.handle('get-network-transfer-usage', () => liveTelemetry.sampleNetwork());
   ipcMain.handle('get-resource-top-processes', () => liveTelemetry.sampleProcesses());
@@ -101,15 +106,34 @@ function registerAppUtilityIpc(ipcMain, deps) {
 
   ipcMain.handle('get-system-resource-usage', async (_event, options = {}) => {
     const coreUsage = sampleSystemResourceUsage();
-    // The permanent sidebar uses CPU/memory only. Do not spawn nvidia-smi
-    // or query disks for values no visible UI consumes.
-    if (options.extended === false) return coreUsage;
+    // Reuse the bounded GPU (10 s) and disk (60 s) caches for the compact footer.
+    if (options.extended === false) {
+      const [gpu, disk] = await Promise.allSettled([
+        systemTelemetry.sampleGpu?.(), systemTelemetry.sampleDisk?.(),
+      ]);
+      return { ...coreUsage, gpu: gpu.status === 'fulfilled' ? gpu.value || null : null,
+        disk: disk.status === 'fulfilled' ? disk.value || null : null };
+    }
     try {
       const extended = await systemTelemetry.sample({ force: options && options.force === true });
       return { ...coreUsage, ...extended };
     } catch {
       return coreUsage;
     }
+  });
+
+  ipcMain.handle('get-clash-proxy-delay', () => clashDelay.sample());
+
+  // VPN 流量账本：只有传入数据目录时才启动（单测注册 IPC 时不起后台轮询）。
+  const vpnTraffic = deps.vpnTraffic
+    || (deps.vpnTrafficDir ? createVpnTrafficRecorder({ dir: deps.vpnTrafficDir }) : null);
+  if (vpnTraffic && !deps.vpnTraffic) {
+    vpnTraffic.start();
+    deps.app?.on?.('will-quit', () => vpnTraffic.stop());
+  }
+  ipcMain.handle('get-vpn-traffic-report', (_event, options = {}) => {
+    if (!vpnTraffic) return { status: { recording: false, holder: 'none', error: 'recorder-disabled' } };
+    return vpnTraffic.report(options && options.range);
   });
 
   ipcMain.handle('get-network-egress-status', (_event, options = {}) => {

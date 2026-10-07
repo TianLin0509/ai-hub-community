@@ -27,6 +27,10 @@ function groupInputTuningFrame(screen) {
 }
 
 if (typeof document !== 'undefined') (function () {
+  async function copyGroupText(text) {
+    const result = await clipboardController.copyText(text,{source:'group-card',silent:true});
+    if (!result.ok) throw new Error(result.reason || '复制失败');
+  }
   const { ipcRenderer } = require('electron');
   const { speedControl } = require('../core/session-speed.js');
   const { isSlotParticipatingThisTurn } = require('../core/meeting-room.js');
@@ -60,8 +64,16 @@ if (typeof document !== 'undefined') (function () {
   // 开发群聊「先讨论再开工」的阶段判断与收敛文本，和主进程 dispatcher 共用同一份。
   const DevDiscuss = require('../core/dev-discuss.js');
   const DevFile = require('../core/dev-file-workflow.js');
+  const GroupAnswers = require('../core/group-answer-files.js');
   const Delivery = require('../core/delivery-workflow.js');
   const DeliveryControls = require('./delivery-workflow-controls.js');
+  const OrchUI = require('./orchestration-ui.js');
+  OrchUI.init(meetingId => {
+    const m = meetingData[meetingId];
+    if (!m || activeMeetingId !== meetingId) return;
+    _updateInputPreflight(m);
+    void refreshGroupChatPanel(m);
+  });
   const Recipients = require('../core/groupchat-recipients.js');
   const SourceFinal = require('../core/groupchat-source-final.js');
   const _devFileStates = {}, _devFileRequests = new Set();
@@ -329,6 +341,7 @@ if (typeof document !== 'undefined') (function () {
     _setupQuestionDirectory(panel, meeting);
     _enhanceGroupCardContent(panel);
     _enhanceCodeBlocks(panel);
+    panel._groupSelection?.sync();
     _setupGcSearch(panel);
     _renderHeroDock(meeting);
     if (opts.scroll) {
@@ -417,7 +430,7 @@ if (typeof document !== 'undefined') (function () {
     _updateInputPreflight(meetingData[activeMeetingId]);
   }
 
-  function _addQuoteChip(meeting, sid, text) {
+  function _addQuoteChip(meeting, sid, text, sourceTurn = null) {
     if (!sid || !text || !text.trim()) return;
     if (_gcQuoteChips.length >= 5) return;  // 最多 5 条引用 (避免 prompt 爆炸)
     const slots = _getGcSlots(meeting);
@@ -426,12 +439,12 @@ if (typeof document !== 'undefined') (function () {
     if (!slot) return;
     const cached = _gcPanelState[meeting.id];
     const turnsArr = (cached && Array.isArray(cached.turns)) ? cached.turns : [];
-    const turnN = turnsArr.length > 0 ? (turnsArr[turnsArr.length - 1].n || turnsArr.length) : 1;
+    const turnN = Number(sourceTurn) || (turnsArr.length > 0 ? (turnsArr[turnsArr.length - 1].n || turnsArr.length) : 1);
     _gcQuoteChips.push({
       sid, slotIndex,
       slotLabel: slot.label || sid.slice(0, 8),
       turnN,
-      text: text.trim().slice(0, 500),  // 单条最长 500 字符
+      text: text.trim(),  // Preserve the complete passage selected by the user.
     });
     _renderQuoteChips();
   }
@@ -445,7 +458,7 @@ if (typeof document !== 'undefined') (function () {
   // mouseup 选区检测 + 浮按钮 (IIFE 顶层一次性挂)
   document.addEventListener('mouseup', function _gcQuoteSelHandler(ev) {
     if (!ev.target || typeof ev.target.closest !== 'function') return;
-    const card = ev.target.closest('.mr-ft[data-ft-sid]');
+    const card = ev.target.closest('.mr-gc-msg.ai[data-source-sid], .mr-ft[data-ft-sid]');
     const hideBtn = () => { if (_gcQuoteFloatBtn) _gcQuoteFloatBtn.style.display = 'none'; };
     if (!card) { hideBtn(); return; }
     const sel = window.getSelection();
@@ -453,8 +466,10 @@ if (typeof document !== 'undefined') (function () {
     if (!selText || selText.length < 2) { hideBtn(); return; }
     // 选区起点必须在卡片 bottom 区(.mr-ft-bottom)内 — 排除 row1/row2 状态文本被误选
     const anchorEl = sel.anchorNode && (sel.anchorNode.nodeType === 1 ? sel.anchorNode : sel.anchorNode.parentElement);
-    if (!anchorEl || !anchorEl.closest('.mr-ft-bottom')) { hideBtn(); return; }
-    const sid = card.getAttribute('data-ft-sid');
+    const body = card.querySelector('.gc-journal-text, .mr-ft-bottom');
+    const focusEl = sel.focusNode && (sel.focusNode.nodeType === 1 ? sel.focusNode : sel.focusNode.parentElement);
+    if (!body || !body.contains(anchorEl) || !body.contains(focusEl)) { hideBtn(); return; }
+    const sid = card.dataset.sourceSid || card.getAttribute('data-ft-sid');
     if (!sid) { hideBtn(); return; }
     let range; try { range = sel.getRangeAt(0); } catch { hideBtn(); return; }
     const rect = range.getBoundingClientRect();
@@ -473,17 +488,21 @@ if (typeof document !== 'undefined') (function () {
         const fText = _gcQuoteFloatBtn.dataset.text;
         const mid = activeMeetingId;
         const meeting = meetingData[mid];
-        if (fSid && fText && meeting) _addQuoteChip(meeting, fSid, fText);
+        if (fSid && fText && meeting && _gcQuoteFloatBtn.dataset.meetingId === mid) {
+          _addQuoteChip(meeting, fSid, fText, _gcQuoteFloatBtn.dataset.turn);
+        }
         _gcQuoteFloatBtn.style.display = 'none';
         try { window.getSelection().removeAllRanges(); } catch {}
       });
     }
+    _gcQuoteFloatBtn.dataset.meetingId = activeMeetingId;
+    _gcQuoteFloatBtn.dataset.turn = card.dataset.readTurn || String(_gcViewingTurnN[activeMeetingId] || "");
     _gcQuoteFloatBtn.dataset.sid = sid;
     _gcQuoteFloatBtn.dataset.text = selText;
     _gcQuoteFloatBtn.style.display = 'inline-flex';
     // 选区右上方 + window scroll 偏移
-    _gcQuoteFloatBtn.style.top = `${rect.top + window.scrollY - 34}px`;
-    _gcQuoteFloatBtn.style.left = `${rect.right + window.scrollX - 90}px`;
+    _gcQuoteFloatBtn.style.top = `${Math.max(8, rect.top + window.scrollY - 34)}px`;
+    _gcQuoteFloatBtn.style.left = `${Math.max(8, Math.min(window.innerWidth - 120, rect.right + window.scrollX - 90))}px`;
   });
 
   // F0 + F3 Phase 1/2 + Phase 5: 全局 Esc — 退出聚焦/对比/时光机。IIFE 顶层挂载, 只挂一次。
@@ -887,11 +906,17 @@ if (typeof document !== 'undefined') (function () {
         if (mrPanel) mrPanel.appendChild(panel);
       }
     }
+    if (!panel._groupSelection) panel._groupSelection = require('./group-card-selection').mountGroupCardSelection({
+      panel, getMeetingId: () => activeMeetingId,
+      extractText: extractVisibleCardText,
+      copyText: (text, options) => clipboardController.copyText(text, options),
+    });
     return panel;
   }
 
   function _removeGcPanel() {
     const p = document.getElementById('mr-group-chat-panel');
+    p?._groupSelection?.destroy();
     if (p && p.parentElement) p.remove();
   }
 
@@ -1435,11 +1460,12 @@ if (typeof document !== 'undefined') (function () {
     overlay.querySelector('.mr-gc-prompt-modal-close').addEventListener('click', close);
     overlay.addEventListener('click', (ev) => { if (ev.target === overlay) close(); });
     overlay.querySelector('.mr-gc-prompt-modal-copy').addEventListener('click', async (ev) => {
+      const button = ev.currentTarget;
       try {
-        await navigator.clipboard.writeText(prompt);
-        ev.currentTarget.textContent = '已复制';
+        await copyGroupText(prompt);
+        button.textContent = '已复制';
       } catch {
-        ev.currentTarget.textContent = '复制失败';
+        button.textContent = '复制失败';
       }
     });
     document.addEventListener('keydown', onKeydown);
@@ -2166,8 +2192,9 @@ if (typeof document !== 'undefined') (function () {
         }
       }
       if (parts.length && typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(parts.join('\n\n---\n\n'));
-        try { _showGcEscapeNotice('已复制本轮 ' + parts.length + ' 家回答到剪贴板', 'info'); } catch {}
+        copyGroupText(parts.join('\n\n---\n\n')).then(()=>{
+          _showGcEscapeNotice('已复制本轮 ' + parts.length + ' 家回答到剪贴板', 'info');
+        }).catch(()=>_showGcEscapeNotice('复制失败，请重试', 'error'));
       }
     }
   }
@@ -2285,7 +2312,7 @@ if (typeof document !== 'undefined') (function () {
       : '等你抛话题';
 
     // D1 Phase 4(2026-05-05 maintainer): AI 群聊角色 PNG 头像 stack(与卡片头像一致)
-    //   groupChat uses company logos instead of slot-bound Pokemon avatars.
+    // Brand character artwork is shared with ordinary chat cards.
     const slots = _getGcSlots(meeting);
     const avatarsHtml = sids.map((sid, idx) => {
       const slot = slots[idx] || {};
@@ -2432,9 +2459,7 @@ if (typeof document !== 'undefined') (function () {
   }
 
   function _groupLogoSrc(kind) {
-    // *-resume 复用基础 kind 的 svg（assets 里没有 *-resume.svg）
-    const base = String(kind || 'claude').replace(/-resume$/, '');
-    return `assets/ai-logos/${escapeHtml(['deepseek-acp','deepseek-legacy'].includes(base) ? 'deepseek' : base)}.svg`;
+    return _avatarSrcFor(kind) || '';
   }
 
   function _formatGroupChatTime(ts) {
@@ -2442,7 +2467,7 @@ if (typeof document !== 'undefined') (function () {
   }
 
   function _renderGroupAvatar(slot, isUser) {
-    if (isUser) return '<div class="mr-gc-avatar mr-gc-avatar-user">我</div>';
+    if (isUser) return `<div class="mr-gc-avatar mr-gc-avatar-user"><img src="${require('./chat-avatar').USER_AVATAR_SRC}" alt="你 · AI Hub" /></div>`;
     if (!slot) return '<div class="mr-gc-avatar mr-gc-avatar-fallback">AI</div>';
     const label = slot.displayLabel || slot.label || slot.kind || 'AI';
     const title = `打开 ${label} 的 CLI 会话`;
@@ -2481,10 +2506,46 @@ if (typeof document !== 'undefined') (function () {
     return r.length > 60 ? r.slice(0, 60) + '…' : r;
   }
 
+  // Markdown answers (core/group-answer-files.js): a member's card shows the file
+  // it wrote, or that it has not handed one in yet. No transcript states here —
+  // problems show on the member's session in the sidebar.
+  function _renderAnswerCard(message, meeting, memberBySid) {
+    const slot = memberBySid[message.sid];
+    const session = typeof sessions !== 'undefined' && sessions.get(message.sid);
+    // Unregistered messages (history before the switch, legacy fallbacks) keep their stored text;
+    // registered members only ever get content from their file.
+    const answer = message.answer || null, text = String(message.content || '');
+    const badge = !answer ? '' : answer.state === 'draft' ? '草稿' : answer.outcome === 'rework' ? '需返工' : answer.outcome === 'blocked' ? '阻塞' : '';
+    const body = text.trim()
+      ? `<div class="mr-gc-md">${require('./conversation-message-view').renderMessageBody(text, { isUser: false, escapeHtml,
+        renderMarkdown: t => _renderMarkdown(t, session?.cwd || meeting.workspace || _activeMeetingCwd()), foldLong: false })}</div>`
+      : '<div class="mr-gc-md mr-gc-empty-placeholder">还没交</div>';
+    const journal = require('./groupchat-journal');
+    const copy = text.trim() ? '<button type="button" class="mr-gc-copy-btn" data-gc-copy-message="1" title="复制此条消息" aria-label="复制此条消息">📋</button>' : '';
+    const prompt = message.sourcePrompt ? `<button type="button" class="mr-gc-prompt-btn" data-gc-view-prompt="${escapeHtml(message.id || '')}" title="查看本轮发给该 AI 的 prompt">查看本轮输入</button>` : '';
+    const time = _formatGroupChatTime(answer?.at || message.createdAt);
+    const kindCls = slot && slot.kind ? ` ai-name-${slot.kind}` : '';
+    // Resend this turn's question to this member only: visible while nothing is handed in, in 更多 otherwise.
+    const resend = message.sid ? `<button type="button" class="mr-gc-retry-btn${text.trim() ? '' : ' is-failure'}" data-gc-resend-member="${escapeHtml(message.sid)}" data-gc-retry-turn="${escapeHtml(message.turnNum || '')}" title="把本轮问题重新发给这位成员；它写好回答文件后卡片自动更新">重新发送</button>` : '';
+    const unread = !!text.trim() && answer?.state !== 'draft';
+    return `
+      <article ${journal.attributes(meeting, message, escapeHtml, { defaultMinimized: OrchUI.defaultMinimized(meeting, message) })} class="mr-gc-msg ai${slot ? ` slot-${(slot.slotIndex || 0) + 1}` : ''}${text.trim() ? '' : ' answer-missing'}" data-gc-msg-id="${escapeHtml(message.id || '')}" data-user-question="false" data-source-sid="${escapeHtml(message.sid || '')}" data-read-turn="${escapeHtml(message.turnNum || '')}" data-unread-answer="${unread}" data-phase="message" data-answer-state="${escapeHtml(answer ? answer.state : 'none')}">
+        ${_renderGroupAvatar(slot, false)}
+        <div class="mr-gc-msg-body">
+          <div class="mr-gc-meta"><span class="mr-gc-name${kindCls}">${escapeHtml(message.speaker || (slot && slot.displayLabel) || 'AI')}</span>${OrchUI.roleBadge(meeting, message, escapeHtml)}${badge ? `<span class="mr-gc-to-badge">${escapeHtml(badge)}</span>` : ''}${time ? `<span>${escapeHtml(time)}</span>` : ''}${OrchUI.peek(meeting, message, escapeHtml)}${journal.actions({ copy, prompt, retry: text.trim() ? resend : '', submit: text.trim() ? '' : resend, minimize: true })}</div>
+          <div class="mr-gc-bubble-row"><div class="mr-gc-bubble"><div class="gc-journal-reading">${journal.disclosure()}<div class="gc-journal-text">${body}</div></div></div></div>
+        </div>
+      </article>`;
+  }
+
   function _renderGroupChatMessage(message, meeting, memberBySid, opts = {}) {
+    if (!OrchUI.messageVisible(meeting, message)) return '';
     const sourceSession = typeof sessions !== 'undefined' && sessions.get(message.sid);
     const renderMarkdown = text => _renderMarkdown(text, sourceSession?.cwd || meeting.workspace || _activeMeetingCwd());
     if (!message) return '';
+    if (message.role === 'assistant' && !message.systemNote && !message.supplementReply && !message.committeeAct && GroupAnswers.enabled(meeting)) {
+      return _renderAnswerCard(message, meeting, memberBySid);
+    }
     // 系统提示（循环自愈的每一次动作都会留一行）：不是谁的发言，不给气泡也不给重发按钮，
     // 只在时间线上留一条居中的细线 —— 但必须看得见，静默重试才是真正的损失。
     if (message.systemNote) {
@@ -2497,7 +2558,7 @@ if (typeof document !== 'undefined') (function () {
     const isUser = message.role === 'user';
     const slot = isUser ? null : memberBySid[message.sid];
     const slotCls = slot ? ` slot-${(slot.slotIndex || 0) + 1}` : '';
-    const label = isUser ? (isDispatchCard(message)?'工作流':'我') : (message.speaker || (slot && slot.displayLabel) || 'AI');
+    const label = isUser ? (isDispatchCard(message)?(OrchUI.dispatchLabel(message) || '工作流'):'我') : (message.speaker || (slot && slot.displayLabel) || 'AI');
     // 投委会发言（committeeAct）：幕次 badge + 气泡左侧色条标识（折叠交给通用「长回答折叠」，不重复做）
     const cAct = message.committeeAct || '';
     let actBadge = '';
@@ -2592,6 +2653,11 @@ if (typeof document !== 'undefined') (function () {
         : status === 'absent' ? '本轮已跳过该 AI，无回答。'
         : '本轮未提取到内容。点「同步」从 transcript 重新提取。';
       body = `<div class="mr-gc-md mr-gc-empty-placeholder">${escapeHtml(ph)}</div>`;
+    } else if (isUser && isDispatchCard(message) && OrchUI.dispatchLabel(message)) {
+      // 编排群：Hub 给编排员的通知、编排员派给成员的问题，默认折叠，点开看原文。
+      const notice = message.dispatch.kind === 'orch-notice';
+      const firstLine = String(contentStr || '').split(/\r?\n/).map(s => s.trim()).find(s => s && s !== '【Hub 通知】') || '';
+      body = `<details class="mr-gc-dispatch-details mr-orch-dispatch"><summary>${escapeHtml(notice ? 'Hub 通知编排员：' : '编排员派给 ' + (message.dispatch.toLabels || []).join('、') + '：')}${escapeHtml(firstLine.replace(/^-\s*/, '').slice(0, 90))}</summary><div class="mr-gc-md conversation-user-text">${escapeHtml(contentStr || '')}</div></details>`;
     } else if (isUser && isDispatchCard(message) && message.dispatch?.kind==='delivery') {
       body=require('./delivery-dispatch-view').render(message,escapeHtml);
     } else if (isUser && isDispatchCard(message)) {
@@ -2609,7 +2675,7 @@ if (typeof document !== 'undefined') (function () {
       body = `<div class="mr-gc-md">${require('./conversation-message-view').renderMessageBody(contentStr,
         {isUser,escapeHtml,renderMarkdown,foldLong:isUser,plainProgress:DevFile.enabled(meeting) && (message.phase==='commentary' || message.status==='progress_update')})}</div>`;
     }
-    if (!isUser) body = `<div class="gc-journal-text">${body}</div>`;
+    if (!isUser) body = `<div class="gc-journal-reading">${require('./groupchat-journal').disclosure()}<div class="gc-journal-text">${body}</div></div>`;
     const sequence = message.displayMessages || [];
     const hasFinal = sequence.some(m=>['final','final_answer'].includes(m.phase));
     if (!isUser && !isPending && (hasFinal || ['completed','manual_extracted'].includes(status))
@@ -2645,7 +2711,7 @@ if (typeof document !== 'undefined') (function () {
     // 派发卡片是流程自己发的，不给「作为新一轮重发/放回输入框」——那两个按钮的语义是
     // 「把我提的问题再问一遍」，对着评审指令按下去只会凭空多出一轮。
     const userTurnActions = (isUser && !isDispatchCard(message))
-      ? `<button type="button" class="mr-gc-turn-action" data-gc-resend-turn="${anchorId}" title="把这条问题作为新一轮重发">↻</button><button type="button" class="mr-gc-turn-action" data-gc-edit-turn="${anchorId}" title="放回输入框编辑后再发">✏</button>`
+      ? `<button type="button" class="mr-gc-turn-action" data-gc-resend-turn="${anchorId}" title="把这条问题作为新一轮重发">重发这条消息</button><button type="button" class="mr-gc-turn-action" data-gc-edit-turn="${anchorId}" title="放回输入框编辑后再发">编辑重发</button>`
       : '';
     // 2026-06-28 maintainer [改进3]：回答字数标签（仅 AI）；[改进5]：AI 名字按 kind 上品牌色（.ai-name-<kind>）
     const kindCls = (!isUser && slot && slot.kind) ? ` ai-name-${slot.kind}` : '';
@@ -2659,7 +2725,7 @@ if (typeof document !== 'undefined') (function () {
     const supplementReceipt = isUser && message.supplementDelivery ? `<span class="mr-supplement-receipt">${escapeHtml(require('./supplement-receipt').format(message.supplementDelivery))}</span>` : '';
     const attemptBadge = attemptLabel ? `<span class="mr-gc-to-badge is-retry">${escapeHtml(attemptLabel)}</span>` : '';
     const journal = require('./groupchat-journal');
-    const journalActions = !isUser ? journal.actions({copy:copyAction,prompt:promptAction,attempt:attemptAction,resync:resyncAction,retry:retryParticipantAction,submit:submitAgainAction}) : '';
+    const journalActions = journal.actions({copy:copyAction,prompt:isUser ? userTurnActions : promptAction,attempt:attemptAction,resync:resyncAction,retry:retryParticipantAction,submit:submitAgainAction,minimize:!isUser});
     const meta = `<div class="mr-gc-meta"><span class="mr-gc-name${kindCls}">${escapeHtml(label)}</span>${activityHeader}${recipientBadge}${supplementReceipt}${attemptBadge}${actBadge}${time ? `<span>${escapeHtml(time)}</span>` : ''}${isUser && message.interruptedNote ? '<span class="mr-gc-interrupted-note" title="本轮进行中 Hub 重启，回答已被打断">已被重启打断</span>' : ''}${wordChip}${statusText ? `<span>${escapeHtml(statusText)}</span>` : ''}${syncAction}${journalActions}</div>`;
     // 2026-05-15 maintainer 群聊弹顶 bug 修复：article 上加 data-gc-msg-id 作 partial-update
     //   局部 patch 的稳定 anchor。pending 区调用方传入 id='pending-${sid}'；真消息
@@ -2671,10 +2737,8 @@ if (typeof document !== 'undefined') (function () {
         <div class="mr-gc-msg-body">
           ${meta}
           <div class="mr-gc-bubble-row">
-            ${isUser ? userTurnActions + copyAction : ''}
             <div class="mr-gc-bubble">${body}${isPending ? '<span class="mr-ft-cursor"></span>' : ''}</div>
           </div>
-          ${!isUser ? journal.footer() : ''}
         </div>
         ${isUser ? _renderGroupAvatar(null, true) : ''}
       </article>
@@ -2685,9 +2749,11 @@ if (typeof document !== 'undefined') (function () {
     const partialBy = state && state._partialBy ? state._partialBy : {};
     const slots = _getGcSlots(meeting).filter(Boolean);
     const currentTurn = Number(state && state.currentTurn) || 0;
+    const answerMode = GroupAnswers.enabled(meeting);
     const persistedSids = new Set((state && Array.isArray(state.messages) ? state.messages : [])
       .filter(m => m && m.role === 'assistant' && Number(m.turnNum) === currentTurn
-        && (m.status === 'completed' || m.status === 'manual_extracted' || _isGcSettledStatus(m.status)))
+        && (answerMode ? !m.sourceMessage && m.status !== 'progress_update' && !m.supplementReply
+          : (m.status === 'completed' || m.status === 'manual_extracted' || _isGcSettledStatus(m.status))))
       .map(m => m.sid));
     const parts = [];
     for (const slot of slots) {
@@ -2743,7 +2809,18 @@ if (typeof document !== 'undefined') (function () {
     const sideCollapsed = _getGroupSideCollapsed();
     // The source collector may recover an old canonical placeholder's final
     // answer after its progress cards. Render that source final once in order.
-    const renderMessages = meeting.scene === 'dev' || Delivery.enabled(meeting)
+    // Markdown answers: one card per member per turn; transcript progress stays in the session.
+    const answerCardKeys = new Set();
+    const renderMessages = GroupAnswers.enabled(meeting)
+      ? messages.filter(m => {
+        if (m.role !== 'assistant' || m.systemNote || m.supplementReply || m.committeeAct) return true;
+        if (m.sourceMessage || m.status === 'progress_update' || m.phase === 'commentary') return false;
+        const key = `${m.turnNum}:${m.sid}`;
+        if (answerCardKeys.has(key)) return false;
+        answerCardKeys.add(key);
+        return true;
+      })
+      : meeting.scene === 'dev' || Delivery.enabled(meeting)
       ? messages.filter(m => m.sourceMessage || m.status === 'progress_update' ? !state.displayMessagesByAttempt?.[m.attemptId]?.length : m.role !== 'assistant'
         || m.displayMessages?.length
         || !SourceFinal.matches(messages,m,state.attempts))
@@ -2776,7 +2853,7 @@ if (typeof document !== 'undefined') (function () {
       }
     }
     const _collapsedSet = _gcCollapsedActs[meeting.id] || (_gcCollapsedActs[meeting.id] = new Set());
-    const messageHtml = renderMessages.map(m => {
+    const messageHtml = renderMessages.filter(m => OrchUI.messageVisible(meeting, m)).map(m => {
       let sep = '';
       const actKey = (m && m.committeeAct) ? `${m.committeeAct}#${m.committeeRound || ''}` : null;
       if (actKey) {
@@ -2807,8 +2884,8 @@ if (typeof document !== 'undefined') (function () {
 
     const emptyHtml = (!messageHtml && !pendingHtml) ? `
       <div class="mr-gc-empty">
-        <div class="mr-gc-empty-title">还没有群聊消息</div>
-        <div class="mr-gc-empty-sub">直接提问会发给当前勾选成员；输入 @m1、@m2 或 @all 可以指定发言成员。</div>
+        <div class="mr-gc-empty-title">${OrchUI.onlyOrchestrator(meeting) ? '还没有你和编排员的消息' : '还没有群聊消息'}</div>
+        <div class="mr-gc-empty-sub">${OrchUI.onlyOrchestrator(meeting) ? '切换到“全员信息”可查看队员消息。' : '直接提问会发给当前勾选成员；输入 @m1、@m2 或 @all 可以指定发言成员。'}</div>
       </div>
     ` : '';
     const dutyHatPanel = _renderDutyHatPanel(meeting, slots);
@@ -3101,6 +3178,9 @@ if (typeof document !== 'undefined') (function () {
   function _patchGroupChatPendingMessage(panel, meeting, sid, state) {
     if (!panel || !meeting || !meeting.groupChat) return false;
     if (!sid || !state) return false;
+    // The cache still receives this output. A hidden member needs no DOM work,
+    // including the caller's full-render fallback on every streaming chunk.
+    if (!OrchUI.messageVisible(meeting, { role: 'assistant', sid })) return true;
     const partial = state._partialBy && state._partialBy[sid];
     if (!partial) return false;
     const messagesEl = panel.querySelector('.mr-gc-messages');
@@ -3401,7 +3481,7 @@ if (typeof document !== 'undefined') (function () {
         return;
       }
       try {
-        await navigator.clipboard.writeText(previewText);
+        await copyGroupText(previewText);
         const oldT = btn.textContent;
         btn.textContent = '✓';
         btn.style.background = '#2da44e';
@@ -3453,7 +3533,8 @@ if (typeof document !== 'undefined') (function () {
       return;
     }
     try {
-      await navigator.clipboard.writeText(text);
+      const result = await clipboardController.copyText(text, { source: 'group-card', silent: true });
+      if (result?.ok === false) throw new Error(result.reason || 'clipboard-write-failed');
       btn.textContent = '✓';
       btn.classList.add('copied');
       setTimeout(() => {
@@ -3543,9 +3624,9 @@ if (typeof document !== 'undefined') (function () {
     const closeBtn = overlay.querySelector('.mr-gc-prompt-modal-close');
     if (closeBtn) closeBtn.addEventListener('click', close);
     const copyBtn = overlay.querySelector('.mr-gc-prompt-modal-copy');
-    if (copyBtn) copyBtn.addEventListener('click', () => {
-      try { if (navigator.clipboard) navigator.clipboard.writeText(prompt || ''); } catch {}
-      copyBtn.textContent = '已复制 ✓';
+    if (copyBtn) copyBtn.addEventListener('click', async () => {
+      const result = await clipboardController.copyText(prompt || '', { source: 'group-prompt', silent: true });
+      copyBtn.textContent = result?.ok ? '已复制 ✓' : '复制失败';
       setTimeout(() => { try { copyBtn.textContent = '复制'; } catch {} }, 1200);
     });
     document.addEventListener('keydown', onKey);
@@ -3623,6 +3704,33 @@ if (typeof document !== 'undefined') (function () {
     } finally {
       btn.disabled = false;
     }
+  }
+
+  // Markdown-answer rooms: resend this turn to one member. Workflow rooms go
+  // through the delivery engine, which re-prompts members that have not delivered.
+  async function _handleGcResendMember(btn, meeting) {
+    if (btn.disabled) return;
+    const sid = btn.getAttribute('data-gc-resend-member');
+    const turnNum = parseInt(btn.getAttribute('data-gc-retry-turn') || '', 10);
+    btn.disabled = true;
+    try {
+      let result;
+      if (Delivery.enabled(meeting) && meeting.serialWorkflow.enabled) {
+        result = await ipcRenderer.invoke('delivery:continue', { meetingId: meeting.id });
+        if (!result?.ok) throw new Error(result?.error || '补发失败');
+      } else {
+        const args = { meetingId: meeting.id, sid, turnNum: Number.isFinite(turnNum) ? turnNum : undefined };
+        result = await ipcRenderer.invoke('groupchat:resend-member', args);
+        if (result?.reason === 'member_busy') {
+          if (!window.confirm('这位成员仍在运行或等待确认，再发一次可能让它重复做。确定重新发送本轮问题吗？')) return;
+          result = await ipcRenderer.invoke('groupchat:resend-member', { ...args, force: true });
+        }
+        if (!result?.ok) throw new Error(result?.reason || '重新发送失败');
+      }
+      _showGcEscapeNotice('已重新发送；它写好回答文件后卡片会自动更新', 'info');
+    } catch (error) {
+      _showGcEscapeNotice('重新发送失败：' + (error && error.message ? error.message : String(error)), 'error');
+    } finally { btn.disabled = false; }
   }
 
   async function _handleGcRetryParticipant(btn, meeting) {
@@ -3826,10 +3934,10 @@ if (typeof document !== 'undefined') (function () {
       const pre = codeCopyBtn.closest('pre');
       const code = pre && pre.querySelector('code');
       if (code && typeof navigator !== 'undefined' && navigator.clipboard) {
-        navigator.clipboard.writeText(code.textContent || '');
         const old = codeCopyBtn.textContent;
-        codeCopyBtn.textContent = '已复制 ✓';
-        setTimeout(() => { try { codeCopyBtn.textContent = old; } catch {} }, 1500);
+        copyGroupText(code.textContent || '').then(()=>{codeCopyBtn.textContent = '已复制 ✓';})
+          .catch(()=>{codeCopyBtn.textContent = '复制失败';})
+          .finally(()=>setTimeout(() => { try { codeCopyBtn.textContent = old; } catch {} }, 1500));
       }
       return;
     }
@@ -3944,6 +4052,13 @@ if (typeof document !== 'undefined') (function () {
       return;
     }
 
+    const resendMemberBtn = _closestInPanel(ev.target, '[data-gc-resend-member]', panel);
+    if (resendMemberBtn) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      await _handleGcResendMember(resendMemberBtn, meeting);
+      return;
+    }
     const retryAnswerBtn = _closestInPanel(ev.target, '[data-gc-retry-answer]', panel);
     if (retryAnswerBtn) {
       ev.preventDefault();
@@ -4928,6 +5043,15 @@ if (typeof document !== 'undefined') (function () {
     _restoreGroupChatScroll(panel,scroll);
   });
 
+  // A member's answer file changed (main/groupchat/answer-file-monitor.js).
+  ipcRenderer.on('groupchat:answer-file', (_e, payload = {}) => {
+    if (!_acceptGcPush(payload)) return;
+    const meeting = meetingData[payload.meetingId];
+    if (meeting && payload.meetingId === activeMeetingId) {
+      refreshGroupChatPanel(meeting).catch(error => console.warn('[answer-files] refresh failed:', error.message));
+    }
+  });
+
   ipcRenderer.on('dev-workbench:progress', (_e, payload = {}) => {
     if (!_acceptGcPush(payload)) return;
     const meeting = meetingData[payload.meetingId];
@@ -5182,6 +5306,7 @@ if (typeof document !== 'undefined') (function () {
     const members = rail.querySelector('.mr-input-tuning-members');
     const slots = _getGcSlots(meeting).filter(Boolean);
     const key = JSON.stringify([meeting.id, slots.map(slot => slot.sid)]);
+    rail._compactMenus?.update(meeting.id, slots.length);
     if (members.dataset.key !== key) {
       _inputModelUi?.closeModelPicker();
       members.dataset.key = key;
@@ -5235,9 +5360,10 @@ if (typeof document !== 'undefined') (function () {
       speedButton.textContent = '速度 · ' + speed.label;
       speedButton.setAttribute('aria-label',`${slot.displayLabel} · 速度：${speed.label}`);
       speedButton.setAttribute('aria-pressed',String(speed.tier === 'fast'));
-      speedButton.title = `${slot.displayLabel} · ${speed.reason || '标准 / Fast；Fast 会增加用量或费用'}`;
+      speedButton.title = `${slot.displayLabel} · ${speed.reason || '标准 / 快速；快速会增加用量或费用'}`;
       pair._contextBudget.update(model.context, slot.displayLabel);
     }
+    rail._compactMenus?.refreshModels();
   }
 
   function _ensureInputTools(meeting) {
@@ -5255,8 +5381,19 @@ if (typeof document !== 'undefined') (function () {
         tuning = document.createElement('div');
         tuning.id = 'mr-input-tuning';
         tuning.className = 'composer-rail';
-        tuning.innerHTML = '<div class="mr-input-tuning-members"></div>';
+        tuning.innerHTML = '<div class="fi-bridge-toolbar"></div><div class="mr-input-tuning-members"></div>';
+        require('./group-composer-tools').mountGroupComposerTools({
+          toolbar: tuning.querySelector('.fi-bridge-toolbar'), input: inputBox,
+          getMeeting: () => meetingData[activeMeetingId],
+          referenceSession: referenceSessionIntoInput,
+          appendText: appendToContenteditable, droppedFilePath,
+          formatFilePaths: formatPastedFilePaths,
+          onDraft: id => _setInputDraft(id, inputBox.innerText || ''),
+          onHistory: button => _togglePromptHistoryMenu(button, meetingData[activeMeetingId]),
+          onExpand: () => _openLongInputEditor(meetingData[activeMeetingId]),
+        });
         row.appendChild(tuning);
+        tuning._compactMenus = require('./group-composer-popovers').mountGroupComposerPopovers(tuning);
       }
       _updateInputTuning(meeting);
       return;
@@ -5368,7 +5505,11 @@ if (typeof document !== 'undefined') (function () {
       });
     }
     const s = state || { phase: 'discuss', label: '读取文件进度…' };
-    if (s.limitReached && !s.done && !s.running) s.label = '已达 6 轮上限 · 保留现场，尚未完成';
+    if (s.limitReached && !s.done && !s.running) s.label = `已完成 ${s.reviewLimit || 3} 轮审查仍需返工 · 现场已保留`;
+    // Hub decides the next owner from the task files; the button only asks it to continue.
+    const canContinue = !!s.paused && !s.running && !s.done && !s.error && !!s.next && !s.next.error;
+    const continueTitle = s.next?.error ? `无法继续：${s.next.error}`
+      : s.next ? `交给 ${s.next.label}${s.limitReached ? `；再给 ${s.reviewLimit || 3} 轮审查额度` : ''}。已交付的不重做` : '';
     const solo = DevFile.isSolo(current);
     const phases = solo ? [] : [['discuss', '讨论'], ['kickoff', '开题'], ['build', '施工'], ['merge', '合并']];
     const selected = _getGcSlots(current).filter(slot => slot && (!Array.isArray(current.participants) || current.participants.includes(slot.slotIndex)));
@@ -5376,11 +5517,12 @@ if (typeof document !== 'undefined') (function () {
     const running = !!s.running || _isGroupTurnRunning(current);
     row.innerHTML = `<div class="mr-file-flow" data-file-phase="${escapeHtml(s.phase || '')}">
       <div class="mr-file-steps">${phases.map(([key, label], i) => `<span class="${s.phase === key ? 'active' : ''}"><b>${i + 1}</b>${label}</span>`).join('<i>›</i>')}</div>
-      <div class="mr-file-detail" title="${escapeHtml([s.label || '文件状态未知', s.paused ? '已暂停，输入“继续”接续' : s.done ? '本任务已完成' : '', s.error || s.dispatchError || ''].filter(Boolean).join(' · '))}"><strong>${escapeHtml(s.label || '文件状态未知')}</strong>${s.paused ? ' · 已暂停，输入“继续”接续' : s.done ? ' · 本任务已完成' : ''}
+      <div class="mr-file-detail" title="${escapeHtml([s.label || '文件状态未知', s.paused ? '已暂停，点「继续」由 Hub 接续' : s.done ? '本任务已完成' : '', s.error || s.dispatchError || ''].filter(Boolean).join(' · '))}"><strong>${escapeHtml(s.label || '文件状态未知')}</strong>${s.paused ? ' · 已暂停' : s.done ? ' · 本任务已完成' : ''}
         ${s.error || s.dispatchError ? `<span class="mr-file-error">${escapeHtml(s.error || s.dispatchError)}</span>` : ''}</div>
       <div class="mr-file-actions">
         ${['discuss', 'kickoff'].includes(s.phase) && !s.error ? '<button type="button" data-file-prep title="把项目接入提示词填入输入框；检查后自行发送">立项</button>' : ''}
         ${!solo && ['discuss', 'kickoff'].includes(s.phase) && !s.error ? '<button type="button" data-file-kickoff title="把开题提示词追加到输入框，并选择负责开题的成员；检查后按 Enter 发送">开题</button>' : ''}
+        ${canContinue ? `<button type="button" class="continue" data-file-continue title="${escapeHtml(continueTitle)}">继续<small>${escapeHtml(s.next.label)}</small></button>` : ''}
         <button type="button" data-file-docs>任务文件</button>
         ${running || (!s.paused && s.phase !== 'discuss' && !s.done) ? '<button type="button" class="stop" data-file-stop>停止</button>' : ''}
       </div><small class="mr-file-recipients">${escapeHtml(names ? `发送给 ${names}` : '请点亮至少一位成员')}</small></div>`;
@@ -5408,6 +5550,17 @@ if (typeof document !== 'undefined') (function () {
       } catch (error) { _showGcEscapeNotice('打开任务文件失败：' + error.message, 'error'); }
     });
     row.querySelector('[data-file-stop]')?.addEventListener('click', () => { void _handleGcStopTurn(current); });
+    row.querySelector('[data-file-continue]')?.addEventListener('click', async event => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      button.classList.add('is-busy');
+      try {
+        const result = await ipcRenderer.invoke('dev-file:continue', { meetingId: current.id });
+        if (!result?.ok) throw new Error(result?.error || '继续失败');
+        if (result.status) _devFileStates[current.id] = result.status;
+      } catch (error) { _showGcEscapeNotice('继续失败：' + error.message, 'error'); }
+      finally { if (activeMeetingId === current.id) _updateInputPreflight(meetingData[current.id]); }
+    });
     row.querySelector('[data-file-kickoff]')?.addEventListener('click', async event => {
       const button = event.currentTarget;
       button.disabled = true;
@@ -5441,6 +5594,11 @@ if (typeof document !== 'undefined') (function () {
       return;
     }
     row.style.display = '';
+    if (OrchUI.enabled(current)) {
+      OrchUI.renderStrip(row, current, { escapeHtml, onError: message => _showGcEscapeNotice(message, 'error') });
+      _updateInputHistoryButton(current);
+      return;
+    }
     if (Delivery.enabled(current) && current.serialWorkflow.enabled) {
       DeliveryControls.render(row,current,id=>{if(activeMeetingId===id)_updateInputPreflight(meetingData[id]);},message=>_showGcEscapeNotice(message,'error'));
       _updateInputHistoryButton(current);
@@ -5631,7 +5789,7 @@ if (typeof document !== 'undefined') (function () {
   }
 
   function _handlePromptHistoryOutside(ev) {
-    const btn = document.getElementById('mr-input-history-btn');
+    const btn = document.querySelector('.mr-composer-history') || document.getElementById('mr-input-history-btn');
     if (_inputHistoryMenuEl && !_inputHistoryMenuEl.contains(ev.target) && ev.target !== btn) {
       _closePromptHistoryMenu();
     }
@@ -6011,6 +6169,10 @@ if (typeof document !== 'undefined') (function () {
 
   function openMeeting(meetingId, meeting, opts = {}) {
     if (activeMeetingId !== meetingId) {
+      document.getElementById('mr-group-chat-panel')?._groupSelection?.hide();
+      if (_gcQuoteFloatBtn) _gcQuoteFloatBtn.style.display = 'none';
+      _closePromptHistoryMenu();
+      document.querySelector('#mr-input-editor-overlay [data-action="apply"]')?.click();
       _inputModelUi?.closeModelPicker();
       _taskFilesMeetingId = null;
     }
@@ -6083,6 +6245,10 @@ if (typeof document !== 'undefined') (function () {
   }
 
   function closeMeetingPanel() {
+    document.getElementById('mr-group-chat-panel')?._groupSelection?.hide();
+    if (_gcQuoteFloatBtn) _gcQuoteFloatBtn.style.display = 'none';
+    _closePromptHistoryMenu();
+    document.querySelector('#mr-input-editor-overlay [data-action="apply"]')?.click();
     memberSplit?.close();
     _inputModelUi?.closeModelPicker();
     _taskFilesMeetingId = null;
@@ -6302,17 +6468,19 @@ if (typeof document !== 'undefined') (function () {
       const collapsed = _getGroupSideCollapsed();
       return `<button class="mr-header-btn mr-view-btn ${collapsed ? '' : 'active'}" id="mr-btn-group-members" title="${collapsed ? '展开群成员栏' : '收起群成员栏'}">群成员 ${gcSlots.length}</button>`;
     })() : '';
+    const gcMessageScopeHtml = OrchUI.enabled(meeting)
+      ? `<button type="button" class="mr-header-btn${OrchUI.onlyOrchestrator(meeting) ? ' active' : ''}" id="mr-btn-message-scope" aria-pressed="${OrchUI.onlyOrchestrator(meeting)}" title="${OrchUI.onlyOrchestrator(meeting) ? '当前只显示你和编排员的消息，点击查看全员信息' : '点击只看你和编排员的消息'}">${OrchUI.onlyOrchestrator(meeting) ? '只看编排' : '全员信息'}</button>` : '';
 
     el.innerHTML = `
       <div class="mr-header-left">
-        <span class="mr-header-title" id="mr-title">${escapeHtml(meeting.title)}</span>
+        <span class="mr-header-title" id="mr-title">${escapeHtml(meeting.title)}</span>${OrchUI.headerTag(meeting)}
         <span class="mr-header-meta" id="mr-header-meta"></span>
         ${meeting.workspace ? `<button type="button" class="mr-workspace-chip" id="mr-workspace-chip" title="在文件管理中打开 · ${escapeHtml(meeting.workspace)}"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.8 4.4A1.4 1.4 0 0 1 3.2 3h3l1.3 1.4h5.3a1.4 1.4 0 0 1 1.4 1.4v6a1.4 1.4 0 0 1-1.4 1.4H3.2a1.4 1.4 0 0 1-1.4-1.4Z"/></svg><span>${meeting.workspaceLabel ? `${escapeHtml(meeting.workspaceLabel)} · ` : ''}${escapeHtml(meeting.workspace)}</span></button>` : ''}
       </div>
       <!-- 2026-06-28 maintainer：删 header 进度条（与标题旁 meta 的"已N轮·本轮N/M"文字信息重叠），保留 meta。_updateHeaderProgress 的 progEl 分支会因元素缺失自动跳过。 -->
       <div class="mr-header-right">
         ${layoutButtonsHtml ? `<div class="mr-header-primary-actions">${layoutButtonsHtml}</div>` : ''}
-        <div class="mr-header-primary-actions">${gcMembersBtnHtml}${meeting.groupChat ? `<button type="button" class="mr-header-btn${_gcToolsExpanded[meeting.id] ? ' active' : ''}" id="mr-btn-group-tools" aria-expanded="${!!_gcToolsExpanded[meeting.id]}" aria-controls="mr-gc-tools" title="展开或收起搜索与本轮进度">群聊工具</button>` : ''}${viewToggleHtml}</div>
+        <div class="mr-header-primary-actions">${gcMembersBtnHtml}${gcMessageScopeHtml}${meeting.groupChat ? `<button type="button" class="mr-header-btn${_gcToolsExpanded[meeting.id] ? ' active' : ''}" id="mr-btn-group-tools" aria-expanded="${!!_gcToolsExpanded[meeting.id]}" aria-controls="mr-gc-tools" title="展开或收起搜索与本轮进度">群聊工具</button>` : ''}${viewToggleHtml}</div>
         <div class="mr-header-secondary-actions" aria-label="会议工具">
           <button class="mr-header-btn" id="mr-btn-add-sub" title="${meeting.groupChat ? '添加新的 AI 成员' : '添加子会话'}">${meeting.groupChat ? '+ 成员' : '+ 添加'}</button>
           ${meeting.workspace ? `<button class="btn-zoom btn-file-manager-toggle" id="mr-btn-files" title="打开当前工作目录的文件管理" aria-label="打开当前工作目录的文件管理" aria-pressed="false"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1.8 4.4A1.4 1.4 0 0 1 3.2 3h3l1.3 1.4h5.3a1.4 1.4 0 0 1 1.4 1.4v6a1.4 1.4 0 0 1-1.4 1.4H3.2a1.4 1.4 0 0 1-1.4-1.4Z"/><path d="M5 7.2h6M5 9.5h4"/></svg></button>` : ''}
@@ -6360,6 +6528,15 @@ if (typeof document !== 'undefined') (function () {
     });
     // 2026-06-28 maintainer：header 群成员按钮 → toggle 右侧群成员栏（替代原 topbar 里的 data-gc-side-toggle）。
     const groupMembersBtn = document.getElementById('mr-btn-group-members');
+    document.getElementById('mr-btn-message-scope')?.addEventListener('click', () => {
+      OrchUI.toggleMessageScope(meeting);
+      if (memberSplit?.mode() === 'two') setGroupLayout('overview', meeting);
+      const panel = _ensureGcPanel();
+      const scroll = _captureGroupChatScroll(panel, meeting);
+      const state = _gcPanelState[meeting.id];
+      if (state) _renderGcPanelInto(panel, meeting, state, { scroll });
+      renderHeader(meeting);
+    });
     const groupToolsBtn = document.getElementById('mr-btn-group-tools');
     if (groupToolsBtn) groupToolsBtn.addEventListener('click', () => {
       if (memberSplit?.mode() === 'two') setGroupLayout('overview', meeting);
@@ -6478,15 +6655,20 @@ if (typeof document !== 'undefined') (function () {
       const item = document.createElement('button');
       item.className = 'mr-quote-menu-item';
       item.textContent = label;
+      item.dataset.addKind = kind;
       item.addEventListener('click', async () => {
         menu.remove();
         try {
-          const result = await ipcRenderer.invoke('add-meeting-sub', { meetingId, kind });
+          _showGcEscapeNotice('正在添加成员…');
+          await window.WorkspaceController.loadSessionDefaults();
+          const opts = window.WorkspaceController.buildSessionTuningOpts(kind);
+          const result = await ipcRenderer.invoke('add-meeting-sub', { meetingId, kind, opts });
           if (!result || !result.meeting) throw new Error('新成员会话创建失败');
           if (result.session && typeof sessions !== 'undefined' && sessions) {
             sessions.set(result.session.id, result.session);
           }
           meetingData[meetingId] = result.meeting;
+          if (activeMeetingId !== meetingId) return;
           renderHeader(result.meeting);
           renderTerminals(result.meeting);
           renderToolbar(result.meeting);
@@ -7092,11 +7274,12 @@ if (typeof document !== 'undefined') (function () {
     if (DevFile.enabled(meeting)) {
       inputBox.dataset.placeholder = DevFile.isSolo(meeting)
         ? '输入任务；点“独立开工”填入提示词，检查后 Enter 发送。'
-        : '输入任务或补充；点“开题”填入提示词，检查后 Enter 发送。停止后输入“继续”接续。';
+        : '输入任务或补充；点“开题”填入提示词，检查后 Enter 发送。暂停后点上方「继续」接续。';
     } else if (DevDiscuss.isDiscussing(meeting)) {
       inputBox.dataset.placeholder = '讨论阶段：先把需求聊清楚（不改代码）；想收口就点上方「收敛」，定了就点「开工」';
     }
-    if(Delivery.enabled(meeting))inputBox.dataset.placeholder='发送给点亮头像的成员；任务运行中可直接补充要求';
+    if(Delivery.enabled(meeting))inputBox.dataset.placeholder='输入任务，Hub 按工作流安排各步骤成员推进；运行中可补充要求，暂停后点上方「继续」';
+    if(OrchUI.active(meeting))inputBox.dataset.placeholder='发给编排员：说目标、改要求或问进展（@成员 可直接点名）';
     // 灰态：readonly + class 切换
     if (isFreeZeroSelected) {
       inputBox.setAttribute('readonly', '');
@@ -7223,9 +7406,18 @@ if (typeof document !== 'undefined') (function () {
     // 而不是往输入框里塞文本再模拟点击。
     // 开发群聊处于讨论阶段时，循环配置虽然在，也只走普通群聊 —— 这是「先讨论再开工」的全部机制。
     function _dispatchMeetingInput(m, finalText, heroIdBySid, recipientSids=Recipients.selectedSids(m)) {
+      // AI 编排模式：默认只发给编排员；@成员 时直接发给被点名的成员并抄送编排员。
+      if (OrchUI.active(m)) {
+        const route = OrchUI.resolveRecipients(m, finalText, sid => (typeof sessions !== 'undefined' && sessions.get(sid)?.title) || '');
+        if (!route.sids.length) { _restoreQuestionAndPreserveDraft(m.id, finalText); _showGcEscapeNotice('编排员会话不可用，消息未发送', 'error'); return; }
+        void OrchUI.noteUserMessage(m, finalText, route.direct);
+        handleMeetingSend(finalText, m, { heroIdBySid, recipientSids: route.sids });
+        return;
+      }
       // 循环工作流（评审 gate + 自动重来）→ main 进程驱动（崩溃续跑）；串行 → renderer 驱动；否则普通群聊单轮
       if (Delivery.enabled(m) && m.serialWorkflow.enabled) {
         void DeliveryControls.submit(m,finalText,recipientSids).then(result=>{
+          if(result.plain)return handleMeetingSend(finalText, m, { heroIdBySid, recipientSids });
           if(result.supplement)return _presentUserSupplement(m,result);
         }).catch(error=>{
           _restoreQuestionAndPreserveDraft(m.id,finalText);
@@ -7678,6 +7870,14 @@ if (typeof document !== 'undefined') (function () {
     getTarget: () => ({ id: activeMeetingId, project: meetingData[activeMeetingId]?.workspace || '' }),
     isActive: target => activeMeetingId === target.id && voiceBox.getClientRects().length > 0,
   });
+  if (voiceBox && voiceRail) require('./prompt-polish').attachPromptPolish({
+    input: voiceBox, rail: voiceRail, before: document.getElementById('mr-send-btn'), ipcRenderer,
+    getTarget: () => ({ id: activeMeetingId }),
+    isActive: id => activeMeetingId === id && voiceBox.getClientRects().length > 0,
+    writeText: text => _setMeetingInputText(activeMeetingId, text),
+  });
+  require('./composer-collapse').mountComposerCollapse({ document, host: voiceRail,
+    before: document.getElementById('mr-send-btn'), input: voiceBox });
   if (process && process.env && process.env.CLAUDE_HUB_E2E === '1') {
     // 走真实 handleMeetingSend，但**不 await** —— e2e 要量的正是「按下发送那一刻
     // 到看见自己那张气泡」的间隔，await 会把这个间隔藏起来。

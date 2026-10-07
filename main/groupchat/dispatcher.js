@@ -7,6 +7,8 @@ const { createAuthBannerMonitor } = require('../../core/host-shell-detector.js')
 const { appendHeroPrompt, normalizeHeroAssignments } = require('../../core/hero-prompts.js');
 const DevDiscuss = require('../../core/dev-discuss.js');
 const DevFile = require('../../core/dev-file-workflow');
+const OrchestrationRules = require('../../core/orchestration/rules');
+const GroupAnswers = require('../../core/group-answer-files');
 const { isNativeSession, nativeTurnHasEnded } = require('../../core/codex-native-runtime');
 const { isClaudeFamily } = require('../../core/ai-kinds.js');
 const { nativeUnknownOutcome } = require('../../core/native-groupchat-outcome');
@@ -83,6 +85,7 @@ function createGroupChatDispatcher(deps) {
     sendToRenderer,
     sessionManager,
     transcriptTap,
+    recoverLaunchAuth,
   } = deps;
 
   groupChatWatcher.init({
@@ -564,6 +567,8 @@ function createGroupChatDispatcher(deps) {
         warn(`[group-chat] auth failure banner confirmed for ${label}(${sid.slice(0, 8)}) - marking errored`);
         try { watcher.markErrored('auth_required'); }
         catch (e) { warn('[group-chat] markErrored auth_required threw:', e && e.message); }
+        const session=sessionManager.getSession(sid);
+        if (session && recoverLaunchAuth) void Promise.resolve(recoverLaunchAuth(session,{code:'auth_required'})).catch(()=>{});
         return;
       }
       if (groupChatWatcher.checkHostShellTakeover(sid)) {
@@ -1287,7 +1292,9 @@ function createGroupChatDispatcher(deps) {
     if (!args.silent) {
       dispatchSeq = (meetingDispatchSeq.get(key) || 0) + 1;
       meetingDispatchSeq.set(key, dispatchSeq);
-      const fileHandoff=args.fileHandoff === true && (DevFile.enabled(meetingManager.getMeeting(meetingId)) || require('../../core/delivery-workflow').enabled(meetingManager.getMeeting(meetingId)));
+      // 编排群总是按文件交接：任何一轮新派发都不把在干活的成员标成「被抢占」。
+      const fileHandoff=(args.fileHandoff === true && (DevFile.enabled(meetingManager.getMeeting(meetingId)) || require('../../core/delivery-workflow').enabled(meetingManager.getMeeting(meetingId))))
+        || OrchestrationRules.enabled(meetingManager.getMeeting(meetingId));
       if(fileHandoff)meetingHandoffSeq.set(key,dispatchSeq);else meetingHandoffSeq.delete(key);
       try { supersedeActiveWatchersForMeeting(meetingId, fileHandoff); }
       catch (e) { warn('[groupchat] preempt supersede threw:', e && e.message); }
@@ -1363,10 +1370,14 @@ function createGroupChatDispatcher(deps) {
           const attempts=Object.values(historyOrch.state.attempts || {});
           return targetMembers.filter(member=>{
             const session=sessionManager.getSession(member.sid);
-            if (!isNativeSession(session)) return receipts.some(r=>r.sid===member.sid && r.handedOffAt && !r.sourceCompletedAt);
             // Only the latest dispatched attempt can occupy this seat. Older
             // receipts remain collectable without becoming extra send gates.
             const attempt=attempts.filter(a=>a.sid===member.sid).at(-1);
+            if (!isNativeSession(session)) {
+              const receipt=attempt ? receipts.find(r=>r.sid===member.sid && r.attemptId===attempt.attemptId)
+                : receipts.filter(r=>r.sid===member.sid).at(-1);
+              return !!(receipt?.handedOffAt && !receipt.sourceCompletedAt);
+            }
             if (!attempt || !(attempt.status==='handed_off' || receipts.some(r=>r.attemptId===attempt.attemptId && r.handedOffAt))) return false;
             const native=(sessionManager.getNativeSession?.(member.sid) || sessionManager.getNativeCodex?.(member.sid));
             if (!native) return true;
@@ -1392,11 +1403,26 @@ function createGroupChatDispatcher(deps) {
           historyOrch.appendSystemNote(historyOrch.state.currentTurn,'文件已交付，正在等待该席位上一轮 CLI 收尾后接续；已有消息会保留。');
           emitGroupChat('dev-workbench:progress',{meetingId,revision:historyOrch.state.revision});
         }
+        // The delivered file already proves the previous stage is done; this only
+        // lets the CLI finish its closing words. If the transcript/hook signal
+        // never arrives (binding hiccup), proceed after a bounded wait instead of
+        // stalling the workflow — the TUI queues a prompt sent while it is busy.
+        // Native sessions report their turn state authoritatively and allow one
+        // writer only, so they keep the strict wait; the bounded bypass is for
+        // PTY seats whose signal comes from transcript binding.
+        const SEAT_WAIT_MS=Math.min(Number(turnTimeoutMs) || 90_000,90_000);
         while(waiting().length) {
           if(interruptedSinceStart() || (shouldDispatch && !shouldDispatch()))
             return {status:'error',reason:'文件进度已变化或用户已停止',turnNum:null};
-          if(Date.now()-waitStart > (Number(turnTimeoutMs) || 30*60_000))
-            return {status:'error',reason:'等待上一轮 CLI 收尾超时；请查看原文，确认后继续',turnNum:null};
+          const nativeWaiting=waiting().some(member=>isNativeSession(sessionManager.getSession(member.sid)));
+          if(nativeWaiting) {
+            if(Date.now()-waitStart > (Number(turnTimeoutMs) || 30*60_000))
+              return {status:'error',reason:'等待上一轮 CLI 收尾超时；请查看原文，确认后继续',turnNum:null};
+          } else if(Date.now()-waitStart > SEAT_WAIT_MS) {
+            historyOrch.appendSystemNote(historyOrch.state.currentTurn,'未收到该席位上一轮 CLI 的收尾信号，已等待 90 秒，按已交付文件继续派发。');
+            emitGroupChat('dev-workbench:progress',{meetingId,revision:historyOrch.state.revision});
+            break;
+          }
           await new Promise(resolve=>setTimeout(resolve,100));
         }
         // Stop can race the terminal event that made waiting() become false.
@@ -1471,8 +1497,8 @@ function createGroupChatDispatcher(deps) {
       // deliveredIdx 必须在补卡之后取：它是「这位成员已经看到这里」的游标，
       // 补卡是 role==='user'（buildDelta 会过滤掉），游标越过它不改变任何人看到的内容。
       const deliveredIdx = orch.state.messages.length - 1;
-      const deliveredMessage = orch.state.messages[deliveredIdx];
-      const deliveredSeq = deliveredMessage && Number.isInteger(deliveredMessage.seq) ? deliveredMessage.seq : 0;
+      // Max, not last: a message renumbered by a changed answer file may sit earlier in the list.
+      const deliveredSeq = orch.state.messages.reduce((max, m) => Number.isInteger(m && m.seq) && m.seq > max ? m.seq : max, 0);
       const fileMembers = DevFile.enabled(meeting) ? groupMembersForMeeting(meeting, { includeDormant: true }) : [];
       const fileProtocolKey = DevFile.enabled(meeting) ? DevFile.protocolKey(meeting, fileMembers) : null;
       // 群成员名单按群聊成员身份算（含暂时 dormant 的），只给名字 + CLI/模型。
@@ -1484,6 +1510,7 @@ function createGroupChatDispatcher(deps) {
           kind: member.kind,
           // 产物写进本群聊的 workspace，而不是 home 下的公共 artifacts 目录。
           workspace: meeting.workspace || null,
+          extraRules: OrchestrationRules.rulesFor(getHubDataDir(), meeting, member.memberId),
         });
         // File protocol is sent once per actual session and role/name binding,
         // and only acknowledged after successful delivery. Ordinary messages
@@ -1523,6 +1550,19 @@ function createGroupChatDispatcher(deps) {
           ),
         };
       });
+
+      // Markdown answers: the card shows what each member writes to its file.
+      if (!silent && GroupAnswers.enabled(meeting)) {
+        for (const t of targets) {
+          try {
+            const entry = GroupAnswers.entryFor({ dataDir: getHubDataDir(), meetingId, turnNum, memberId: t.member?.memberId || t.sid, speaker: t.label, workflowRun });
+            require('node:fs').mkdirSync(entry.dir, { recursive: true });
+            orch.registerAnswerFile(turnNum, t.sid, entry);
+            const note = GroupAnswers.instruction(entry);
+            if (note) t.prompt = `${t.prompt}\n\n${note}`;
+          } catch (e) { warn('[groupchat] answer file registration failed:', e && e.message); }
+        }
+      }
 
       for (const t of targets) {
         cancelPatchListenersForSid(t.sid);

@@ -12,7 +12,8 @@ function currentConfig() {
   const codex=raw.providers?.codex || {};
   const routing={
     codexSubscriptionProfile:process.env.HUB_CODEX_PROFILE || codex.subscription_profile || hub.DEFAULTS.codex_subscription_profile,
-    codexSubscriptionProfiles:hub.normalizeCodexSubscriptionProfiles(codex.subscription_profiles)};
+    codexSubscriptionProfiles:hub.normalizeCodexSubscriptionProfiles(codex.subscription_profiles),
+    codexAccountSwitchScope:codex.switch_scope === 'launch' ? 'launch' : 'live'};
   const cached=hub.getConfig();
   if (cached.codexSubscriptionProfile!==routing.codexSubscriptionProfile
       || JSON.stringify(cached.codexSubscriptionProfiles)!==JSON.stringify(routing.codexSubscriptionProfiles)) hub.clearConfigCache();
@@ -31,18 +32,25 @@ function resolveAccount(config, env = process.env) {
   return {id, label:profile.label, home};
 }
 
-function withGlobalAccount(existing, config, id, env = process.env) {
+function withGlobalAccount(existing, config, id, env = process.env, scope) {
   if (typeof id !== 'string' || !config.codexSubscriptionProfiles.some(p => p.id === id)) throw new Error('Codex 账号配置不存在');
   if (env.HUB_CODEX_PROFILE && env.HUB_CODEX_PROFILE !== id) throw new Error('HUB_CODEX_PROFILE 环境变量固定了账号，请移除后切换');
   if (config.codexBackend === 'api') throw new Error('当前使用 Codex API，不能切换订阅账号');
   resolveAccount({...config,codexSubscriptionProfile:id},env);
-  return {...existing,providers:{...existing.providers,codex:{...existing.providers?.codex,subscription_profile:id}}};
+  if (scope !== undefined && !['launch','live'].includes(scope)) throw new Error('账号切换范围无效');
+  return {...existing,providers:{...existing.providers,codex:{...existing.providers?.codex,subscription_profile:id,
+    ...(scope ? {switch_scope:scope} : {})}}};
+}
+
+function resolveRunningAccount(config, active, env = process.env) {
+  return config.codexAccountSwitchScope === 'launch' ? {...active} : resolveAccount(config,env);
 }
 
 // History and writer ownership stay with their original home. Only credentials,
 // native config and future new threads follow the selected global account.
 function prepareLaunch(opts, config, env = process.env) {
   const account = resolveAccount(config,env);
+  require('./codex-auth-validation').assertUsableCredential(account.home);
   const oldProfile = config.codexSubscriptionProfiles.find(p => p.id === opts.codexProfile);
   const sid = opts.codexSid || opts.codexForkSid;
   if (opts.codexProfile && !oldProfile && !(sid && opts.codexSessionsRoot)) throw new Error('Codex 账号配置不存在');
@@ -117,4 +125,4 @@ function historySqliteHomeSync(historyHome, persistedHome, env = process.env) {
   }
   return sqliteHome;
 }
-module.exports = {resolveAccount,withGlobalAccount,prepareLaunch,currentConfig,resolveHistorySqliteHome,historySqliteHomeSync};
+module.exports = {resolveAccount,resolveRunningAccount,withGlobalAccount,prepareLaunch,currentConfig,resolveHistorySqliteHome,historySqliteHomeSync};

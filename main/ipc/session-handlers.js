@@ -47,8 +47,11 @@ function registerSessionIpc(ipcMain, deps) {
     resumeSession,
     getTerminalOutputBatchStats = () => null,
     getPersistedSessions = () => [],
+    ensureLaunchAuth,
   } = deps;
   require('./codex-backstage-handlers').registerCodexBackstageIpc(ipcMain, { sessionManager });
+  require('../../core/codex-fast-command').registerCodexSpeedIpc(ipcMain,{sessionManager,sendToRenderer});
+  ipcMain.on('hub:ui-theme', (_event, theme) => sessionManager.setPresentationTheme?.(theme));
 
   const lastResizeBySid = new Map();
   ipcMain.handle('hub:feedback-ping', () => ({ok:true}));
@@ -127,7 +130,7 @@ function registerSessionIpc(ipcMain, deps) {
   const web = require('../../core/chatgpt-web-integration');
   ipcMain.handle('chatgpt-web:status', () => web.webStatus());
   ipcMain.handle('chatgpt-web:settings', () => web.openWebSettings());
-  ipcMain.handle('create-session', (_e, arg) => {
+  const createSession = (arg) => {
     // Back-compat: legacy callers pass just a kind string; newer callers pass { kind, opts }.
     let kind;
     let opts;
@@ -151,8 +154,10 @@ function registerSessionIpc(ipcMain, deps) {
         return createResolvedSession(kind, opts);
       });
     }
+    if (ensureLaunchAuth) return ensureLaunchAuth(kind,opts).then(()=>createResolvedSession(kind,opts));
     return createResolvedSession(kind, opts);
-  });
+  };
+  ipcMain.handle('create-session', (_e, arg) => createSession(arg));
 
   function createResolvedSession(kind, opts) {
     const isResumePicker = typeof kind === 'string' && kind.endsWith('-resume');
@@ -202,8 +207,8 @@ function registerSessionIpc(ipcMain, deps) {
     if (!plan.ok) return plan;
 
     const { kind, opts } = plan;
-    const createFork = () => {
-      const session = sessionManager.createSession(kind, opts);
+    const createFork = (preparedOpts = opts) => {
+      const session = sessionManager.createSession(kind, preparedOpts);
       registerSessionForTap(session);
       sendToRenderer('session-created', { session });
       return { ok: true, session };
@@ -212,6 +217,10 @@ function registerSessionIpc(ipcMain, deps) {
       return sessionManager.getNativeSession(source.id).fork()
         .then(fork => { opts.acpFork = fork; return createFork(); })
         .catch(error => ({ ok: false, error: 'acp-fork-failed', message: error.message }));
+    }
+    if (kind === 'codex' && opts.codexForkSid && sessionManager.prepareCodexFork) {
+      return sessionManager.prepareCodexFork(opts).then(createFork)
+        .catch(error => ({ ok: false, error: 'codex-fork-failed', message: error.message }));
     }
     return createFork();
   });
@@ -400,6 +409,8 @@ function registerSessionIpc(ipcMain, deps) {
       ? isCodexConversationModelId(modelId)
       : kind === 'claude'
         ? isClaudeModelSelection(modelId)
+        : kind==='deepseek'&&!session.deepseekLegacyClaude
+          ? require('../../core/deepseek-codex-profile').DEEPSEEK_CODEX_MODELS.includes(modelId)
         : false;
     if (!valid) return { ok: false, error: 'invalid-model', message: '该模型不属于当前 CLI 的会话模型目录' };
     if (kind === 'codex') modelId = require('../../core/model-options').normalizeCodexSessionModel(modelId);
@@ -410,7 +421,7 @@ function registerSessionIpc(ipcMain, deps) {
       .slice(0, 120) || modelId;
     const fields = { currentModel: { id: modelId, displayName } };
     const effort = String(payload.effort || '').toLowerCase();
-    if (kind === 'codex' && CODEX_MODEL_EFFORTS.has(effort)) fields.effort = effort;
+    if (['codex','deepseek'].includes(kind) && CODEX_MODEL_EFFORTS.has(effort)) fields.effort = effort;
     const updated = sessionManager.updateSessionMeta(sessionId, fields);
     if (!updated) {
       if (kind === 'claude') await restoreClaudePreferenceGuard(sessionId);
@@ -493,17 +504,32 @@ function registerSessionIpc(ipcMain, deps) {
 
   ipcMain.handle('debug:get-terminal-output-batch-stats', () => getTerminalOutputBatchStats());
 
-  ipcMain.handle('restart-session', (_e, sessionId) => {
+  ipcMain.handle('restart-session', (_e, sessionId) => restartSession(sessionId));
+
+  // overrides 只用于 PTY 原生会话的「按新模型/深度重启并接着原会话历史」（助理切换模型）。
+  function restartSession(sessionId, overrides = null) {
+    if (ensureLaunchAuth) {
+      const old=sessionManager.getSession(sessionId);
+      if (old) return ensureLaunchAuth(old.kind,{...old,...overrides,model:sessionModelId(old)})
+        .then(()=>restartAuthorizedSession(sessionId,overrides))
+        .catch(error=>({ok:false,error:error.code || 'restart-failed',message:error.message}));
+    }
+    return restartAuthorizedSession(sessionId,overrides);
+  }
+  function restartAuthorizedSession(sessionId, overrides = null) {
     const old = sessionManager.getSession(sessionId);
     if (!old) {
       return { ok: false, error: 'session-not-found', message: '会话不存在或已经休眠' };
     }
     const nativeCodex = sessionManager.getNativeSession?.(sessionId) || sessionManager.getNativeCodex?.(sessionId);
     // PTY 跑的 Codex 与 Claude 一样按原生会话 id 恢复；只有 App Server 会话在这里重连。
+    if (overrides && (old.runtimeBackend === 'codex-app-server' || old.runtimeBackend === 'claude-stream-json' || (nativeCodex && !nativeCodex.isCliProvider) || sessionManager.getNativeClaude?.(sessionId))) {
+      return { ok: false, error: 'restart-overrides-unsupported', message: '原生后端会话不支持按新模型重启' };
+    }
     if (old.purpose !== 'xresearch-research' && (old.runtimeBackend === 'codex-app-server' || (nativeCodex && !nativeCodex.isCliProvider))) {
       const native = nativeCodex;
       if (!native) return {ok:false,error:'unmanaged-codex',message:'旧 Codex 进程尚未接管；请先在原会话结束工作并关闭，再恢复'};
-      return native.reconnect().then(()=>sessionManager.getSession(sessionId))
+      return native.reconnect({useLaunchAccount:true}).then(()=>sessionManager.getSession(sessionId))
         .catch(error=>({ok:false,message:error.message}));
     }
     if (old.purpose === 'xresearch-research') {
@@ -528,7 +554,7 @@ function registerSessionIpc(ipcMain, deps) {
         return { ok: false, error: 'resume-handler-unavailable', message: '会话恢复服务尚未就绪' };
       }
 
-      const resumeMeta = buildSessionResumeMeta(old);
+      const resumeMeta = buildSessionResumeMeta(old, overrides ? { launchOverrides: overrides } : {});
       lastResizeBySid.delete(sessionId);
       // 2026-09-26：kill 只是发信号，旧 PTY 的收尾（保存记录、停 writer、释放归属）在
       // 退出回调里。以前 close 后立刻 resume，撞上「该会话已在本 Hub 打开」而失败；
@@ -551,6 +577,7 @@ function registerSessionIpc(ipcMain, deps) {
       }));
     }
 
+    if (overrides) return { ok: false, error: 'restart-overrides-unsupported', message: '该会话没有可恢复的原生历史，不能按新模型重启' };
     // PowerShell has no provider-native thread.  Restarting it intentionally
     // creates a fresh shell while retaining the Hub card's UX metadata.
     sessionManager.closeSession(sessionId);
@@ -576,9 +603,9 @@ function registerSessionIpc(ipcMain, deps) {
     registerSessionForTap(fresh);
     sendToRenderer('session-created', { session: fresh });
     return fresh;
-  });
+  }
 
-  return { lastResizeBySid };
+  return { lastResizeBySid, createSession, restartSession };
 }
 
 module.exports = {
