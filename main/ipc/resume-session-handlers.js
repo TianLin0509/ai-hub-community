@@ -82,7 +82,21 @@ function createResumeSessionHandler(deps) {
       effectiveCodexSessionsRoot = defaultCodexSessionsRoot;
     }
     const hookPort = getHookPort();
+    // 剥离范围只能包住联赛自己的代码：社区版恢复逻辑后面还会读 isAgentLeague，
+    // 也需要助理与编排员的恢复配置（2026-10-08 真机验收：剥掉后所有会话恢复都报 isAgentLeague is not defined）。
+    const isAgentLeague = false;
+
     let resumeOpts = {};
+    if (meta.purpose === 'hub-assistant') {
+      if (!require('../../core/hub-assistant/backends').BACKENDS.includes(meta.kind) || typeof deps.prepareAssistantResume !== 'function') {
+        throw new Error('助理恢复配置不可用，未启动替代会话');
+      }
+      resumeOpts = await deps.prepareAssistantResume(meta);
+    }
+    // AI 编排员：恢复时重新挂上编排工具（同一会话身份）。
+    if (meta.purpose === 'hub-orchestrator' && typeof deps.prepareOrchestratorResume === 'function') {
+      resumeOpts = { ...resumeOpts, ...(deps.prepareOrchestratorResume(meta) || {}) };
+    }
     if (meta.meetingId) {
       const meeting = meetingManager.getMeeting(meta.meetingId);
       if (meeting && meeting.groupChat) resumeOpts.noInheritCursor = true;
