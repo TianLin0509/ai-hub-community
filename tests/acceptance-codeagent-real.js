@@ -23,6 +23,11 @@ const skipGroup = argv.includes('--skip-group');
 const onlySteps = arg('--steps') ? new Set(arg('--steps').split(',').map(s => s.trim())) : null;
 const secondModel = arg('--model') || 'MiniMax-M2.7';
 const home = process.env.USERPROFILE || os.homedir();
+// 在 Code Agent 自己的会话里运行本脚本时，会继承「当前会话」的变量；嵌套启动的 CLI 不能带着它们
+// （2026-10-08 公司第二轮实测：清掉这些后嵌套启动正常，登录走 .credentials.json）。
+for (const key of Object.keys(process.env)) {
+  if (/^CODEAGENT_HUB_/.test(key) || ['CODEAGENT3_LAUNCHER_PID', 'CODEAGENT3_X_AUTH_TOKEN'].includes(key)) delete process.env[key];
+}
 const configDir = path.resolve(process.env.AI_HUB_CODEAGENT_CONFIG_DIR || process.env.CODEAGENT3_CONFIG_DIR || path.join(home, '.cac'));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-acceptance-'));
 const out = path.join(root, 'report');
@@ -151,7 +156,9 @@ function transcriptUserTexts(file) {
 
 async function main() {
   if (!exe || !fs.existsSync(exe)) throw new Error('请用 --exe 指定已安装的「AI Hub Community.exe」完整路径（安装回执 JSON 的 executable）');
-  const version = spawnSync('cmd.exe', ['/d', '/s', '/c', (process.env.AI_HUB_CODEAGENT_COMMAND ? `"${process.env.AI_HUB_CODEAGENT_COMMAND}"` : 'codeagent') + ' --version'], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
+  const cliCommand = process.env.AI_HUB_CODEAGENT_COMMAND || 'codeagent';
+  const version = spawnSync('cmd.exe', ['/d', '/c', `chcp 65001>nul & ${/\s/.test(cliCommand) ? `"${cliCommand}"` : cliCommand} --version`],
+    { encoding: 'utf8', windowsHide: true, timeout: 60000, windowsVerbatimArguments: true });
   report.facts.codeagentVersion = redact((version.stdout || version.stderr || '').trim()).slice(0, 200);
   report.facts.node = process.version;
   const before = hookEntries();
@@ -354,6 +361,37 @@ async function main() {
       note('成员回答：' + (state.messages || []).filter(m => m.role === 'assistant').map(m => String(m.content).slice(0, 80)).join(' | '));
     }, { needs: ['hub'] });
   }
+
+  await step('12', '新建会话表单默认选中 CodeAgent，并排在第一位', async note => {
+    // 首页「新建普通会话」与侧栏「启动」按钮都调用这个入口；默认选中的逻辑就在其中。
+    await c.eval(`window.WorkspaceController.openNewSessionModal()`);
+    await until(`document.querySelector('#new-session-submit')?.getBoundingClientRect().width > 0`, '新建会话表单', 20000);
+    const state = await c.eval(`(() => { const grid = document.querySelector('.session-kind-grid'); const sel = document.querySelector('.new-session-option.selected'); return { selected: sel && sel.dataset.kind, first: grid && grid.firstElementChild && grid.firstElementChild.dataset.kind, summary: document.getElementById('new-session-summary')?.innerText || '' }; })()`);
+    note('默认选中：' + state.selected + '；第一位：' + state.first + '；表单摘要：' + state.summary);
+    await c.eval(`document.getElementById('new-session-cancel')?.click()`);
+    if (state.selected !== 'codeagent') throw new Error('默认选中的不是 CodeAgent');
+    if (state.first !== 'codeagent') throw new Error('CodeAgent 不在第一位');
+  }, { needs: ['hub'] });
+
+  await step('13', '浅色主题下 CodeAgent 终端用深色配色（与 CLI 自己的黑底协调）', async note => {
+    const theme = await c.eval(`document.documentElement.getAttribute('data-theme')`);
+    await openTerminal(ctx.a);
+    await sleep(1500);
+    const bg = await c.eval(`terminalCache.get(${j(ctx.a)})?.terminal?.options?.theme?.background || ''`);
+    note('Hub 主题：' + theme + '；CodeAgent 终端背景色：' + bg);
+    await c.eval(`applyViewMode('card')`);
+    if (theme === 'codex' && !/^#0d1117$/i.test(bg)) throw new Error('浅色主题下 CodeAgent 终端不是深色配色');
+  }, { needs: ['turn1'] });
+
+  await step('14', '会话自动命名：第一句话后先显示临时名，再由 CodeAgent 生成正式名字', async note => {
+    const titleOf = () => c.eval(`sessions.get(${j(ctx.a)})?.title || ''`);
+    let title = await titleOf();
+    note('当前标题：' + title);
+    const end = Date.now() + 200000;
+    while (/^CodeAgent( · |\s*\d+$)/.test(title) && Date.now() < end) { await sleep(3000); title = await titleOf(); }
+    note('最终标题：' + title);
+    if (/^CodeAgent( · |\s*\d+$)/.test(title)) throw new Error('3 分钟内没有生成正式名字（仍是临时名或默认名）');
+  }, { needs: ['turn1'] });
 
   report.facts.settingsAfter = (() => { const a = hookEntries(); return { keys: a.keys, foreignHooks: a.foreign && a.foreign.length, hubHooks: a.hub && a.hub.length }; })();
 }
