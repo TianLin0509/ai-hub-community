@@ -91,6 +91,9 @@ class HubChrome {
     throw new Error('未知的网站：' + key);
   }
   async lifecycle(fn) {
+    // The headless inspector holds the exclusive account-check lease for its whole run, and
+    // a person's click or a tool may wait for it to yield while holding this lock.
+    if (this.inspectionOwner) return fn();
     const { acquire } = require('./web-roundtable/store');
     for (const end = Date.now() + 45000; ; ) {
       const release = acquire('lifecycle', path.join(this.root, 'locks'));
@@ -159,7 +162,8 @@ class HubChrome {
   // the live store when it is open; the answer has the same shape either way.
   // Sites without a login cookie get a quick look in a background tab, but only when Chrome
   // is already running — checking never starts the browser.
-  async loginStatus(identityId, { live = true } = {}) {
+  // Cookie-only unless a caller explicitly asks to look at the websites (live: true).
+  async loginStatus(identityId, { live = false } = {}) {
     const identity = this.identity(identityId);
     const running = await this.running();
     const loginOpen = () => ({ identity: identity.id, running: false, loginOpen: true, sites: Object.fromEntries(identity.sites.map(k => [k, { state: 'login_open' }])) });
@@ -183,9 +187,12 @@ class HubChrome {
   }
   // Which ChatGPT account this identity is signed in as, from the site's own session
   // endpoint. Only the email leaves the page; the session's token is never read here.
-  async chatgptAccount(identityId, { signal } = {}) {
+  async chatgptAccount(identityId, options = {}) { return (await this.chatgptCheck(identityId, options)).account || ''; }
+  // One page load; the session endpoint is read at most twice, only once the page itself shows
+  // a signed-in account (2026-10-08: the old loop could call it about 15 times per check).
+  async chatgptCheck(identityId, { signal } = {}) {
     const { targetId } = await this.openTab(identityId, 'https://chatgpt.com/');
-    let page;
+    let page, reads = 0;
     try {
       page = await this.page(targetId);
       for (const end = Date.now() + 15000; Date.now() < end;) {
@@ -197,15 +204,18 @@ class HubChrome {
           require('./web-risk-guard').recordChallenge(this.root, { identity: identityId, site: 'chatgpt', kind: 'cloudflare', source: 'account-check' });
           throw Object.assign(Error('网站安全验证拦截了后台检查'), { code: 'HUB_LOGIN_CHECK_RESTRICTED' });
         }
-        if (probe?.host === 'chatgpt.com' && probe.login) return '';
+        if (probe?.host === 'chatgpt.com' && probe.login) return { state: 'signed_out', account: '' };
+        if (!(probe?.host === 'chatgpt.com' && probe.profile)) { await sleep(1000); continue; }
+        if (reads >= 2) return { state: 'signed_in', account: '' };
+        reads++;
         const email = await page.evaluate(`(async()=>{if(location.hostname!=='chatgpt.com')return '';try{const r=await fetch('/api/auth/session',{credentials:'include',signal:AbortSignal.timeout(4000)});if(!r.ok)return '';const j=await r.json();return (j&&j.user&&j.user.email)||'';}catch{return ''}})()`).catch(e => {
           if (!/Execution context was destroyed|Cannot find context with specified id/i.test(e.message || '')) throw e;
           return '';
         });
-        if (email) return String(email).slice(0, 120);
-        await sleep(800);
+        if (email) return { state: 'signed_in', account: String(email).slice(0, 120) };
+        await sleep(2000);
       }
-      return '';
+      return { state: 'unknown', account: '' };
     } finally { page?.close(); await this.closeTab(targetId); }
   }
   offlineStatus(identityId) {
@@ -279,7 +289,10 @@ class HubChrome {
       // timers are throttled and no animation frame runs, so a Playwright click waits forever
       // for the element to be stable (measured 2026-09-30 on the bridge's send button). Chrome
       // launched by Playwright carries the same three switches.
-      '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding', '--disable-background-timer-throttling',
+      // Only for the debugging Chrome the tools drive. A window a person uses (debug false) gets
+      // none of them: the same profile launched without these passed Cloudflare at once while
+      // the debugging launch looped on "Verify you are human" (2026-10-08).
+      ...(debug ? ['--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding', '--disable-background-timer-throttling'] : []),
       // Set an explicit visible state instead of restoring a parked off-screen window.
       // Measured on Windows Chrome: --window-position overrides --start-maximized,
       // for both the first launch and a new window in an already running browser.
@@ -317,16 +330,43 @@ class HubChrome {
     if (!this.profileHeld()) return [];
     return [{ automated: !!(await this.endpoint()) }];
   }
-  assertAvailable() {
+  yieldFile() { return path.join(this.root, 'locks', 'account-check.yield'); }
+  // A background login check never blocks anyone: a person's click or a tool asks it to
+  // yield (a file, so it works across Hub processes) and waits for it to let go.
+  async waitForCheck(timeoutMs = 30000) {
     if (this.inspectionOwner) return;
-    const { acquire } = require('./web-roundtable/store');
-    const release = acquire('account-check', path.join(this.root, 'locks'));
-    if (!release) throw Error('正在后台检查登录，请等待检查结束或在账号页取消检查');
-    release();
+    const { acquire } = require('./web-roundtable/store'), dir = path.join(this.root, 'locks');
+    for (let asked = false, end = Date.now() + timeoutMs; ; ) {
+      const release = acquire('account-check', dir);
+      if (release) { release(); return; }
+      if (!asked) { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(this.yieldFile(), String(Date.now()), 'utf8'); asked = true; }
+      if (Date.now() > end) throw Error('后台登录确认没有及时让出浏览器，请稍后再试');
+      await sleep(200);
+    }
+  }
+  yieldRequested() { return fs.existsSync(this.yieldFile()); }
+  clearYield() { try { fs.unlinkSync(this.yieldFile()); } catch (e) { if (e.code !== 'ENOENT') throw e; } }
+  // A headless Chrome exists only for a login check. One left behind with no check running
+  // (seen 2026-10-07: alive a whole day, refusing every click with "正在后台检查登录") is
+  // closed when it holds nothing but Hub markers.
+  // Holds the check lease while closing, so a check starting this very moment is never hit.
+  async closeOrphanHeadless(ep, { strict = true } = {}) {
+    if (!ep?.headless || this.inspectionOwner) return false;
+    const release = require('./web-roundtable/store').acquire('account-check', path.join(this.root, 'locks'));
+    if (!release) { if (strict) throw Error('后台登录确认刚刚开始，请稍后再试'); return false; }
+    try {
+      const now = await this.endpoint();
+      if (!now?.headless || now.ws !== ep.ws) return !now;
+      const busy = await this.workTabs();
+      if (busy) { if (strict) throw Error(`后台无头浏览器里还有 ${busy} 个任务页面，等它们结束后再打开`); return false; }
+      await this.close();
+      return true;
+    } finally { release(); }
   }
   async ensure({ headless = false, identityId = this.identities[0].id } = {}) {
-    this.assertAvailable();
-    const existing = await this.endpoint();
+    await this.waitForCheck();
+    let existing = await this.endpoint();
+    if (!headless && await this.closeOrphanHeadless(existing, { strict: false })) existing = null;
     if (existing) {
       routing.assertCurrent(this.root,routing.policy(this.proxyServer()),this.profileHeld());
       if (headless && !existing.headless) throw Error('专属 Chrome 正在使用中，请关闭网页窗口后检查');
@@ -426,7 +466,7 @@ class HubChrome {
     return this.lifecycle(() => this._openTab(identityId, url, { visible }));
   }
   async _openTab(identityId, url, { visible = false } = {}) {
-    if (!visible) require('./web-risk-guard').assertAutomationAllowed(this.root, { identity: identityId, url });
+    if (!visible) require('./web-risk-guard').assertAutomationAllowed(this.root, { identity: identityId, url, navigate: true });
     const { ep, cdp } = await this.browser();
     try {
       const mark = await this.marker(identityId, cdp);
@@ -486,33 +526,42 @@ class HubChrome {
   // debugging port — observed 2026-09-25 in this Hub Chrome, as the Gemini flow found before.
   // Cookies live in the profile, so the next debugging-mode start sees the login.
   async openLogin(identityId, siteKeys) {
+    await this.waitForCheck();
     return this.lifecycle(() => this._openLogin(identityId, siteKeys));
   }
+  // The account page's 打开. It always opens: a background check yields, an orphaned
+  // headless Chrome is closed, and a running Hub Chrome gets a window of its own on screen
+  // (no debugger attached to it) so web tools keep working alongside the person.
   async openWebsite(identityId, siteKey) {
+    this.identity(identityId);
+    const site = this.site(siteKey);
+    await this.waitForCheck();
     return this.lifecycle(async () => {
-      this.assertAvailable();
-      this.identity(identityId);
-      const site = this.site(siteKey);let ep = await this.endpoint();
-      if (ep?.headless) throw Error('正在后台检查登录，请等待结束或取消检查');
-      // This explicit account-page action owns the lifecycle lock. A browser
-      // containing only Hub markers has no website or draft to interrupt.
+      let ep = await this.endpoint();
+      if (await this.closeOrphanHeadless(ep)) ep = null;
+      // A browser containing only Hub markers has no website or draft to interrupt.
       if(ep&&this.routingStatus().state==='restart_required'&&!require('./web-risk-guard').handoff(this.root)&&!(await this.workTabs())){
         await this.close();ep=null;
       }
       const guard = require('./web-risk-guard');
-      if (guard.blocked(this.root, identityId, guard.siteOf(site.url))) {
+      // A cool-down only holds the tools back; the person simply opens the site.
+      if (guard.blocked(this.root, identityId, guard.siteOf(site.url))?.kind !== 'cooldown' && guard.blocked(this.root, identityId, guard.siteOf(site.url))) {
         const { lease, cleared } = await guard.openForHuman(this, { identity: identityId, url: site.url, by: 'account-tab' });
-        return { mode: 'ordinary', handoff: true, until: lease.until, cleared };
+        return { mode: lease.mode, handoff: true, until: lease.until, cleared };
       }
-      // A visible page in a debugging process still has the debugging port. Account-page
-      // visits use the same ordinary Chrome as login, with the same profile and proxy.
-      return this._openOrdinary(identityId, site.url);
+      // A person's ordinary window is open: Chrome adds the page to it.
+      if (!ep && this.profileHeld()) return this._openOrdinary(identityId, site.url);
+      const recent = guard.read(this.root).sites[identityId + ':' + guard.siteOf(site.url)];
+      if (recent && Date.now() - (recent.at || 0) < 24 * 3600000) {
+        try { await guard.resetChallengeCookies(this, identityId, guard.siteOf(site.url), { countersOnly: true }); } catch { /* the visit matters more */ }
+      }
+      return { identity: identityId, mode: 'shared', ...await this._openVisible(identityId, site.url) };
     });
   }
   async assertOrdinaryAvailable() {
-    this.assertAvailable();
-    const ep = await this.endpoint();
-    if (ep?.headless) throw Error('正在后台检查登录，请等待结束或取消检查');
+    await this.waitForCheck();
+    let ep = await this.endpoint();
+    if (await this.closeOrphanHeadless(ep)) ep = null;
     if (ep) {
       const busy = await this.workTabs();
       if (busy > 0) throw Object.assign(Error(`专属 Chrome 中还有 ${busy} 个网页或任务；请先保存并关闭这些标签页，再打开账号网站或去验证，登录记录会保留`), { code: 'HUB_BROWSER_BUSY' });
@@ -533,13 +582,20 @@ class HubChrome {
     await this.launch(identityId, { debug: false, visible: true, newWindow: false, urls: [].concat(urls) });
     return { identity: identityId, mode: 'ordinary', pid: routing.read(this.root)?.pid || this.lastLaunchPid };
   }
+  // 去登录 prefers an ordinary window: Google sign-in refuses a browser with a debugging port.
+  // While web tools have pages open, closing the browser would break their work, so the
+  // login page opens in the running Hub Chrome instead of refusing the click.
   async _openLogin(identityId, siteKeys) {
-    this.assertAvailable();
     const identity = this.identity(identityId);
     const keys = [].concat(siteKeys || identity.sites).filter(Boolean);
     for (const k of keys) if (!identity.sites.includes(k) && !Object.hasOwn(require('./external-accounts').EXTERNAL_SITES, k)) throw new Error(`身份「${identity.label}」不负责 ${this.site(k).name}`);
     const urls = keys.map(k => this.site(k).url);
-    return { ...await this._openOrdinary(identity.id, urls), sites: keys };
+    try { return { ...await this._openOrdinary(identity.id, urls), sites: keys }; }
+    catch (e) {
+      if (e.code !== 'HUB_BROWSER_BUSY') throw e;
+      for (const url of urls) await this._openVisible(identity.id, url);
+      return { identity: identity.id, mode: 'shared', sites: keys };
+    }
   }
   // Any non-marker page may still belong to a task or the user, irrespective of placement.
   async workTabs() {

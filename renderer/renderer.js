@@ -1542,6 +1542,9 @@ function getOrCreateTerminal(sessionId) {
       const s = sessions.get(sessionId);
       if (!s) return;
       if (s.userRenamed || s.autoTitleGenerated) return; // user's Hub rename / Hub auto-title is authoritative
+      // 公司 Code Agent 的窗口标题是「🟡/🟢 + 用户刚发的那句话」或「opentui: 路径」，不是会话摘要，
+      // 交给 Hub 自己的自动起名（2026-10-08 公司实测录屏）。
+      if (String(s.kind || '').startsWith('codeagent')) return;
       // slot 化（2026-05-03 maintainer）：AI 群聊 sub session title 永久绑定 slot 名
       //   （Pikachu/Charmander/Squirtle），不接受 OSC 自动覆盖。
       //   主桌单 session（meetingId === null）仍走 OSC 自动命名（Claude 给的简短摘要）。
@@ -7535,6 +7538,7 @@ ipcRenderer.on('hook-event', (_e, payload = {}) => {
     cwd,
     latestUserMessage,
     backgroundTasks,
+    injectedContinuation,
     sessionCrons,
     error,
     errorDetails,
@@ -7645,7 +7649,7 @@ ipcRenderer.on('hook-event', (_e, payload = {}) => {
     updateFloatingBarState();
     scheduleSessionListRender();
   }
-  else if (event === 'prompt') onPromptSubmittedFromHook(sessionId, eventAt, { provider: payload.provider, turnId });
+  else if (event === 'prompt') onPromptSubmittedFromHook(sessionId, eventAt, { provider: payload.provider, turnId, injected: injectedContinuation === true });
   else if (event === 'stop-failure') onClaudeStopFailure(sessionId, eventAt, {
     error,
     errorDetails,
@@ -7715,7 +7719,11 @@ function onPromptSubmittedFromHook(sessionId, submittedAt = Date.now(), options 
   const session = sessions.get(sessionId);
   if (!session) return;
   notePtyTurnBoundary(session);
-  const transition = applyPromptSubmitted(session, { submittedAt, turnId: options.turnId });
+  // Claude Code 在后台任务结束或 Monitor 产生事件时，会自己注入一条
+  // <task-notification> 续跑一轮，并照样发 UserPromptSubmit。这不是用户发言：
+  // 未读要留着，后台任务清单也要留到这一轮的 Stop 带来新清单为止。
+  const injected = options.injected === true;
+  const transition = applyPromptSubmitted(session, { submittedAt, turnId: options.turnId, acknowledgesReply: !injected });
   if (!transition.applied) return;
   session.currentCardActivity = null;
   session.liveToolActivities = [];
@@ -7727,7 +7735,7 @@ function onPromptSubmittedFromHook(sessionId, submittedAt = Date.now(), options 
   session._runSource = 'semantic';
   session._lastOutputTs = transition.at;
   session.lastError = null;
-  session._claudeBackgroundTasks = [];
+  if (!injected) session._claudeBackgroundTasks = [];
   observeSessionRuntime(session, {
     state: RUNTIME_STARTING,
     source: options.provider === 'codex' ? 'codex-user-prompt-submit' : 'claude-user-prompt-submit',
@@ -7792,6 +7800,17 @@ function onReplyCompleteFromTranscriptEvent(payload) {
     // counting unread when Stop arrives as well. Native stream-json has no Stop
     // hook and must use the ordered completion reducer below.
     const at = normalizeEventTime(completedAt, Date.now());
+    // 这一轮的文字写完了，但 Stop 报告后台还有 Shell / Monitor 在跑：Claude 等它们
+    // 有动静还会自己续跑，会话仍是活跃的。只记下这条回复，不关这一轮。
+    if (activeClaudeBackgroundTasks(session._claudeBackgroundTasks).length > 0) {
+      session._lastTranscriptReadySig = sig;
+      session.lastMessageTime = Math.max(Number(session.lastMessageTime) || 0, at);
+      session.lastOutputPreview = preview;
+      recordSessionArtifacts(session, text || preview, at);
+      scheduleSessionListRender();
+      schedulePersist();
+      return;
+    }
     const startedAt = Number(session.runStartedAt) || Number(session.lastRunStartedAt) || 0;
     if (startedAt > 0 && at >= startedAt) {
       session.lastRunStartedAt = startedAt;
@@ -8071,7 +8090,9 @@ function onReplyCompleteFromHook(sessionId, completedAt = Date.now(), options = 
       state: RUNTIME_RUNNING,
       source: 'claude-background-tasks',
       confidence: CONFIDENCE_AUTHORITATIVE,
-      observedAt: transition.at,
+      // transcript 的终态可能先到一步，并以处理时刻记成「完成」。Stop 带来的后台任务
+      // 清单是更新的事实，用处理时刻记，才不会被那条更早的完成当成过期观察丢掉。
+      observedAt: Math.max(transition.at, Date.now()),
       startedAt: session.runStartedAt || session.lastRunStartedAt || transition.at,
       evidence: backgroundTasks.map(task => task.description || task.type || task.id).filter(Boolean).join('；'),
     });
@@ -9159,9 +9180,6 @@ function persistWorkscene(flush = false) {
         kimiSessionDir: s.kimiSessionDir || null,
         purpose: s.purpose || null,
         researchSessionId: s.researchSessionId || null,
-        xresearchTaskId: s.xresearchTaskId || null,
-        heroIds: Array.isArray(s.heroIds) ? s.heroIds : null,
-        promptPolicyVersion: s.promptPolicyVersion || null,
         hiddenFromSidebar: !!s.hiddenFromSidebar,
         completionNotificationEnabled: s.completionNotificationEnabled === true,
       });
@@ -9524,9 +9542,6 @@ sessionImmersive = require('./session-immersive').createSessionImmersiveControll
         kimiSessionDir: meta.kimiSessionDir || null,
         purpose: meta.purpose || null,
         researchSessionId: meta.researchSessionId || null,
-        xresearchTaskId: meta.xresearchTaskId || null,
-        heroIds: Array.isArray(meta.heroIds) ? meta.heroIds : null,
-        promptPolicyVersion: meta.promptPolicyVersion || null,
         hiddenFromSidebar: !!meta.hiddenFromSidebar,
         completionNotificationEnabled: meta.completionNotificationEnabled === true,
       });

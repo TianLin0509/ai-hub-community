@@ -161,9 +161,6 @@ function buildSessionResumeMeta(session, overrides = {}) {
       : null,
     purpose: session.purpose || null,
     researchSessionId: session.researchSessionId || null,
-    xresearchTaskId: session.xresearchTaskId || null,
-    heroIds: Array.isArray(session.heroIds) ? session.heroIds.slice() : null,
-    promptPolicyVersion: session.promptPolicyVersion || null,
     hiddenFromSidebar: !!session.hiddenFromSidebar,
   };
   return { ...meta, ...(overrides || {}) };

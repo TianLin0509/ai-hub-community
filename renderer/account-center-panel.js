@@ -7,6 +7,13 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
   const search = page.querySelector('.ac-search'), tabs = page.querySelector('.ac-tabs');
   let state = null, signature = '', view = 'list', error = '', notice = '', busy = '', timer, previousFocus, epoch = 0, request = 0;
   let toolGroups = null;
+  // Sidebar badge: accounts whose login or human check needs the person (main process count).
+  function setBadge(n) {
+    const count = document.getElementById('accounts-attention');
+    if (!count || !Number.isInteger(n)) return;
+    count.textContent = n; count.hidden = !n;
+    count.title = n ? n + ' 个账号需要重新登录或验证' : '';
+  }
   let toolAccounts = null, toolAccountsError = '', toolAccountsFlight = null;
   const toolChoices = {};
   function selectTab(id) {
@@ -15,7 +22,7 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
     tabs.querySelector('[aria-selected="true"]')?.focus();
   }
   function footerHtml() {
-    return `<footer class="ac-footnote"><span>网页共用 AI Hub 专属 Chrome · 打开网页只记录打开时间</span><details class="ac-connections" data-details="connections"><summary>工具连接</summary>${toolConnections(toolAccounts, esc, state?.activity)}${toolAccountsError ? `<p class="ac-item-error">${esc(toolAccountsError)}</p>` : ''}${toolsHtml()}</details></footer>`;
+    return `<footer class="ac-footnote"><span>「打开」用你自己的浏览器（AI 不碰它）；状态显示 AI 浏览器的登录，生图、中转、圆桌用的是它</span><details class="ac-connections" data-details="connections"><summary>工具连接</summary>${toolConnections(toolAccounts, esc, state?.activity)}${toolAccountsError ? `<p class="ac-item-error">${esc(toolAccountsError)}</p>` : ''}${toolsHtml()}</details></footer>`;
   }
   async function call(action, args) {
     const r = await ipcRenderer.invoke('hub-accounts:' + action, args);
@@ -25,7 +32,9 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
   function renderStatus() {
     const el = page.querySelector('.ac-status'), text = error || notice;
     el.textContent = text; el.hidden = !text; el.classList.toggle('error', !!error);
-    for (const b of page.querySelectorAll('[data-ac="open"],[data-ac="login"],[data-ac="recover"],[data-ac="add"],[data-ac="preferred"],[data-ac="authorize"],[data-ac="tools"],[data-ac="tools-connect"],[data-ac="external"]')) b.disabled = !!busy || state?.setupProgress?.status === 'running' || state?.progress?.status === 'running';
+    // A background login check never disables 打开: clicking makes the check yield.
+    for (const b of page.querySelectorAll('[data-ac="open"],[data-ac="login"],[data-ac="add"],[data-ac="preferred"],[data-ac="authorize"],[data-ac="external"]')) b.disabled = !!busy || state?.setupProgress?.status === 'running';
+    for (const b of page.querySelectorAll('[data-ac="recover"],[data-ac="recheck"],[data-ac="copy-logins"],[data-ac="tools"],[data-ac="tools-connect"]')) b.disabled = !!busy || state?.setupProgress?.status === 'running' || state?.progress?.status === 'running';
     for (const b of page.querySelectorAll('[data-ac="codex-quota"]')) b.disabled=!!busy || !!state?.clis?.find(c=>c.kind==='codex' && c.profileId===b.dataset.profile)?.isDefault;
   }
   function toolsHtml() {
@@ -38,8 +47,7 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
   function render() {
     if (page.hidden) return;
     position();
-    const n = Object.values(state?.activity?.entries || {}).filter(a => ['login_required', 'verification_required'].includes(a.outcome)).length, count = document.getElementById('accounts-attention');
-    if (count) { count.textContent = n; count.hidden = !n; }
+    if (state) setBadge(state.attention);
     document.getElementById('account-editor').hidden = view !== 'config'; body.hidden = view === 'config';
     page.querySelector('[data-ac="back"]').hidden = view !== 'config';
     tabs.hidden = search.hidden = view === 'config';
@@ -56,8 +64,8 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
     if (tab === 'ai' && !search.value) body.innerHTML += footerHtml();
     if (state.activity?.warnings?.length) body.innerHTML += `<p class="ac-item-error">${esc(state.activity.warnings.join(' / '))}</p>`;
     if (tab === 'ai' && (state.webTools?.images?.readError || state.webTools?.roundtable?.recoveryError)) body.innerHTML += '<p class="ac-item-error">部分网页工具状态读取失败；请在原会话查看任务结果。</p>';
-    if (state.progress?.status === 'running') body.innerHTML += `<p class="ac-connection-notice" role="status">${esc(state.progress.stage)} · ${state.progress.done}/${state.progress.total} <button class="ac-text-btn" data-ac="check-cancel">取消复核</button></p>`;
-    else if (state.progress?.error || state.progress?.warnings?.length) body.innerHTML += `<p class="ac-item-error">${esc(state.progress.error || state.progress.warnings.join(' / '))}</p>`;
+    if (state.progress?.status === 'running') body.innerHTML += `<p class="ac-connection-notice" role="status">${esc('正在后台确认登录（' + state.progress.done + '/' + state.progress.total + '），不影响打开网页')}</p>`;
+    else if (!state.progress?.auto && (state.progress?.error || state.progress?.warnings?.length)) body.innerHTML += `<p class="ac-item-error">${esc(state.progress.error || state.progress.warnings.join(' / '))}</p>`;
     for (const d of body.querySelectorAll('details')) d.open = expanded.includes(d.dataset.details);
     renderStatus();
   }
@@ -110,6 +118,7 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
     if (busy) return;
     busy = name; error = ''; notice = ''; renderStatus();
     if (['external', 'open', 'login'].includes(name)) { notice = '正在打开官方入口…'; renderStatus(); }
+    if (name === 'copy-logins') { notice = '正在把你的登录复制给 AI 浏览器…'; renderStatus(); }
     const ticket = epoch; ++request;
     try {
       const result = await call(name, args);
@@ -118,6 +127,7 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
       else if (name === 'tools-connect') { state.setupProgress = result; render(); }
       else if (name === 'external') { notice = result.message; await refresh(); await refreshToolAccounts(); }
       else if (name === 'open' || name === 'login') { notice = result.message; await refresh(); }
+      else if (name === 'copy-logins') { notice = result.message; apply(result); }
       else apply(result);
     } catch (e) { if (ticket === epoch) error = e.message; }
     finally { busy = ''; if (ticket === epoch) renderStatus(); schedule(); }
@@ -178,7 +188,9 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
     else if (a === 'tab') selectTab(b.dataset.tab);
     else if (a === 'open') void action('open', args);
     else if (a === 'login') void action('login', args);
-    else if (a === 'recover') void action('check-start', args);
+    else if (a === 'recover') void action('check-start', { ...args, live: true });
+    else if (a === 'recheck') void action('check-start', args);
+    else if (a === 'copy-logins') void action('copy-logins', args);
     else if (a === 'check-cancel') void action('check-cancel', {});
     else if (a === 'add' || a === 'preferred') void action('preference', { ...args, add: a === 'add' });
     else if (a === 'authorize') void authorize(b.dataset.id);
@@ -210,6 +222,8 @@ function createAccountCenterPanel({ document, ipcRenderer, escapeHtml: esc, conf
   });
   document.addEventListener('hub-account-config-saved', () => { notice = '接入配置已保存。'; void refresh(); });
   ipcRenderer.on('codex-global-account-changed',()=>{if(!page.hidden)void refresh();});
+  ipcRenderer.on('hub-accounts:attention', (_event, n) => setBadge(n));
+  void ipcRenderer.invoke('hub-accounts:attention').then(r => { if (r?.ok) setBadge(r.data); }).catch(() => {});
   ipcRenderer.on('launch-auth-status',(_event,result)=>{if(!page.hidden){notice=result.message;void refresh();}});
   window.addEventListener('resize', position);
   return { open, close, refresh };

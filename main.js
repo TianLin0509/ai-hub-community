@@ -69,7 +69,7 @@ const {
   attachCodexUsageScope,
   filterUsageCacheForCodexScope,
 } = require('./core/codex-usage-scope.js');
-const { ALL_AI_KINDS, isClaudeFamily, isCodexCliKind, isKimiCliKind, SLOT_IDS, KIND_LABELS, getSlotPromptName, getSlotDisplayLabel, slotIdToIndex, slotIndexToId } = require('./core/ai-kinds.js');
+const { ALL_AI_KINDS, isClaudeFamily, isCodexCliKind, isKimiCliKind, isCodeAgentKind, SLOT_IDS, KIND_LABELS, getSlotPromptName, getSlotDisplayLabel, slotIdToIndex, slotIndexToId } = require('./core/ai-kinds.js');
 const { registerConfigIpc } = require('./main/ipc/config-handlers.js');
 const { registerWorkbenchOperationsIpc } = require('./main/ipc/workbench-operations-handlers.js');
 const { createWorkbenchOperationsService } = require('./core/workbench-operations.js');
@@ -142,7 +142,7 @@ function isCodexBaseKind(kind) {
 }
 const { readLastAssistantMessage } = require('./core/read-last-assistant.js');
 const { readTranscriptTail } = require('./core/session-manager');
-const { parseClaudeTranscriptToTurns } = require('./core/claude-transcript-parser.js');
+const { parseClaudeTranscriptToTurns, isTaskNotificationText } = require('./core/claude-transcript-parser.js');
 const { TranscriptParserService } = require('./core/transcript-parser-service.js');
 const { CodexJsonlUsageService } = require('./main/usage/codex-jsonl-usage-service.js');
 const {
@@ -367,6 +367,8 @@ async function readLastUserMessage(transcriptPath) {
           if (hasTool) continue;
           text = msg.content.filter(c => c && c.type === 'text').map(c => c.text || '').join(' ').trim();
         }
+        // 后台任务 / Monitor 的续跑由引擎注入，不是用户说的话，继续往前找真正的提问。
+        if (entry.origin?.kind === 'task-notification' || isTaskNotificationText(text)) continue;
         if (text) return text;
       }
       tail = firstFragment == null ? '' : firstFragment;
@@ -1854,6 +1856,7 @@ try {
       return { extract: file => require('./core/hub-assistant/podcast/extract').extract(file, { electron }),
         writers: [sc.claudeWriter({ cwd: getHubDataDir() }), sc.qwenWriter({ source: () => fl.fastLaneSources({ dataDir: getHubDataDir(), safeStorage: electron.safeStorage }).find(s => s.via === 'token-plan') })],
         synthesize: (text, out) => voice.synthesize(text, out, { credentials: () => require('./core/hub-phone/voice').dashscopeCredentials({ dataDir: getHubDataDir(), safeStorage: electron.safeStorage }) }) }; })(),
+    onWorkbenchChanged: () => { sendToRenderer('assistant:workbench-changed', {}); phoneService?.kick?.(); },
     onPodcastsChanged: () => { sendToRenderer('assistant:podcasts-changed', {}); phoneService?.kick?.(); },
     openPath: file => shell.openPath(file),
     getMeetings: () => meetingManager.getAllMeetings(),
@@ -2334,7 +2337,7 @@ const hookServer = http.createServer((req, res) => {
       if (isHook) {
         const event = req.url.slice('/api/hook/'.length);
         const eventAt = Date.now();
-        const boundClaudeSessionId = String(hookTargetSession.ccSessionId || '');
+        let boundClaudeSessionId = String(hookTargetSession.ccSessionId || '');
         const incomingClaudeSessionId = String(parsed.claudeSessionId || '');
         let initialCwdMismatch = false;
         let initialTranscriptBucketMismatch = false;
@@ -2349,6 +2352,34 @@ const hookServer = http.createServer((req, res) => {
             initialTranscriptBucketMismatch = path.basename(path.dirname(parsed.transcriptPath)).toLowerCase()
               !== projectSlug(hookTargetSession.cwd).toLowerCase();
           } catch {}
+        }
+        // 公司 Code Agent 不认 --session-id，Hub 启动时无法预定身份（core/codeagent-config.js）。
+        // 待绑定期间（新建、分支、没有记录可恢复的重启），工作目录与记录所在目录都对得上的第一个
+        // 顶层 hook 就是这个会话本人：绑定后立刻撤掉待绑定标记，之后与 Claude 一样严格拒收外来 id。
+        // 子代理（agentId）和在会话里另起的 CLI（目录不同）不会被当成本人。
+        if (hookTargetSession.codeagentIdentityPending === true && isCodeAgentKind(hookTargetSession.kind)
+            && !parsed.agentId && incomingClaudeSessionId && hookTargetSession.cwd) {
+          let sameCwd = false;
+          let sameBucket = !parsed.transcriptPath;
+          try { sameCwd = !parsed.cwd || path.resolve(parsed.cwd).toLowerCase() === path.resolve(hookTargetSession.cwd).toLowerCase(); } catch {}
+          try {
+            if (parsed.transcriptPath) sameBucket = path.basename(path.dirname(parsed.transcriptPath)).toLowerCase()
+              === projectSlug(hookTargetSession.cwd).toLowerCase();
+          } catch {}
+          if (sameCwd && sameBucket) {
+            sessionManager.updateSessionMeta(parsed.sessionId, { codeagentIdentityPending: false, ccSessionId: null });
+            const bound = updateSessionTranscriptBinding(parsed.sessionId, {
+              ccSessionId: incomingClaudeSessionId, transcriptPath: parsed.transcriptPath, cwd: parsed.cwd,
+            });
+            if (bound && bound.ccSessionId === incomingClaudeSessionId) {
+              boundClaudeSessionId = incomingClaudeSessionId;
+              console.log(`[codeagent hook] ${parsed.sessionId.slice(0, 8)} bound to CLI identity ${incomingClaudeSessionId.slice(0, 8)} (${event})`);
+              if (parsed.transcriptPath) void transcriptTap.watchClaudeTranscript(parsed.sessionId, parsed.transcriptPath, { turnId: null, newTurn: false });
+              if (event === 'session-start') { res.writeHead(200); res.end(JSON.stringify({ ok: true, identity: 'bound' })); return; }
+            } else {
+              sessionManager.updateSessionMeta(parsed.sessionId, { codeagentIdentityPending: true });
+            }
+          }
         }
         // PTY Claude 的身份生命周期：/clear、/resume、退出后重启都会换 session_id。
         // 只有当前绑定的会话先发出 SessionEnd，随后的新 SessionStart 才允许改绑；
@@ -2412,7 +2443,10 @@ const hookServer = http.createServer((req, res) => {
         // payload) fall back to reading the transcript JSONL tail (async —
         // long transcripts used to block the main-process event loop).
         let latestUserMessage = null;
-        if (typeof parsed.prompt === 'string' && parsed.prompt.trim()) {
+        // Claude Code 在后台任务结束或 Monitor 出事件时自己注入 <task-notification> 续跑，
+        // 也会发 UserPromptSubmit。它不是用户发言：不当预览、不起标题、不算已读。
+        const injectedContinuation = event === 'prompt' && isTaskNotificationText(parsed.prompt);
+        if (!injectedContinuation && typeof parsed.prompt === 'string' && parsed.prompt.trim()) {
           latestUserMessage = parsed.prompt;
         } else if (event === 'stop' && parsed.transcriptPath) {
           latestUserMessage = await readLastUserMessage(parsed.transcriptPath);
@@ -2479,6 +2513,7 @@ const hookServer = http.createServer((req, res) => {
           cwd: parsed.cwd,
           latestUserMessage,
           backgroundTasks: Array.isArray(parsed.backgroundTasks) ? parsed.backgroundTasks : [],
+          injectedContinuation,
           sessionCrons: Array.isArray(parsed.sessionCrons) ? parsed.sessionCrons : [],
           error: parsed.error || null,
           errorDetails: parsed.errorDetails || null,
@@ -2826,6 +2861,10 @@ hubAccountsService = new (require('./core/hub-accounts').HubAccounts)({
   recovery: new (require('./core/web-roundtable/recovery').AccountRecovery)({ dataDir: getHubDataDir() }),
 });
 require('./main/ipc/hub-accounts-handlers').registerHubAccountsIpc(ipcMain, hubAccountsService);
+// About twice a day the logins are confirmed in the background; the sidebar shows how many
+// accounts need the person.
+hubAccountsService.startAuto({ onAttention: count => sendToRenderer('hub-accounts:attention', count) });
+app.on('before-quit', () => hubAccountsService.stopAuto());
 
 require('./main/ipc/voice-input-handlers').registerVoiceInputIpc(ipcMain, {
   app, safeStorage: require('electron').safeStorage,
@@ -3277,13 +3316,28 @@ app.whenReady().then(async () => {
   //   scripts/session-hub-hook.py 也不存在。与 findTranscriptByCCSessionId 的
   //   candidateRoots 列表对齐，单一真理源应在 ai-kinds.js（后续可重构）。
   for (const claudeDir of claudeDirs) ensureHooksDeployed(claudeDir);
+  // 公司 Code Agent（Claude 形态，core/codeagent-config.js）：配置目录已存在才部署，不凭空创建 ~/.cac。
+  // 隔离 Hub 只在测试显式指定了它的配置目录时部署，绝不碰真实 home。
+  const codeagentHookTargets = [];
+  try {
+    const codeagentConfig = require('./core/codeagent-config').resolveCodeAgentConfig(process.env);
+    const allowed = isIsolatedHub() ? !!process.env.AI_HUB_CODEAGENT_CONFIG_DIR : true;
+    if (allowed && fs.existsSync(codeagentConfig.configDir)) {
+      const settingsOptions = { events: require('./core/codeagent-config').HOOK_EVENTS,
+        manageStatusLine: false, managePermissionMode: false };
+      const result = ensureClaudeHookIntegration({ claudeDir: codeagentConfig.configDir,
+        sourceScriptsDir: hookSourceScriptsDir, logger: console, settingsOptions });
+      if (result.errors.length) console.warn(`[codeagent-hooks] ${codeagentConfig.configDir}: ${result.errors.join('；')}`);
+      codeagentHookTargets.push({ dir: codeagentConfig.configDir, settingsOptions });
+    }
+  } catch (error) { console.warn('[codeagent-hooks] skipped:', error.message); }
   // settings.json can be rewritten by Claude settings/plugin changes while the
   // Hub keeps running. A one-time boot merge is therefore insufficient: the
   // screenshot incident had UserPromptSubmit=[] and no Hub Stop hook five
   // hours after launch. Periodically repair only Hub-owned entries.
-  if (claudeDirs.length) {
+  if (claudeDirs.length || codeagentHookTargets.length) {
     claudeHookWatchdog = startClaudeHookIntegrationWatchdog({
-      claudeDirs,
+      claudeDirs: [...claudeDirs, ...codeagentHookTargets],
       sourceScriptsDir: hookSourceScriptsDir,
       logger: console,
     });

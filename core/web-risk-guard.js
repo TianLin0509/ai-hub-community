@@ -21,6 +21,16 @@ const FILE = 'web-risk.json';
 // Paused, not failed: a site that challenged automation is left alone this long.
 const BACKOFF_MS = [30, 120, 360, 1440].map(m => m * 60000);
 const HANDOFF_MS = 15 * 60000;
+// After a person verified or signed in, automation waits this long before touching the site
+// again (2026-10-08: right after a pass, two lanes and a login check hit chatgpt.com within
+// seconds; Cloudflare's session scoring treats such a burst as the same session acting oddly).
+const COOLDOWN_MS = 20 * 60000;
+// Automated page loads per identity and site in any rolling hour. A restrained person, not a
+// crawler: an image job costs 2-4 loads, a roundtable answer one. Cloudflare-fronted
+// subscription sites get the smallest budget.
+const VISITS_PER_HOUR = { chatgpt: 30, claude: 10, google: 30 };
+const DEFAULT_VISITS_PER_HOUR = 60;
+const HOUR_MS = 3600000;
 const STRIKE_MEMORY_MS = 24 * 3600000;
 // Challenge-state cookies only. Login cookies are never touched.
 const CHALLENGE_COOKIE = /^(cf_clearance|__cf_bm|cf_chl_[a-z_]*)$/;
@@ -65,8 +75,9 @@ function file(root) { return path.join(root, FILE); }
 function read(root) {
   try {
     const value = JSON.parse(fs.readFileSync(file(root), 'utf8'));
-    return { handoff: value.handoff || null, sites: value.sites && typeof value.sites === 'object' ? value.sites : {} };
-  } catch { return { handoff: null, sites: {} }; }
+    return { handoff: value.handoff || null, sites: value.sites && typeof value.sites === 'object' ? value.sites : {},
+      visits: value.visits && typeof value.visits === 'object' ? value.visits : {} };
+  } catch { return { handoff: null, sites: {}, visits: {} }; }
 }
 // Several processes (Hub, image lanes, bridge) share the file: short exclusive lock, atomic write.
 function update(root, fn) {
@@ -113,6 +124,29 @@ function clearSite(root, identity, site) {
 function releaseSite(root, identity, site, now = Date.now()) {
   return update(root, state => { const e = state.sites[key(identity, site)]; if (e) e.until = Math.min(e.until, now); return !!e; });
 }
+// The person finished: automation may come back after a cool-down, not at once. Strikes stay.
+// Only sites fronted by Cloudflare's session scoring cool down; a domestic slider check
+// passed by the person lets automation continue at once.
+const COOLING_SITES = new Set(['chatgpt', 'claude', 'google']);
+function coolSite(root, identity, site, now = Date.now(), ms = COOLDOWN_MS) {
+  if (!COOLING_SITES.has(site)) return releaseSite(root, identity, site, now);
+  return update(root, state => {
+    const prev = state.sites[key(identity, site)];
+    state.sites[key(identity, site)] = { ...(prev || { identity, site, strikes: 0, since: now, at: prev?.at || 0 }),
+      kind: 'cooldown', source: 'handoff', until: now + ms };
+    return state.sites[key(identity, site)];
+  });
+}
+// Counts one automated page load against the hourly budget, or refuses it.
+function takeVisit(root, identity, site, now = Date.now()) {
+  const limit = VISITS_PER_HOUR[site] || DEFAULT_VISITS_PER_HOUR;
+  return update(root, state => {
+    const visits = state.visits[key(identity, site)] = (state.visits[key(identity, site)] || []).filter(t => now - t < HOUR_MS);
+    if (visits.length >= limit) return { refused: true, limit, until: visits[0] + HOUR_MS };
+    visits.push(now);
+    return { refused: false, limit, used: visits.length };
+  });
+}
 function blocked(root, identity, site, now = Date.now()) {
   const entry = site && read(root).sites[key(identity, site)];
   return entry && entry.until > now ? entry : null;
@@ -129,11 +163,19 @@ function endHandoff(root, id) {
 }
 // Every automation transport calls this before touching a page. Errors carry a stable code
 // and a category word ('Human handoff' / 'Site challenged') for tools that only see stdout.
-function assertAutomationAllowed(root, { identity, url, now = Date.now() } = {}) {
+// `navigate`: the caller is about to load a page of that site; it counts against the hourly
+// budget. Steps on an already open page pass `navigate` false and cost nothing.
+function assertAutomationAllowed(root, { identity, url, navigate = false, now = Date.now() } = {}) {
   const lease = handoff(root, now);
   if (lease) throw Object.assign(Error(`Human handoff: 有人正在 Hub 浏览器里验证或登录（${lease.identity}/${lease.site || '网站'}），自动化暂停到 ${new Date(lease.until).toLocaleTimeString()}`), { code: 'HUB_HUMAN_HANDOFF', until: lease.until });
   const site = url && siteOf(url), entry = site && blocked(root, identity, site, now);
+  // Its own word: tools must treat it as "try later", never as a new human check.
+  if (entry && entry.kind === 'cooldown') throw Object.assign(Error(`Hub cooldown: ${identity}/${site} 刚由人完成验证或登录，自动化冷静到 ${new Date(entry.until).toLocaleTimeString()}`), { code: 'HUB_COOLDOWN', until: entry.until, site, cooldown: true });
   if (entry) throw Object.assign(Error(`Site challenged: ${identity}/${site} 刚遇到人机验证，自动化暂停到 ${new Date(entry.until).toLocaleTimeString()}；请在账号页打开网站完成验证`), { code: 'HUB_SITE_CHALLENGED', until: entry.until, site });
+  if (navigate && site) {
+    const visit = takeVisit(root, identity, site, now);
+    if (visit.refused) throw Object.assign(Error(`Rate limited by Hub: ${identity}/${site} 一小时内自动打开网页已达 ${visit.limit} 次，到 ${new Date(visit.until).toLocaleTimeString()} 再继续`), { code: 'HUB_RATE_LIMITED', until: visit.until, site });
+  }
 }
 
 // Page-level check after a navigation or a failed step. `page` is a Playwright page or a raw
@@ -162,7 +204,7 @@ async function inspectAndLeave(root, { identity, page, cdp, url, source, probeTi
 async function runProtected(root, options, fn) {
   try { return await fn(); }
   catch (error) {
-    if (!/^(Site challenged|Human handoff)/.test(error?.message || '') && !handoff(root)
+    if (!/^(Site challenged|Human handoff|Hub cooldown|Rate limited by Hub)/.test(error?.message || '') && !handoff(root)
       && await inspectAndLeave(root, options)) {
       throw Object.assign(Error('Site challenged: the page asked for human verification; left it and paused this site'), { cause: error });
     }
@@ -172,17 +214,22 @@ async function runProtected(root, options, fn) {
 
 // Delete challenge-state cookies of one identity's site (partitioned ones included). Runs
 // through the identity's own local marker page, never through a website tab.
-async function resetChallengeCookies(hub, identity, site) {
+// Storage.getCookies with the marker's context id fails for the default profile ("Failed to
+// find browser context", 2026-10-08), which left every earlier reset silently undone; the
+// marker page's own cookie store is that identity's profile, partitioned cookies included.
+async function resetChallengeCookies(hub, identity, site, { countersOnly = false } = {}) {
   const hosts = SITES[site] || [];
   const { cdp } = await hub.browser();
   try {
     const marker = await hub.marker(identity, cdp);
-    const { cookies } = await cdp.call('Storage.getCookies', { browserContextId: marker.browserContextId });
+    const reader = await hub.page(marker.targetId);
+    let cookies;
+    try { ({ cookies } = await reader.call('Network.getAllCookies')); } finally { reader.close(); }
     const ofSite = host => hosts.some(h => host === h || host.endsWith('.' + h));
     const partitionHost = c => { try { return new URL(c.partitionKey?.topLevelSite || '').hostname; } catch { return ''; } };
     // Only this site's check state: its own cookies, and Cloudflare's challenge cookies that are
     // partitioned under this site. Another site's check state and every login cookie stay.
-    const doomed = cookies.filter(c => CHALLENGE_COOKIE.test(c.name) && hosts.length
+    const doomed = cookies.filter(c => CHALLENGE_COOKIE.test(c.name) && (!countersOnly || /^cf_chl_/.test(c.name)) && hosts.length
       && (ofSite(c.domain.replace(/^\./, '')) || (c.domain.replace(/^\./, '').endsWith('cloudflare.com') && ofSite(partitionHost(c)))));
     if (!doomed.length) return 0;
     const page = await hub.page(marker.targetId);
@@ -197,16 +244,21 @@ async function resetChallengeCookies(hub, identity, site) {
 // state for that site, then a visible window on screen with no debugger attached to it.
 async function openForHuman(hub, { identity, url, by = '', reset = true }) {
   const root = hub.root, site = siteOf(url);
-  // Do not reset cookies, pause another task, or close a page with a draft when busy.
-  await hub.assertOrdinaryAvailable();
+  // An ordinary window when the browser is free. While tools have pages open, closing it
+  // would break their work: the person gets a window in the running Hub Chrome instead,
+  // with no debugger attached, and the lease ends when that window's page is closed.
+  let shared = false;
+  try { await hub.assertOrdinaryAvailable(); }
+  catch (e) { if (e.code !== 'HUB_BROWSER_BUSY') throw e; shared = true; }
   const lease = startHandoff(root, { identity, site, url, by });
   let cleared = 0;
   try { if (site && reset) cleared = await resetChallengeCookies(hub, identity, site); } catch {}
   let opened;
-  try { opened = await hub._openOrdinary(identity, url); }
+  try { opened = shared ? { mode: 'shared', ...await hub._openVisible(identity, url) } : await hub._openOrdinary(identity, url); }
   catch (e) { endHandoff(root, lease.id); throw e; }
-  update(root, state => { if (state.handoff?.id === lease.id) Object.assign(state.handoff, { mode: opened.mode, browserPid: opened.pid }); });
-  return { lease: { ...lease, mode: opened.mode, browserPid: opened.pid }, cleared, site };
+  const extra = shared ? { mode: 'shared', targetId: opened.targetId } : { mode: opened.mode, browserPid: opened.pid };
+  update(root, state => { if (state.handoff?.id === lease.id) Object.assign(state.handoff, extra); });
+  return { lease: { ...lease, ...extra }, cleared, site };
 }
 
 // The person closed the window we gave them: they are done, automation may resume. Check the
@@ -221,7 +273,7 @@ async function settleHandoff(hub) {
     // Ordinary Chrome has no CDP target. Its profile lock is the completion signal;
     // expiry alone must never let a tool take over a person's open browser.
     if (await hub.endpoint() || hub.profileHeld()) return lease;
-    if (endHandoff(hub.root, lease.id) && lease.site) releaseSite(hub.root, lease.identity, lease.site);
+    if (endHandoff(hub.root, lease.id) && lease.site) coolSite(hub.root, lease.identity, lease.site);
     return null;
   }
   if (!lease?.targetId) return lease || null;
@@ -236,9 +288,9 @@ async function settleHandoff(hub) {
     if (targetInfos.some(t => t.targetId === lease.targetId)) return lease;
   } finally { cdp.close(); }
   // Closing the window is the person's "done": automation may try that site once more.
-  if (endHandoff(hub.root, lease.id) && lease.site) releaseSite(hub.root, lease.identity, lease.site);
+  if (endHandoff(hub.root, lease.id) && lease.site) coolSite(hub.root, lease.identity, lease.site);
   return null;
 }
 
-module.exports = { siteOf, CHALLENGE_PROBE, CHALLENGE_COOKIE, BACKOFF_MS, HANDOFF_MS, read, recordChallenge, clearSite, releaseSite, blocked, runProtected,
+module.exports = { siteOf, CHALLENGE_PROBE, CHALLENGE_COOKIE, BACKOFF_MS, HANDOFF_MS, COOLDOWN_MS, VISITS_PER_HOUR, read, recordChallenge, clearSite, releaseSite, coolSite, takeVisit, blocked, runProtected,
   handoff, startHandoff, endHandoff, assertAutomationAllowed, inspectAndLeave, resetChallengeCookies, openForHuman, settleHandoff };

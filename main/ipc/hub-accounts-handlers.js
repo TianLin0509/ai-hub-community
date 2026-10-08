@@ -6,6 +6,7 @@ function registerHubAccountsIpc(ipcMain, accounts) {
     catch (e) { return { ok: false, error: e.message || '账号操作失败' }; }
   };
   ipcMain.handle('hub-accounts:state', wrap(() => accounts.passiveState()));
+  ipcMain.handle('hub-accounts:attention', wrap(async () => (await accounts.passiveState()).attention));
   ipcMain.handle('hub-accounts:check', wrap(() => accounts.check()));
   const selection = p => {
     if (!p || typeof p !== 'object' || Array.isArray(p)) throw Error('账号参数无效');
@@ -13,7 +14,7 @@ function registerHubAccountsIpc(ipcMain, accounts) {
     if (p.site !== undefined && !require('../../core/hub-account-catalog').companyFor(p.site)) throw Error('公司标识无效');
     return { identity: p.identity, site: p.site };
   };
-  ipcMain.handle('hub-accounts:check-start', wrap(p => accounts.startCheck(selection(p))));
+  ipcMain.handle('hub-accounts:check-start', wrap(p => accounts.startCheck({ ...selection(p), live: p.live === true })));
   ipcMain.handle('hub-accounts:check-cancel', wrap(() => accounts.cancelCheck()));
   ipcMain.handle('hub-accounts:tools', wrap(() => accounts.setup.discover()));
   ipcMain.handle('hub-accounts:tool-accounts', wrap(p => accounts.toolAccounts(p.refresh === true)));
@@ -24,6 +25,7 @@ function registerHubAccountsIpc(ipcMain, accounts) {
     return accounts.setup.start(p.choices);
   }));
   ipcMain.handle('hub-accounts:open', wrap(p => accounts.open(selection(p))));
+  ipcMain.handle('hub-accounts:copy-logins', wrap(p => accounts.copyLogins({ identity: selection(p).identity })));
   ipcMain.handle('hub-accounts:preference', wrap(p => accounts.preference({ ...selection(p), add: p.add === true })));
   ipcMain.handle('hub-accounts:login', wrap(p => {
     if (p.identity !== undefined && (typeof p.identity !== 'string' || !/^[\w-]{1,32}$/.test(p.identity))) throw new Error('身份标识无效');
