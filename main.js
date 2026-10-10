@@ -1078,6 +1078,8 @@ function createWindow() {
       contextIsolation: false,
       sandbox: false,
       webviewTag: true,
+      // 关闭了显卡加速（兼容渲染）时告诉界面进程：终端改用 DOM 渲染（见 renderer loadGpuRenderer）。
+      additionalArguments: process.__hubGpuDisabledReason ? ['--ai-hub-gpu-disabled'] : [],
     },
   });
   mainWindow._hubNativeTitleBar = nativeTitleBar;
@@ -1550,6 +1552,7 @@ try {
   global.__devFileEngine = require('./main/groupchat/dev-file-engine').createDevFileEngine({
     meetingManager, sessionManager, getHubDataDir, getDispatcher: () => (__testHooks ? __testHooks.dispatcher : groupChatDispatcher),
     isWorkflowRunning: id => !!global.__loopEngine?.isRunning(id), deliveryEngine: global.__deliveryEngine,
+    stopWorkflow: id => global.__loopEngine.stopLoop(id, {interrupt:false, reason:'workflow_disabled'}),
     getMembers: meeting => groupChatDispatcher.groupMembersForMeeting(meeting, { includeDormant: true }),
     ensureMemberReady: (meeting, memberId) => global.__loopEngine.ensureMemberReady(meeting, memberId),
     sendToRenderer, onChanged: (id) => devWorkbench?.changed?.(id), logger: console,
@@ -1809,7 +1812,9 @@ const promptOperations = registerPromptSubmitIpc(ipcMain, {
     return assistantService.preparePrompt(request);
   },
 });
-try {
+// 发行目标关掉助理时（公司版：没有 Claude，助理会话会一直显示运行异常）整个服务不起：
+// 不建、不恢复助理会话，日程与手机通道也随之不启动。
+if (require('./core/distribution').featureEnabled('assistant')) try {
   assistantService = require('./main/ipc/assistant-handlers').registerAssistantIpc(ipcMain, {
     dataDir: getHubDataDir(),
     historyDatabasePath: (() => {
@@ -3234,7 +3239,9 @@ app.whenReady().then(async () => {
   // AUMID, or Windows can cache a bare electron.exe relaunch command. Isolated
   // E2E Hubs must never touch this production Shell registration.
   if (process.platform === 'win32' && !isIsolatedHub()) {
-    const hubIconPath = path.join(__dirname, 'claude-wx.ico');
+    // 安装版：图标只能用 exe 自己内嵌的那份。claude-wx.ico 在 app.asar 里，Hub 自己读得到（健康检查照样通过），
+    // Windows 资源管理器读不到，开始菜单快捷方式（任务栏按它取图标）就显示成白色文档（2026-10-09 公司真机）。
+    const hubIconPath = HUB_IS_PACKAGED ? process.execPath : path.join(__dirname, 'claude-wx.ico');
     const hubProductVersion = (() => {
       try { return require('./package.json').version || ''; } catch { return ''; }
     })();
@@ -3272,12 +3279,13 @@ app.whenReady().then(async () => {
     };
 
     // 快捷方式先指向当前可用的启动器：品牌化副本在就用它，不在就回落 electron.exe。
-    let hubLaunchExePath = startShellIntegration(resolveHubLaunchExePath(brandingOptions));
+    let hubLaunchExePath = startShellIntegration(HUB_IS_PACKAGED ? process.execPath : resolveHubLaunchExePath(brandingOptions));
 
     // 品牌化副本缺失或过期时后台重建。electron.exe 220MB+，读+改资源+写一整遍
     // 要好几秒，绝不能在主进程同步跑；用 ELECTRON_RUN_AS_NODE 起子进程。
     // 只新增/替换 AIHubCommunity.exe，永不触碰 electron.exe（node_modules 完整性铁律）。
-    const brandingState = describeBrandingHealth(brandingOptions);
+    // 安装版的 exe 在打包时已经换好图标和版本信息，不需要（也做不到：脚本和 resedit 都在 app.asar 里）运行时品牌化。
+    const brandingState = HUB_IS_PACKAGED ? { healthy: true } : describeBrandingHealth(brandingOptions);
     if (!brandingState.healthy && brandingState.expected) {
       console.log(`[hub-brand] ${brandingState.message}，后台重建中`);
       const child = spawn(process.execPath, [path.join(__dirname, 'scripts', 'brand-hub-exe.js')], {

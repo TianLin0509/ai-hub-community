@@ -63,7 +63,7 @@ function validate(d, memberIds) {
     if (!Array.isArray(r.members) || r.members.length < 1 || r.members.length > 3 || new Set(r.members).size !== r.members.length) throw new Error(`第 ${i + 1} 轮请选择 1–3 位不同的 Agent`);
     if (r.members.some(id => !memberIds.includes(id))) throw new Error(`第 ${i + 1} 轮有已移除的成员，请重新选择`);
     if (typeof r.name !== 'string' || !r.name.trim() || r.name.length > 80) throw new Error(`第 ${i + 1} 轮名称不能为空且不能超过 80 字`);
-    if (typeof r.prompt !== 'string' || !r.prompt.trim() || r.prompt.length > 16000) throw new Error(`第 ${i + 1} 轮共享 prompt 不能为空且不能超过 16000 字`);
+    if (typeof r.prompt !== 'string' || r.prompt.length > 16000) throw new Error(`第 ${i + 1} 轮共享 prompt 须为文本且不能超过 16000 字（可以留空）`);
     // 串行流程可在最后一轮设审核：需返工退回上一轮。
     const serialReview = d.kind === 'serial' && i > 0 && i === d.rounds.length - 1;
     if (!['next', 'end', ...(d.kind === 'file' || serialReview ? ['review'] : [])].includes(r.after)) throw new Error('轮次接续规则无效');
@@ -95,6 +95,7 @@ function toConfig(previous, d, memberIds) {
 }
 function toDeliveryConfig(previous, draft, memberIds) {
   const c=toConfig(previous,draft,memberIds);
+  delete c.conversationVersion;
   if(previous?.deliveryVersion!==1 && (previous?.serialRunState || previous?.loopState || previous?.fileFlow)) {
     c.legacyExecution={serialRunState:previous.serialRunState,loopState:previous.loopState,fileFlow:previous.fileFlow};
   }
@@ -104,10 +105,20 @@ function toDeliveryConfig(previous, draft, memberIds) {
   c.stepConfigs=draft.rounds.map(r=>({name:r.name,prompt:r.prompt,after:r.after}));
   return c;
 }
+function usesDelivery(draft) {
+  return draft?.kind === 'file' || !!draft?.rounds?.some(r=>r.after === 'review');
+}
+function toWorkflowConfig(previous, draft, memberIds) {
+  if (usesDelivery(draft)) return toDeliveryConfig(previous,draft,memberIds);
+  const c=toConfig(previous,draft,memberIds);
+  for (const key of ['deliveryVersion','deliveryKind','deliveryStages','taskArmed','fileFlow','taskDocs','kickoff','stopRequested','stopRequestedAt','stopReason']) delete c[key];
+  c.conversationVersion=1;
+  return c;
+}
 // New rooms start on the delivery engine directly. extra carries room-level
 // fields such as projectLocator / projectLibrary / workRoot.
 function createDeliveryConfig(presetId, members, extra = {}) {
   const draft = createPreset(presetId, members);
   return toDeliveryConfig({ ...extra }, draft, members.map(m => m.memberId));
 }
-module.exports = { LIMIT, PRESETS, GENERAL, DEV, createPreset, fromConfig, validate, toConfig, toDeliveryConfig, createDeliveryConfig };
+module.exports = { LIMIT, PRESETS, GENERAL, DEV, createPreset, fromConfig, validate, toConfig, toDeliveryConfig, toWorkflowConfig, usesDelivery, createDeliveryConfig };

@@ -14,7 +14,7 @@ function reviewBudgetStart(runtime) {
   return old > 0 ? Math.floor((old - 1) / 2) : 0;
 }
 
-function createDevFileEngine({ meetingManager, sessionManager, getHubDataDir, getDispatcher, ensureMemberReady, getMembers, deliveryEngine, isWorkflowRunning = () => false,
+function createDevFileEngine({ meetingManager, sessionManager, getHubDataDir, getDispatcher, ensureMemberReady, getMembers, deliveryEngine, isWorkflowRunning = () => false, stopWorkflow,
   sendToRenderer = () => {}, onChanged = () => {}, logger = console }) {
   const preparing = new Set(), active = new Map(), snapshots = new Map(), stopped = new Set();
   let timer = null, directoryEvents = null, restartScope = null;
@@ -280,6 +280,29 @@ function createDevFileEngine({ meetingManager, sessionManager, getHubDataDir, ge
     return { prompt: F.independentPrompt(m, F.directory(getHubDataDir(), id), members(m)), slot: executor(m, F.spec('kickoff')).slot };
   }
   function registerIpc(ipcMain, shell) {
+    ipcMain.handle('workflow:set-enabled', (_e, {meetingId, enabled, expectedRevision} = {}) => {
+      try {
+        const m = get(meetingId), wf = m?.serialWorkflow;
+        if (!m?.groupChat || !Array.isArray(wf?.steps) || !wf.steps.length) throw new Error('请先保存工作流设置');
+        if (typeof enabled !== 'boolean') throw new Error('工作流开关状态无效');
+        if ((wf.settingsRevision || 0) !== expectedRevision) throw new Error('设置已更新，请重试开关');
+        if (wf.enabled === enabled) return {ok:true, config:wf};
+        if (!enabled) {
+          if (deliveryEngine?.handles(meetingId)) deliveryEngine.stop(meetingId, {interrupt:false});
+          else if (F.enabled(m)) stop(meetingId);
+          else if (isWorkflowRunning(meetingId)) {
+            if (typeof stopWorkflow !== 'function') throw new Error('暂时无法暂停发言，请稍后重试');
+            stopWorkflow(meetingId);
+          }
+        }
+        const next = {...get(meetingId).serialWorkflow, enabled, settingsRevision:(wf.settingsRevision || 0)+1};
+        if (enabled && next.deliveryVersion===1) next.taskArmed=true;
+        meetingManager.updateMeeting(meetingId, {serialWorkflow:next});
+        sendToRenderer('meeting-updated', {meeting:get(meetingId)});
+        emit(meetingId);
+        return {ok:true, config:next};
+      } catch(error) { return {ok:false, reason:error.message}; }
+    });
     ipcMain.handle('workflow:configure', (_e, {meetingId, draft, expectedRevision} = {}) => {
       try {
         const m = get(meetingId);
@@ -287,15 +310,21 @@ function createDevFileEngine({ meetingManager, sessionManager, getHubDataDir, ge
         const wf = m.serialWorkflow || {}, fileStatus = status(meetingId);
         if (deliveryEngine?.isBusy(meetingId)) throw new Error('当前任务尚未结束，请先完成或结束任务，再修改工作流');
         if (fileStatus?.error) throw new Error('任务目录状态无法确认，保留原设置：'+fileStatus.error);
-        if (isWorkflowRunning(meetingId) || preparing.has(meetingId) || active.get(meetingId)?.size || wf.loopState?.status === 'running' || wf.serialRunState?.status === 'running') throw new Error('工作流运行中，停止并等待本轮结束后再修改');
+        if (isWorkflowRunning(meetingId) || preparing.has(meetingId) || active.get(meetingId)?.size || wf.loopState?.status === 'running' || (wf.serialRunState?.status === 'running' && wf.conversationVersion!==1)) throw new Error('工作流运行中，停止并等待本轮结束后再修改');
         if ((wf.settingsRevision || 0) !== expectedRevision) throw new Error('设置已被更新，请关闭后重新打开');
         const ids = (m.slotSpecs || []).map((p,i)=>p.memberId || `m${i+1}`);
         // Existing delivered legacy tasks keep their original protocol and paths.
-        const next = fileStatus?.files?.length ? Settings.toConfig(wf,draft,ids) : Settings.toDeliveryConfig(wf,draft,ids);
+        // Saving is the user's choice to use this configuration. Old editors
+        // may still send enabled:false; it must not leave the saved flow inert.
+        const savedDraft = {...draft,enabled:true};
+        const next = fileStatus?.files?.length ? Settings.toConfig(wf,savedDraft,ids) : Settings.toWorkflowConfig(wf,savedDraft,ids);
         if (fileStatus?.files?.length && (draft.kind !== 'file' || JSON.stringify(next.steps) !== JSON.stringify(wf.steps))) throw new Error('已有任务文件，不能切换协议或负责人；请为新任务创建群聊');
         next.settingsRevision = (wf.settingsRevision || 0) + 1;
+        // A terminal run normally returns to ordinary chat. An explicit save
+        // selects the new flow for the next message, without touching run.json.
+        if(next.deliveryVersion===1)next.taskArmed=true;
         meetingManager.updateMeeting(meetingId,{serialWorkflow:next});
-        if(next.deliveryVersion===1 && next.enabled)meetingManager.setParticipants(meetingId,next.deliveryStages[0].members.map(id=>ids.indexOf(id)));
+        if(next.enabled)meetingManager.setParticipants(meetingId,next.steps[0].map(id=>ids.indexOf(id)));
         sendToRenderer('meeting-updated',{meeting:get(meetingId)});
         emit(meetingId);
         return {ok:true,config:next};
