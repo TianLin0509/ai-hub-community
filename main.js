@@ -8,6 +8,11 @@ const os = require('os');
 // Freeze the running window's build before a later source-mode merge changes
 // files on disk, even if its first native session is opened much later.
 require('./core/runtime-build-info').runtimeBuildInfo();
+// Opt-in main-process CPU profile for isolated performance runs; inert unless
+// HUB_MAIN_CPU_PROFILE is set (see core/main-cpu-profiler.js).
+if (process.env.HUB_MAIN_CPU_PROFILE) {
+  require('./core/main-cpu-profiler.js').startMainCpuProfiler({ dataDir: require('./core/data-dir.js').getHubDataDir() });
+}
 
 // 2026-05-16 maintainer：防卡死后门 — 默认开 Chromium CDP 端口（OS 自动分配）。
 //   实际分配的端口在启动后写入 <dataDir>/control/<pid>.json 的 cdpPort 字段，
@@ -151,6 +156,7 @@ const {
   healPersistedCwds,
   projectSlug,
 } = require('./core/claude-transcript-locator.js');
+const { sameWorkDir, transcriptBucketMatches } = require('./core/hook-cwd-match');
 const {
   DEFAULT_CODEX_SESSIONS_ROOT,
   parseCodexRolloutToTurns,
@@ -828,6 +834,7 @@ transcriptTap.on('session-bound', (ev) => {
         geminiChatId: ev.geminiChatId,
         geminiProjectHash: ev.geminiProjectHash,
         geminiProjectRoot: ev.geminiProjectRoot,
+        transcriptPath: ev.sessionPath,
       });
     } else if (isKimiCliKind(ev.kind) && (ev.kimiSid || ev.wirePath || ev.sessionDir)) {
       sendToRenderer('session-meta-updated', {
@@ -860,6 +867,7 @@ transcriptTap.on('session-bound', (ev) => {
     changed = true;
   }
   if (ev.kind === 'gemini') {
+    if (ev.sessionPath && cur.transcriptPath !== ev.sessionPath) { cur.transcriptPath = ev.sessionPath; changed = true; }
     if (ev.geminiChatId && cur.geminiChatId !== ev.geminiChatId) { cur.geminiChatId = ev.geminiChatId; changed = true; }
     if (ev.geminiProjectHash && cur.geminiProjectHash !== ev.geminiProjectHash) { cur.geminiProjectHash = ev.geminiProjectHash; changed = true; }
     if (ev.geminiProjectRoot && cur.geminiProjectRoot !== ev.geminiProjectRoot) { cur.geminiProjectRoot = ev.geminiProjectRoot; changed = true; }
@@ -1083,6 +1091,14 @@ function createWindow() {
     },
   });
   mainWindow._hubNativeTitleBar = nativeTitleBar;
+  // 窗口在屏幕上就一直出帧 + 窗口事件日志（公司真机「点后台冻住、半分钟后黑屏」，见该模块注释）。
+  try {
+    const keepRendering = require('./core/window-keep-rendering.js');
+    keepRendering.installWindowKeepRendering(mainWindow, {
+      app, ipcMain, dataDir: getHubDataDir(),
+      enabled: keepRendering.shouldKeepRendering({ community: require('./core/distribution').community }),
+    });
+  } catch (error) { console.warn('[window] keep-rendering setup failed:', error && error.message); }
   require('./main/ipc/preview-immersive-handlers.js').bindPreviewImmersiveWindow(mainWindow);
   // 工具栏要知道窗口是不是最大化：Windows 最大化一个隐藏标题栏的窗口时，
   // 窗口会比屏幕大出一圈边框，顶部那几像素会被切掉。渲染层拿这个状态决定
@@ -1345,6 +1361,9 @@ function registerSessionForTap(session) {
       sessionsRoot: session.codexSessionsRoot || undefined,
       codexSid: session.codexSid || undefined,
       kimiSid: session.kimiSid || undefined,
+      geminiChatId: session.geminiChatId || undefined,
+      geminiProjectHash: session.geminiProjectHash || undefined,
+      antigravityEventsFile: /^gemini(?:-resume)?$/.test(session.kind) ? require('./core/antigravity-config').eventsFile(getHubDataDir(),session.id) : undefined,
       sessionDir: session.kimiSessionDir || undefined,
       registeredAt: session.createdAt || Date.now(),
       allowMtimeFallback: !!session.codexAllowMtimeFallback,
@@ -1391,7 +1410,9 @@ function updateSessionTranscriptBinding(hubSessionId, fields = {}) {
   // 子进程会继承 CLAUDE_HUB_SESSION_ID，它的 Stop hook 会把本卡片重绑到子进程的
   // transcript 上；子进程目录一旦被清理，卡片视图就 ENOENT 打不开。
   // hook 上报的 cwd 与会话 cwd 不一致时一律不重绑（卡片仍可用 ccSessionId 回退查找）。
-  if (fields.cwd && current.cwd && normalizeWorkspaceKey(fields.cwd) !== normalizeWorkspaceKey(current.cwd)) {
+  // 短名与长名写法（C:\Users\X0012~1 与 C:\Users\x00123456）是同一目录，不算嵌套 CLI。
+  if (fields.cwd && current.cwd && normalizeWorkspaceKey(fields.cwd) !== normalizeWorkspaceKey(current.cwd)
+      && !sameWorkDir(fields.cwd, current.cwd)) {
     console.warn('[hook] ignored transcript rebind from a nested CLI:',
       `session=${String(hubSessionId).slice(0, 8)} reported=${fields.cwd} expected=${current.cwd}`);
     return null;
@@ -1806,6 +1827,10 @@ const promptOperations = registerPromptSubmitIpc(ipcMain, {
   sessionManager, transcriptTap, sendToRenderer,
   onPromptReceipt: receipt => { assistantService?.observePromptReceipt?.(receipt); phoneService?.observeReceipt(receipt); },
   preparePrompt(request, session) {
+    if(session?.purpose==='hub-photo-assistant'){
+      if(!assistantService)throw new Error('拍图助理服务尚未就绪，消息未发送');
+      return assistantService.photo.ensureSession().then(()=>assistantService.photo.preparePrompt(request));
+    }
     if (session?.purpose !== 'hub-assistant') return request;
     if (!assistantService) throw new Error('助理服务尚未就绪，消息未发送');
     if (session.id !== request.sessionId || !assistantService.isAssistantSession(session.id)) throw new Error('请求不是固定助理会话，消息未发送');
@@ -2347,16 +2372,10 @@ const hookServer = http.createServer((req, res) => {
         let initialCwdMismatch = false;
         let initialTranscriptBucketMismatch = false;
         if (!boundClaudeSessionId && parsed.cwd && hookTargetSession.cwd) {
-          try {
-            initialCwdMismatch = path.resolve(parsed.cwd).toLowerCase()
-              !== path.resolve(hookTargetSession.cwd).toLowerCase();
-          } catch {}
+          try { initialCwdMismatch = !sameWorkDir(parsed.cwd, hookTargetSession.cwd); } catch {}
         }
         if (!boundClaudeSessionId && parsed.transcriptPath && hookTargetSession.cwd) {
-          try {
-            initialTranscriptBucketMismatch = path.basename(path.dirname(parsed.transcriptPath)).toLowerCase()
-              !== projectSlug(hookTargetSession.cwd).toLowerCase();
-          } catch {}
+          try { initialTranscriptBucketMismatch = !transcriptBucketMatches(parsed.transcriptPath, hookTargetSession.cwd); } catch {}
         }
         // 公司 Code Agent 不认 --session-id，Hub 启动时无法预定身份（core/codeagent-config.js）。
         // 待绑定期间（新建、分支、没有记录可恢复的重启），工作目录与记录所在目录都对得上的第一个
@@ -2366,11 +2385,8 @@ const hookServer = http.createServer((req, res) => {
             && !parsed.agentId && incomingClaudeSessionId && hookTargetSession.cwd) {
           let sameCwd = false;
           let sameBucket = !parsed.transcriptPath;
-          try { sameCwd = !parsed.cwd || path.resolve(parsed.cwd).toLowerCase() === path.resolve(hookTargetSession.cwd).toLowerCase(); } catch {}
-          try {
-            if (parsed.transcriptPath) sameBucket = path.basename(path.dirname(parsed.transcriptPath)).toLowerCase()
-              === projectSlug(hookTargetSession.cwd).toLowerCase();
-          } catch {}
+          try { sameCwd = !parsed.cwd || sameWorkDir(parsed.cwd, hookTargetSession.cwd); } catch {}
+          try { if (parsed.transcriptPath) sameBucket = transcriptBucketMatches(parsed.transcriptPath, hookTargetSession.cwd); } catch {}
           if (sameCwd && sameBucket) {
             sessionManager.updateSessionMeta(parsed.sessionId, { codeagentIdentityPending: false, ccSessionId: null });
             const bound = updateSessionTranscriptBinding(parsed.sessionId, {
@@ -2439,7 +2455,8 @@ const hookServer = http.createServer((req, res) => {
           // Descendant/parallel Claude processes inherit environment variables.
           // A mismatched native session or first-hook cwd is not evidence for
           // this Hub session, even when it inherited the correct local token.
-          console.warn(`[claude hook] ignored foreign ${event} for ${parsed.sessionId.slice(0, 8)}`);
+          console.warn(`[claude hook] ignored foreign ${event} for ${parsed.sessionId.slice(0, 8)}`
+            + ` (${initialCwdMismatch ? 'cwd' : initialTranscriptBucketMismatch ? 'transcript-dir' : 'native-id'})`);
           res.writeHead(202); res.end('{"ignored":"foreign-session"}'); return;
         }
         // Prefer the UserPromptSubmit payload's `prompt` field when present —
@@ -3005,6 +3022,8 @@ async function scanAgentSessions(opts = {}) {
   for (const s of allSessions) {
     if (['codex-app-server','acp'].includes(s.runtimeBackend)) continue;
     const runtimeKind = s.transcriptKind || s.kind;
+    // agy reports quota via /usage; retired Gemini footer parsing is not evidence.
+    if (/^gemini(?:-resume)?$/.test(runtimeKind) && require('./core/antigravity-config').isAntigravity(s)) continue;
     const isOpenAiCodex = s.kind === 'codex' || s.kind === 'codex-resume';
     if (runtimeKind !== 'gemini' && !isCodexBaseKind(runtimeKind) && !isKimiCliKind(runtimeKind)) continue;
     if (s.status === 'dormant') continue;

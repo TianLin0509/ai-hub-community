@@ -9,6 +9,11 @@ const fs = require('fs');
 const { isCodexSession, isNativeSession, acceptNativeSnapshot } = require('../core/codex-native-runtime.js');
 const { isNativeAgent } = require('../core/native-agent-runtime.js');
 const { isPtyAgentSession } = require('../core/agent-runtime-mode.js');
+const { installHiddenRenderGuard } = require('./xterm-hidden-render-guard.js');
+// 公司版默认回到 9 月的「后台」路径：终端按实际尺寸常驻在卡片下面，点后台只藏卡片层（见 core/backstage-path.js）。
+const BACKSTAGE_KEEPS_TERMINAL = require('../core/backstage-path.js').keepsTerminalBehindCards();
+// 主面板的终端此刻是否「收起」：10 月路径下卡片视图里终端不显示、不调尺寸；9 月路径下它一直在卡片下面活着。
+function primaryTerminalDormant() { return currentView !== 'pty' && !BACKSTAGE_KEEPS_TERMINAL; }
 // 草稿写进 Main 的草稿库：原生会话和 PTY 的 Claude/Codex 会话都算（同一个 Hub 会话 id）。
 const hasDurableDraft = session => isNativeAgent(session) || isPtyAgentSession(session);
 const { recordNativeContent, promptReceipt } = require('../core/native-feedback.js');
@@ -688,7 +693,7 @@ function fitAndResizeTerminal(sessionId, cached, opts = {}) {
   if (!sessionId || !cached || !cached.opened || !cached.container) return false;
   // The primary terminal can have nonzero geometry behind the opaque card
   // overlay. Geometry alone is not evidence that the user opened backstage.
-  if (cached.container.closest('.terminal-panel') === terminalPanelEl && currentView !== 'pty') return false;
+  if (cached.container.closest('.terminal-panel') === terminalPanelEl && primaryTerminalDormant()) return false;
   const rect = cached.container.getBoundingClientRect();
   if (rect.width < 4 || rect.height < 4 || !cached.container.offsetWidth) return false;
   // 之前只有 Codex 会话在 fit 之后回到底部（shouldAutoPinCodexTerminal 里就写死了
@@ -790,7 +795,7 @@ function scheduleVisibleTerminalRecovery(sessionId, cached, opts = {}) {
     cached._surfaceRecoveryRaf = 0;
     if (terminalCache.get(sessionId) !== cached || !cached.opened || !cached.container) return;
     if (!cached.container.isConnected) return;
-    if (cached.container.closest('.terminal-panel') === terminalPanelEl && currentView !== 'pty') return;
+    if (cached.container.closest('.terminal-panel') === terminalPanelEl && primaryTerminalDormant()) return;
     if (!cached.container.offsetWidth || !cached.container.offsetHeight) {
       if (!secondPass) {
         cached._surfaceRecoveryRaf = requestAnimationFrame(() => recover(true));
@@ -866,6 +871,7 @@ const modelUi = createModelUiController({
     codexProfile: session && session.codexProfile,
   }),
   getTerminalScreenText: sessionId => terminalActivityMonitor.extractLiveScreenLines(sessionId).join('\n'),
+  openCommandScreen: sessionId => require('./command-screen').openCommandScreen(ipcRenderer, sessionId),
   isSessionBusy: session => sessionRuntimeIsActive(session),
   // 头部徽章 T2 删了，模型名只剩 composer 底栏那个 chip。模型切换的每一步
   // （发起 / 确认 / 超时回滚）都要让它重画一次，否则会停在切换前的名字上。
@@ -1124,6 +1130,32 @@ function renderSessionList() {
 function scheduleSessionListRender() {
   sidebarRenderCoalescer.schedule();
 }
+
+// 画面停刷的现场记录（写进 <数据目录>/logs/window-events.log，见 core/window-keep-rendering.js）：
+// 页面被判成可见/不可见时记一笔；页面可见却超过 3 秒没出一帧，也记一笔（带当前视图与会话数），
+// 用来区分「窗口被当成看不见」和「真的画不动」。每秒只排一次 requestAnimationFrame，开销可忽略。
+(() => {
+  const report = (event, extra = {}) => {
+    try { ipcRenderer.send('hub:page-window-event', { event, view: typeof currentView === 'string' ? currentView : null, sessions: typeof sessions !== 'undefined' ? sessions.size : null, ...extra }); } catch {}
+  };
+  document.addEventListener('visibilitychange', () => report('visibility', { state: document.visibilityState }));
+  let pendingSince = 0;
+  let stalled = false;
+  setInterval(() => {
+    if (document.visibilityState !== 'visible') { pendingSince = 0; return; }
+    const now = performance.now();
+    if (pendingSince) {
+      if (!stalled && now - pendingSince > 3000) { stalled = true; report('frame-stall', { ms: Math.round(now - pendingSince) }); }
+      return;
+    }
+    pendingSince = now;
+    requestAnimationFrame(() => {
+      if (stalled) report('frame-resume', { ms: Math.round(performance.now() - pendingSince) });
+      stalled = false;
+      pendingSince = 0;
+    });
+  }, 1000);
+})();
 
 ipcRenderer.on('desktop-notification:open-session', (_event, payload = {}) => {
   const sessionId = String(payload.sessionId || '');
@@ -1875,7 +1907,8 @@ function paintAppToolbarForView(label) {
   toolbarActionsEl.replaceChildren();
   toolbarActionsEl.hidden = true;
   syncBackstageButton(false);
-  const signature = 'view:' + label;
+  const researchVersion = label === '投研' ? (window.__xresearchVersionInfo || {}) : null;
+  const signature = 'view:' + label + (researchVersion ? JSON.stringify(researchVersion) : '');
   if (toolbarCrumbEl.dataset.signature === signature) return;
   toolbarCrumbEl.dataset.signature = signature;
   toolbarCrumbEl.replaceChildren();
@@ -1883,6 +1916,19 @@ function paintAppToolbarForView(label) {
   name.className = 'crumb-view-name';
   name.textContent = label;
   toolbarCrumbEl.appendChild(name);
+  if (researchVersion) {
+    const version = document.createElement('button');
+    version.type = 'button';
+    version.className = 'cx-ui-version';
+    version.textContent = researchVersion.loaded ? 'UI ' + researchVersion.loaded : '版本待确认';
+    if (researchVersion.available && researchVersion.available !== researchVersion.loaded) {
+      version.textContent += ' · 更新至 ' + researchVersion.available;
+    }
+    version.title = '点击刷新投研页面，保留当前栏目。' + (researchVersion.error || '');
+    version.setAttribute('aria-label', version.textContent + '，点击刷新投研页面');
+    version.addEventListener('click', () => window.__xresearchRefresh?.());
+    toolbarCrumbEl.appendChild(version);
+  }
 }
 
 // 会话视图。下面这一整段就是 T2 的舞台头部原样搬上来的：面包屑三段 + 状态点、
@@ -2048,6 +2094,7 @@ function refreshAppToolbar() {
 }
 
 let _appToolbarRefreshRaf = null;
+window.addEventListener('xresearch-version-changed', scheduleAppToolbarRefresh);
 function scheduleAppToolbarRefresh() {
   if (_appToolbarRefreshRaf) return;
   _appToolbarRefreshRaf = requestAnimationFrame(() => {
@@ -2234,12 +2281,13 @@ function showTerminal(sessionId, opts = { focus: true }) {
   if (!cached.opened) {
     cached.terminal.open(cached.container);
     cached.opened = true;
+    installHiddenRenderGuard(cached.terminal);
     setupImageHover(cached.terminal, cached.container);
     void hydrateTerminalFromSnapshot(sessionId, cached);
   }
   // Card navigation does not display xterm. Recreating its Canvas/WebGL
   // surface here costs a frame and can stall Windows compositor commits.
-  if (embedded || currentView === 'pty') loadGpuRenderer(cached);
+  if (embedded || !primaryTerminalDormant()) loadGpuRenderer(cached);
   else unloadGpuRenderer(cached);
   // Behind the opaque cards a visible xterm still paints with its DOM fallback
   // renderer and measures every new glyph: on 2026-10-08 one click on a
@@ -2247,7 +2295,7 @@ function showTerminal(sessionId, opts = { focus: true }) {
   // Hide it exactly like inactive terminals; it keeps parsing output into its
   // buffer, and applyViewMode('pty') shows it and runs the visible recovery.
   // It is opened (and measured) above while still displayed.
-  if (!embedded) setCardHiddenTerminal(cached, currentView !== 'pty');
+  if (!embedded) setCardHiddenTerminal(cached, primaryTerminalDormant());
   if (isCodexKind(session.kind) && !isNativeAgent(session)) {
     cached._codexAnswerAccent ||= require('./codex-answer-accent').mountCodexAnswerAccent(cached.terminal, document);
     cached._codexAnswerAccent.refresh();
@@ -2265,7 +2313,7 @@ function showTerminal(sessionId, opts = { focus: true }) {
       cached._codexBackstage ||= createCodexBackstage({ document, ipcRenderer, sessionId,
         getSession:() => sessions.get(sessionId),
         renderProse:text => DOMPurify.sanitize(marked.parse(text, {async:false}), {FORBID_TAGS:['img','video','audio','iframe']}),
-        onModeChange:mode => { cached._backstageReadable=mode!=='legacy';if(cached._backstageReadable || currentView !== 'pty')unloadGpuRenderer(cached);else loadGpuRenderer(cached); },
+        onModeChange:mode => { cached._backstageReadable=mode!=='legacy';if(cached._backstageReadable || primaryTerminalDormant())unloadGpuRenderer(cached);else loadGpuRenderer(cached); },
         focusComposer:() => mountTarget.querySelector('.floating-input-box')?.focus() });
       cached._codexBackstage.mount(termContainer);
       cached._codexBackstage.setVisible(currentView === 'pty', {force:!!opts.forceScrollBottom});
@@ -2276,7 +2324,7 @@ function showTerminal(sessionId, opts = { focus: true }) {
     // Card navigation must not fit/redraw an invisible CLI, or resize a
     // session which a later click has already unmounted. Entering backstage
     // runs scheduleVisibleTerminalRecovery with the final visible geometry.
-    if (!termContainer.isConnected || (!embedded && (activeSessionId !== sessionId || currentView !== 'pty'))) return;
+    if (!termContainer.isConnected || (!embedded && (activeSessionId !== sessionId || primaryTerminalDormant()))) return;
     const dbg = window.__scrollDebug;
     if (dbg && dbg.isOn()) dbg.log('show:raf-enter', { focus: opts.focus, ...dbg.snap(cached.terminal, sessionId) });
     const forcePtyResize = cached._hydrated && cached._needsPtyRedraw;
@@ -3992,7 +4040,7 @@ function applyViewMode(mode, { remember = true, skipPreviousCardCapture = false 
       scheduleVisibleTerminalRecovery(activeSessionId, cached, { pinBottom: false });
     }
   }
-  if (mode === 'card' && typeof terminalCache !== 'undefined') {
+  if (mode === 'card' && !BACKSTAGE_KEEPS_TERMINAL && typeof terminalCache !== 'undefined') {
     unloadGpuRenderer(terminalCache.get(activeSessionId));
     setCardHiddenTerminal(terminalCache.get(activeSessionId), true);
   }
@@ -4140,11 +4188,7 @@ function measureFloatingBarVisualHeight(bar) {
   return Math.ceil(Math.max(0, bottom - top));
 }
 
-// 「消息没提交」必须看得见（2026-09-03）。
-//   闭环发送已经把静默卡死的概率压到很低，但只要还有残余概率，就不能让它无声无息 ——
-//   用户上一次的体验就是"以为发出去了，几十秒后才发现 AI 根本没动"。
-//   这里不自动重发：能否安全重发取决于原文还在不在 CLI 输入框里，
-//   那个判断在主进程的 resendCurrentPrompt 里做（含指纹比对），点按钮才触发。
+// Submission receipts remain internal; receipt uncertainty never creates a banner.
 const { beginPromptDelivery, applyPromptReceipt } = require('./prompt-delivery-state.js');
 const floatingPromptDeliveries = new Map();
 
@@ -4153,14 +4197,9 @@ function updateFloatingPromptReceipt(receipt) {
   const state = floatingPromptDeliveries.get(receipt.sessionId);
   if (!applyPromptReceipt(state, receipt)) return;
   paintNativePromptReceipts(receipt.sessionId);
-  if (state.status === 'content-mismatch' && !state.dismissed) notifyPromptContentMismatch(state);
   for (const bar of document.querySelectorAll('.floating-input-bar')) {
     if (bar.dataset.sessionId !== receipt.sessionId) continue;
-    if (['confirmed', 'delivered', 'queued'].includes(state.status)) clearFloatingInputStuck(bar);
-    else if (!state.dismissed) {
-      if (state.status === 'content-mismatch') clearFloatingInputStuck(bar);
-      markFloatingInputStuck(bar, receipt.sessionId);
-    }
+    clearFloatingInputStuck(bar);
   }
 }
 
@@ -4199,67 +4238,10 @@ function clearFloatingInputStuck(bar) {
   if (existing) existing.remove();
 }
 
-// 当前项目规则要求未确认结果可见。补发绑定本次提交身份，由主进程
-// 核对回执和当前输入行；不能把上一轮运行或未知结果当作已经收到。
-function markFloatingInputStuck(bar, sessionId) {
-  const delivery = floatingPromptDeliveries.get(sessionId);
-  if (!bar || !delivery || delivery.dismissed || ['pending', 'confirmed', 'delivered', 'queued'].includes(delivery.status)) {
-    clearFloatingInputStuck(bar); return;
-  }
-  let row = bar.querySelector('.fi-stuck');
-  if (row?.dataset.submissionId !== delivery.clientSubmissionId) { clearFloatingInputStuck(bar); row = null; }
-  if (!row) {
-    row = document.createElement('div'); row.className = 'fi-stuck';
-    row.dataset.submissionId = delivery.clientSubmissionId;
-    const label = document.createElement('span'); label.className = 'fi-stuck-label';
-    const resend = document.createElement('button'); resend.type = 'button';
-    resend.className = 'fi-stuck-resend'; resend.textContent = '补发';
-    resend.title = '先核对本次接收回执和 CLI 输入行，再决定是否补回车';
-    resend.addEventListener('click', async (event) => {
-      event.stopPropagation();
-      if (floatingPromptDeliveries.get(sessionId) !== delivery || delivery.status === 'content-mismatch' || row.dataset.busy === 'true') return;
-      row.dataset.busy = 'true';
-      resend.disabled = true; resend.textContent = '核对中…';
-      try {
-        const result = await ipcRenderer.invoke('session:resend-prompt', { sessionId, clientSubmissionId: delivery.clientSubmissionId });
-        if (floatingPromptDeliveries.get(sessionId) !== delivery) return;
-        if (result?.receipt) updateFloatingPromptReceipt(result.receipt);
-        if (delivery.status === 'confirmed' || result?.mode === 'already-submitted') { clearFloatingInputStuck(bar); return; }
-        if (row.isConnected) label.textContent = result?.message || '仍未确认，请到后台核对是否收到；未重复发送正文';
-      } catch (error) {
-        if (row.isConnected) label.textContent = '核对未完成，请到后台查看是否收到';
-      } finally {
-        delete row.dataset.busy;
-        if (row.isConnected) { resend.textContent = '补发'; resend.disabled = delivery.status === 'content-mismatch' || isNativeAgent(sessions.get(sessionId)); }
-      }
-    });
-    const dismiss = document.createElement('button'); dismiss.type = 'button';
-    dismiss.className = 'fi-stuck-dismiss'; dismiss.textContent = '忽略';
-    dismiss.addEventListener('click', (event) => {
-      event.stopPropagation(); delivery.dismissed = true;
-      for (const other of document.querySelectorAll('.floating-input-bar')) if (other.dataset.sessionId === sessionId) clearFloatingInputStuck(other);
-    });
-    row.append(label, resend, dismiss);
-    const stack = bar.querySelector('.fi-content-stack') || bar;
-    stack.insertBefore(row, stack.firstChild);
-  }
-  row.querySelector('.fi-stuck-label').textContent = delivery.status === 'content-mismatch'
-    ? '接收内容与原文的换行或空白不同，请到后台核对'
-    : '暂未确认 agent 收到消息，请核对后台或点击补发';
-  row.querySelector('.fi-stuck-resend').disabled = row.dataset.busy === 'true' || delivery.status === 'content-mismatch' || isNativeAgent(sessions.get(sessionId));
-}
-
-// 明确失败还要归还原文并解释原因，不能仅显示未确认状态。
 function reportFloatingSendFailure(sessionId, inputBox, text, reason) {
   const restored = !!inputBox && !readContenteditablePlainText(inputBox) && !!text;
   if (restored) { replaceContenteditableText(inputBox, text); saveFloatingInputDraft(sessionId, inputBox); }
   showToast(`发送失败：${reason}。${restored ? '原文已放回输入框；' : ''}请先在终端核对是否已收到，再决定是否重发`, 'error');
-}
-
-function notifyPromptContentMismatch(delivery) {
-  if (!delivery || delivery._mismatchNotified) return;
-  delivery._mismatchNotified = true;
-  showToast('终端收到的内容与原文在换行或空白上不一致，请在终端核对；不会自动补发', 'error');
 }
 
 function lockFloatingInputBarGeometry(bar) {
@@ -5181,10 +5163,8 @@ function mountFloatingInput(sessionId, termContainer, terminal, pane = {}) {
       if (result?.receipt) updateFloatingPromptReceipt(result.receipt);
       if (delivery.status === 'confirmed' || delivery.status === 'content-mismatch') return;
       if (result && result.ok && result.sendStatus !== 'stuck') return;
-      if (result?.sendStatus === 'content-mismatch') { notifyPromptContentMismatch(delivery); return; }
-      // PTY 会话明确「未发送」（例如 CLI 启动选择框还挂着）：原文放回输入框、说明原因，
-      // 不亮「补发」——补发只会把同一段文字塞进同一个选择框。主进程的失败回执可能
-      // 比这里先到、已在本会话的各个输入栏亮起提示，这里一并清掉。
+      if (result?.sendStatus === 'content-mismatch') return;
+      // CLI 还不能接收输入时，恢复明确未发送的原文并说明原因。
       if (!result?.ok && result?.notSent && session?.agentRuntime === 'pty') {
         delivery.dismissed = true;
         updateFloatingPromptReceipt({ sessionId, clientSubmissionId, status: 'failed' });
@@ -5197,8 +5177,7 @@ function mountFloatingInput(sessionId, termContainer, terminal, pane = {}) {
       }
       const reason = result && result.ok ? 'no-ack' : (result && result.error) || 'send-failed';
       console.warn(`[floating-input] prompt not acknowledged for ${sessionId.slice(0, 8)}: ${reason}`);
-      // 明确「未发送」：先标成已处理，否则下面这条失败回执会在同一会话的所有输入栏
-      // （含分屏里的另一栏）点亮「补发」——没发出去的东西不存在补发。
+      // 明确未发送的结果单独处理，不当作送达未知。
       if (result?.notSent && (isNativeAgent(session) || session?.agentRuntime === 'pty')) delivery.dismissed = true;
       updateFloatingPromptReceipt({ sessionId, clientSubmissionId, status: result?.ok || result?.unconfirmed ? 'unconfirmed' : 'failed' });
       // PTY 会话也可能明确「未发送」（例如 CLI 启动选择框还挂着）：原文放回输入框，
@@ -5217,13 +5196,12 @@ function mountFloatingInput(sessionId, termContainer, terminal, pane = {}) {
           return;
         }
       }
-      // 明确的失败不能只显示未确认横幅：输入框在发送前已清空，
+      // 明确失败仍要告知：输入框在发送前已清空，
       // 这里说明原因并把原文放回（可能已部分写进终端，所以提示先核对，不自动重发）。
       if (!result?.ok && !result?.unconfirmed) {
         reportFloatingSendFailure(sessionId, inputBox, text, result?.message || result?.error || '发送失败');
         return;
       }
-      markFloatingInputStuck(bar, sessionId);
     }).catch((err) => {
       if (nativeCommand) {
         if (feedbackSequence === commandFeedbackSequence) commandFeedback.show(text.trim(), err.message || '命令提交失败', true);
@@ -5238,7 +5216,6 @@ function mountFloatingInput(sessionId, termContainer, terminal, pane = {}) {
       if (isNativeAgent(session)) showToast('发送未完成：' + err.message, 'error');
       else reportFloatingSendFailure(sessionId, inputBox, text, err && err.message || '发送通道异常');
       updateFloatingPromptReceipt({ sessionId, clientSubmissionId, status: 'failed' });
-      markFloatingInputStuck(bar, sessionId);
     });
   }
 
@@ -5347,10 +5324,6 @@ function mountFloatingInput(sessionId, termContainer, terminal, pane = {}) {
   bar.addEventListener('click', (e) => e.stopPropagation());
   bar.addEventListener('mousedown', (e) => e.stopPropagation());
 
-  const restoredDelivery = floatingPromptDeliveries.get(sessionId);
-  if (restoredDelivery && ['unconfirmed', 'failed', 'content-mismatch'].includes(restoredDelivery.status)) {
-    markFloatingInputStuck(bar, sessionId);
-  }
 
   return {
     dispose() {
@@ -7034,7 +7007,7 @@ async function hydrateTerminalFromSnapshot(sessionId, cached) {
   // 才写进来的，此后再没有任何一次 fit/pin。内容量一变（尤其带绝对定位的 TUI 帧），
   // 布局就可能停在按空终端算出来的状态。回灌完成后补一次 fit + 置底。
   if (sessionId === activeSessionId
-      && (currentView === 'pty' || cached.container.closest('.terminal-panel') !== terminalPanelEl)) {
+      && (!primaryTerminalDormant() || cached.container.closest('.terminal-panel') !== terminalPanelEl)) {
     fitAndResizeTerminal(sessionId, cached, { force: true, forcePtyResize: true });
     cached._needsPtyRedraw = false;
     refreshTerminalRendererSurface(cached);
@@ -8732,6 +8705,14 @@ ipcRenderer.on('session-created', async (_e, { session }) => {
     scheduleSessionListRender();
     return;
   }
+  // 手机拍图在后台创建或唤醒；只在用户已经选中它时切入，保留其他会话的输入。
+  if (session.purpose === 'hub-photo-assistant') {
+    if (wasDormant && activeSessionId === session.id) {
+      await selectSession(session.id, { forceScrollBottom: pendingResume?.forceScrollBottom === true });
+    }
+    scheduleSessionListRender();
+    return;
+  }
   // Delegated work must not replace the conversation or the draft currently
   // being written in the assistant. Users open the target explicitly.
   if (assistantPanel.isOpen()) {
@@ -9398,7 +9379,7 @@ function createSecondarySessionView(sessionId, panel, options = {}) {
         const container = document.createElement('div'); container.className = 'terminal-container';
         host.prepend(container); container.append(cached.container); cached.container.style.display = 'block';
         if (!cached.opened) {
-          cached.terminal.open(cached.container); cached.opened = true;
+          cached.terminal.open(cached.container); cached.opened = true; installHiddenRenderGuard(cached.terminal);
           setupImageHover(cached.terminal, cached.container);
           void hydrateTerminalFromSnapshot(sessionId, cached);
         }
