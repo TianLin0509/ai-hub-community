@@ -1,7 +1,7 @@
 {
   "edition": "community",
-  "version": "0.4.4",
-  "upstreamVersion": "1.6.428",
-  "upstreamCommit": "e8fda0f9529865e5e52b34c77b8018c0b0d259d9",
+  "version": "0.4.5",
+  "upstreamVersion": "1.6.438",
+  "upstreamCommit": "9a009a19db1c59b91e444462e058aff8e31ef2b8",
   "upstreamDirty": false
 }
